@@ -1,4 +1,3 @@
-
 import argparse
 import json
 from pathlib import Path
@@ -29,16 +28,19 @@ class PairGenerator:
         data = mujoco.MjData(model)
         self.batch_size = batch_size
         self.device = device
-        self.camera_from_world = np.asarray(json.loads(camera_transform.read_text())["T_top_camera_from_world"])
-        joints = [model.joint(f"{side}_joint{j}").id for side in ("left", "right") for j in range(1, 7)]
-        self.qpos_indices = model.jnt_qposadr[joints]
-        self.limits = model.jnt_range[joints].copy()
+        self.camera_from_world = torch.tensor(
+            json.loads(camera_transform.read_text())["T_top_camera_from_world"],
+            dtype=torch.float32,
+            device=device,
+        )
+        joint_ids = [model.joint(f"{side}_joint{j}").id for side in ("left", "right") for j in range(1, 7)]
+        self.qpos_indices = model.jnt_qposadr[joint_ids]
+        self.limits = model.jnt_range[joint_ids, :].copy()
         self.joint_mean = norm_stats["state"]["mean"][JOINT_STATE_INDICES]
         self.joint_std = norm_stats["state"]["std"][JOINT_STATE_INDICES]
         self.rng = np.random.default_rng(0)
         self.sites = [model.site(f"{side}_tcp_site").id for side in ("left", "right")]
         self.model, self.data = _put_model_and_data_safe(mjw, model, data, nworld=batch_size, nconmax=0, njmax=0)
-        self.camera_from_world = torch.as_tensor(self.camera_from_world, dtype=torch.float32, device=device)
         self.qpos = wp.to_torch(self.data.qpos)
         self.site_pos = wp.to_torch(self.data.site_xpos)
         self.site_rot = wp.to_torch(self.data.site_xmat)
@@ -46,9 +48,9 @@ class PairGenerator:
     def fk(self, joints):
         self.qpos[:, self.qpos_indices] = joints
         mjw.kinematics(self.model, self.data)
-        positions = self.site_pos[:, self.sites] @ self.camera_from_world[:3, :3].T + self.camera_from_world[:3, 3]
-        rotations = self.camera_from_world[:3, :3] @ self.site_rot[:, self.sites]
-        return torch.cat((positions, rotations[..., :, 0], rotations[..., :, 1]), dim=-1).flatten(1)
+        positions = self.site_pos[:, self.sites, :] @ self.camera_from_world[:3, :3].T + self.camera_from_world[:3, 3]
+        rotations = self.camera_from_world[:3, :3] @ self.site_rot[:, self.sites, :, :]
+        return torch.cat((positions, rotations[:, :, :, 0], rotations[:, :, :, 1]), dim=-1).flatten(1)
 
     def __call__(self):
         joints = self.rng.normal(self.joint_mean, self.joint_std, size=(self.batch_size, 12)).astype(np.float32)
@@ -99,15 +101,14 @@ class EEFAdapters(nn.Module):
         return self.pose_log_std.exp().clamp_min(1e-3)
 
     def forward(self, joints, poses):
-        joint_input = (joints - self.state_mean) / self.state_scale
-        joint_prediction = self.mlp_in((poses - self.pose_mean) / self.pose_std)
+        joint_prediction = self.eef_to_joint(poses)
         pose_prediction = self.predict_pose_values(joints)
         pred = pose_prediction.reshape(-1, 2, 9)
         target = poses.reshape(-1, 2, 9)
-        pos_loss = F.mse_loss(pred[..., :3], target[..., :3])
-        rot_loss = F.mse_loss(pred[..., 3:], target[..., 3:])
-        losses = (F.mse_loss(joint_prediction, joint_input), 10 * pos_loss + rot_loss)
-        return losses, joint_prediction * self.state_scale + self.state_mean, pose_prediction
+        pos_loss = F.mse_loss(pred[:, :, :3], target[:, :, :3])
+        rot_loss = F.mse_loss(pred[:, :, 3:], target[:, :, 3:])
+        loss_in = ((joint_prediction - joints) / self.state_scale).square().mean()
+        return (loss_in, 10 * pos_loss + rot_loss), joint_prediction, pose_prediction
 
     def eef_to_joint(self, poses):
         pose_input = (poses - self.pose_mean) / self.pose_std
@@ -137,14 +138,14 @@ def load_adapters(checkpoint, device="cpu"):
 def validate(model, joints, poses, fk):
     (loss_in, loss_out), predicted_joints, predicted_poses = model(joints, poses)
     expected_poses = poses.reshape(-1, 2, 9)
-    r2 = rotation_matrix(expected_poses[..., 3:])
+    r2 = rotation_matrix(expected_poses[:, :, 3:])
     metrics = {"loss": (loss_in + loss_out).item(),
                "in_loss": loss_in.item(), "out_loss": loss_out.item(),
                "in_joint_rmse_rad": (predicted_joints - joints).square().mean().sqrt().item()}
     for name, prediction in (("in", fk(predicted_joints)), ("out", predicted_poses)):
         prediction = prediction.reshape(-1, 2, 9)
-        position_error = prediction[..., :3] - expected_poses[..., :3]
-        r1 = rotation_matrix(prediction[..., 3:])
+        position_error = prediction[:, :, :3] - expected_poses[:, :, :3]
+        r1 = rotation_matrix(prediction[:, :, 3:])
         cosine = (((r1 * r2).sum((-1, -2)) - 1) / 2).clamp(-1, 1)
         metrics[f"{name}_position_rmse_mm"] = position_error.square().sum(-1).mean().sqrt().item() * 1000
         metrics[f"{name}_rotation_mean_deg"] = torch.rad2deg(torch.acos(cosine)).mean().item()
