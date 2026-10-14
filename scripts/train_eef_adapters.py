@@ -159,11 +159,10 @@ def main():
     parser.add_argument("--output", type=Path, default=REPO / "outputs/eef_adapters")
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=40960)
-    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     args = parser.parse_args()
-    if min(args.steps, args.batch_size) < 1 or args.lr <= 0:
-        parser.error("Steps, batch size and learning rate must be positive")
+    if min(args.steps, args.batch_size) < 1:
+        parser.error("Steps and batch size must be positive")
     torch.manual_seed(0)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for mjwarp FK training")
@@ -171,7 +170,7 @@ def main():
     norm_stats = parse_norm_stats(torch.load(args.dit_checkpoint, map_location="cpu", mmap=True, weights_only=False)["norm_stats"])
     generator = PairGenerator(norm_stats, args.batch_size, device, args.camera_transform)
     model = EEFAdapters(generator.joint_mean, generator.joint_std + 1e-6).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     args.output.mkdir(parents=True, exist_ok=True)
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     if args.wandb:
