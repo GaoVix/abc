@@ -84,7 +84,7 @@ class MLP(nn.Sequential):
 
 class EEFAdapters(nn.Module):
 
-    def __init__(self, state_mean, state_scale, ik_sizes=(18,64,128,256,128,64,12), fk_sizes=(12,64,128,64,18)):
+    def __init__(self, state_mean, state_scale, ik_sizes=(18,64,128,256,512,256,128,64,12), fk_sizes=(12,64,128,64,18)):
         super().__init__()
         self.mlp_in = MLP(ik_sizes)
         self.mlp_out = MLP(fk_sizes)
