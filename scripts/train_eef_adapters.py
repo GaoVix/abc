@@ -1,21 +1,18 @@
-"""Train IK/FK MLPs from official-state joint samples and FK poses.
-
-Pose9 = [position3, rotation column1, rotation column2], in the fixed top-camera frame.
-Inputs/outputs use meters and radians; joint scaling is fixed and pose scaling is learned.
-FK generation requires CUDA and uses batched mjwarp kinematics.
-"""
 
 import argparse
 import json
 from pathlib import Path
 
 import mujoco
+import mujoco_warp as mjw
 import numpy as np
 import torch
+import warp as wp
 from torch import nn
 from torch.nn import functional as F
 
 from abc_minimal.preprocess import parse_norm_stats
+from abc_sim.rendering.replay.renderer import _put_model_and_data_safe
 
 REPO = Path(__file__).resolve().parents[1]
 CAMERA_TRANSFORM = REPO / "scripts/eef_camera_transform.json"
@@ -23,21 +20,20 @@ JOINT_STATE_INDICES = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
 
 
 class PairGenerator:
-    def __init__(self, norm_stats, camera_transform=CAMERA_TRANSFORM):
-        self.model = mujoco.MjModel.from_xml_path(str(REPO / "abc_sim/models/yam_dishrack_base.xml"))
-        self.data = mujoco.MjData(self.model)
+    def __init__(self, norm_stats, batch_size, device, camera_transform=CAMERA_TRANSFORM):
+        wp.init()
+        model = mujoco.MjModel.from_xml_path(str(REPO / "abc_sim/models/yam_dishrack_base.xml"))
+        data = mujoco.MjData(model)
+        self.batch_size = batch_size
+        self.device = device
         self.camera_from_world = np.asarray(json.loads(camera_transform.read_text())["T_top_camera_from_world"])
-        joints = [self.model.joint(f"{side}_joint{j}").id for side in ("left", "right") for j in range(1, 7)]
-        self.qpos_indices = self.model.jnt_qposadr[joints]
-        self.limits = self.model.jnt_range[joints].copy()
+        joints = [model.joint(f"{side}_joint{j}").id for side in ("left", "right") for j in range(1, 7)]
+        self.qpos_indices = model.jnt_qposadr[joints]
+        self.limits = model.jnt_range[joints].copy()
         self.joint_mean = norm_stats["state"]["mean"][JOINT_STATE_INDICES]
         self.joint_std = norm_stats["state"]["std"][JOINT_STATE_INDICES]
-        if not (np.isfinite(self.joint_mean).all() and np.isfinite(self.joint_std).all()
-                and (self.joint_std > 0).all()):
-            raise ValueError("State sampling mean/std must be finite, with positive std")
         self.rng = np.random.default_rng(0)
-        self.sites = [self.model.site(f"{side}_tcp_site").id for side in ("left", "right")]
-        self._warp_fk = {}
+        self.sites = [model.site(f"{side}_tcp_site").id for side in ("left", "right")]
         self.metadata = {"frame": "fixed initial top camera", "axes": "x right, y down, z forward",
                          "site": "tcp_site", "rotation_6d": "first two matrix columns",
                          "source": str(camera_transform.resolve()), "joint_ranges_rad": self.limits.tolist(),
@@ -46,32 +42,25 @@ class PairGenerator:
                                             "stats": "state", "seed": 0,
                                             "mean": self.joint_mean.tolist(),
                                             "std": self.joint_std.tolist()}}
+        with wp.ScopedStream(wp.stream_from_torch(device)):
+            self.model, self.data = _put_model_and_data_safe(
+                mjw, model, data, nworld=batch_size, nconmax=0, njmax=0
+            )
+            self.camera_from_world = torch.as_tensor(self.camera_from_world, dtype=torch.float32, device=device)
+            self.qpos = wp.to_torch(self.data.qpos)
+            self.site_pos = wp.to_torch(self.data.site_xpos)
+            self.site_rot = wp.to_torch(self.data.site_xmat)
 
     def __call__(self, joints):
-        import mujoco_warp as mjw
-        import warp as wp
-
-        from abc_sim.rendering.replay.renderer import _put_model_and_data_safe
-
-        wp.init()
         with wp.ScopedStream(wp.stream_from_torch(joints.device)):
-            key = (str(joints.device), len(joints))
-            if key not in self._warp_fk:
-                model, data = _put_model_and_data_safe(
-                    mjw, self.model, self.data, nworld=len(joints), nconmax=0, njmax=0
-                )
-                camera = torch.as_tensor(self.camera_from_world, dtype=joints.dtype, device=joints.device)
-                self._warp_fk[key] = (model, data, camera, wp.to_torch(data.qpos),
-                                     wp.to_torch(data.site_xpos), wp.to_torch(data.site_xmat))
-            model, data, camera, qpos, site_pos, site_rot = self._warp_fk[key]
-            qpos[:, self.qpos_indices] = joints
-            mjw.kinematics(model, data)
-            positions = site_pos[:, self.sites] @ camera[:3, :3].T + camera[:3, 3]
-            rotations = camera[:3, :3] @ site_rot[:, self.sites]
+            self.qpos[:, self.qpos_indices] = joints
+            mjw.kinematics(self.model, self.data)
+            positions = self.site_pos[:, self.sites] @ self.camera_from_world[:3, :3].T + self.camera_from_world[:3, 3]
+            rotations = self.camera_from_world[:3, :3] @ self.site_rot[:, self.sites]
             return torch.cat((positions, rotations[..., :, 0], rotations[..., :, 1]), dim=-1).flatten(1)
 
-    def sample_joints(self, count):
-        joints = self.rng.normal(self.joint_mean, self.joint_std, size=(count, 12)).astype(np.float32)
+    def sample_joints(self):
+        joints = self.rng.normal(self.joint_mean, self.joint_std, size=(self.batch_size, 12)).astype(np.float32)
         for _ in range(1000):
             outside = (joints < self.limits[:, 0]) | (joints > self.limits[:, 1])
             if not outside.any():
@@ -81,9 +70,8 @@ class PairGenerator:
             joints[rows, columns] = self.rng.normal(self.joint_mean[columns], self.joint_std[columns])
         raise RuntimeError("Could not sample joints within limits; check the state stats and robot model")
 
-    def sample(self, count, device):
-        joint_values = self.sample_joints(count)
-        joints = torch.from_numpy(joint_values).to(device)
+    def sample(self):
+        joints = torch.from_numpy(self.sample_joints()).to(self.device)
         return joints, self(joints)
 
 
@@ -95,20 +83,23 @@ def rotation_matrix(rotation6):
 
 
 class MLP(nn.Sequential):
-    def __init__(self, input_dim, hidden, output_dim):
-        super().__init__(
+    def __init__(self, input_dim, hidden, output_dim, depth=1):
+        layers = [
             nn.Linear(input_dim, hidden),
             nn.GELU(approximate="tanh"),
-            nn.Linear(hidden, output_dim),
-        )
+        ]
+        for _ in range(depth - 1):
+            layers.extend((nn.Linear(hidden, hidden), nn.GELU(approximate="tanh")))
+        layers.append(nn.Linear(hidden, output_dim))
+        super().__init__(*layers)
 
 
 class EEFAdapters(nn.Module):
     """Map raw poses/joints using shared state stats and trainable pose scaling."""
 
-    def __init__(self, state_mean, state_scale):
+    def __init__(self, state_mean, state_scale, ik_depth=3):
         super().__init__()
-        self.mlp_in = MLP(18, 256, 12)
+        self.mlp_in = MLP(18, 256, 12, depth=ik_depth)
         self.mlp_out = MLP(12, 256, 18)
         self.register_buffer("state_mean", torch.as_tensor(state_mean, dtype=torch.float32).clone())
         self.register_buffer("state_scale", torch.as_tensor(state_scale, dtype=torch.float32).clone())
@@ -144,7 +135,8 @@ class EEFAdapters(nn.Module):
 def load_adapters(checkpoint, device="cpu"):
     saved = torch.load(checkpoint, map_location=device, weights_only=True)
     model_state = saved["model"]
-    model = EEFAdapters(model_state["state_mean"], model_state["state_scale"]).to(device)
+    ik_depth = sum(key.startswith("mlp_in.") and key.endswith(".weight") for key in model_state) - 1
+    model = EEFAdapters(model_state["state_mean"], model_state["state_scale"], ik_depth=ik_depth).to(device)
     model.load_state_dict(model_state)
     return model.eval(), saved["kinematics"]
 
@@ -172,9 +164,10 @@ def main():
     parser.add_argument("--dit-checkpoint", type=Path, default=REPO / "cache/abc_dit_xl_200k_model.pt",
                         help="Checkpoint supplying state mean/std for joint sampling and both MLPs")
     parser.add_argument("--output", type=Path, default=REPO / "outputs/eef_adapters")
-    parser.add_argument("--steps", type=int, default=200000)
+    parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=16384)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     args = parser.parse_args()
     if min(args.steps, args.batch_size) < 1 or args.lr <= 0:
         parser.error("Steps, batch size and learning rate must be positive")
@@ -184,30 +177,40 @@ def main():
     device = "cuda"
     norm_stats = parse_norm_stats(torch.load(args.dit_checkpoint, map_location="cpu",
                                             mmap=True, weights_only=False)["norm_stats"])
-    generator = PairGenerator(norm_stats, args.camera_transform)
+    generator = PairGenerator(norm_stats, args.batch_size, device, args.camera_transform)
     model = EEFAdapters(generator.joint_mean, generator.joint_std + 1e-6).to(device)
-    val_joints, val_poses = generator.sample(4096, device)
+    val_joints, val_poses = generator.sample()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     args.output.mkdir(parents=True, exist_ok=True)
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    if args.wandb:
+        import wandb
+        wandb.init(project="abc-eef-adapters", config=config, dir=str(args.output))
     print(f"Two MLPs, {sum(p.numel() for p in model.parameters()):,} parameters; device={device}")
     best = float("inf")
     for step in range(1, args.steps + 1):
-        joints, poses = generator.sample(args.batch_size, device)
+        joints, poses = generator.sample()
         (loss_in, loss_out), _, _ = model(joints, poses)
         optimizer.zero_grad(set_to_none=True)
         (loss_in + loss_out).backward()
         optimizer.step()
         if step % 100 == 0:
             print(f"step {step:6d}  in_loss {loss_in.item():.6f}  out_loss {loss_out.item():.6f}", flush=True)
+            if args.wandb:
+                wandb.log({"train/in_loss": loss_in.item(), "train/out_loss": loss_out.item()},
+                          step=step)
         if step % 1000 == 0 or step == args.steps:
             metrics = validate(model, val_joints, val_poses)
             print("val " + json.dumps(metrics), flush=True)
+            if args.wandb:
+                wandb.log({f"val/{key}": value for key, value in metrics.items()}, step=step)
             if metrics["loss"] < best:
                 best = metrics["loss"]
                 checkpoint = {"model": model.state_dict(), "config": config, "step": step,
                               "kinematics": generator.metadata, "validation": metrics}
                 torch.save(checkpoint, args.output / "best.pt")
+    if args.wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
