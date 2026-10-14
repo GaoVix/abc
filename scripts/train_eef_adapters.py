@@ -157,8 +157,8 @@ def main():
     parser.add_argument("--dit-checkpoint", type=Path, default=REPO / "cache/abc_dit_xl_200k_model.pt", help="Checkpoint supplying state mean/std for joint sampling and both MLPs")
     parser.add_argument("--output", type=Path, default=REPO / "outputs/eef_adapters")
     parser.add_argument("--steps", type=int, default=100000)
-    parser.add_argument("--batch-size", type=int, default=16384)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=40960)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     args = parser.parse_args()
     if min(args.steps, args.batch_size) < 1 or args.lr <= 0:
@@ -170,7 +170,7 @@ def main():
     norm_stats = parse_norm_stats(torch.load(args.dit_checkpoint, map_location="cpu", mmap=True, weights_only=False)["norm_stats"])
     generator = PairGenerator(norm_stats, args.batch_size, device, args.camera_transform)
     model = EEFAdapters(generator.joint_mean, generator.joint_std + 1e-6).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     args.output.mkdir(parents=True, exist_ok=True)
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     if args.wandb:
