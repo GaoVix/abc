@@ -85,9 +85,8 @@ class MLP(nn.Sequential):
 
 
 class EEFAdapters(nn.Module):
-    """Map raw poses/joints using shared state stats and trainable pose scaling."""
 
-    def __init__(self, state_mean, state_scale, ik_depth=3):
+    def __init__(self, state_mean, state_scale, ik_depth=4):
         super().__init__()
         self.mlp_in = MLP(18, 256, 12, depth=ik_depth)
         self.mlp_out = MLP(12, 256, 18)
@@ -95,10 +94,6 @@ class EEFAdapters(nn.Module):
         self.register_buffer("state_scale", torch.as_tensor(state_scale, dtype=torch.float32).clone())
         self.pose_mean = nn.Parameter(torch.zeros(18))
         self.pose_log_std = nn.Parameter(torch.zeros(18))
-
-    @property
-    def pose_std(self):
-        return self.pose_log_std.exp().clamp_min(1e-3)
 
     def forward(self, joints, poses):
         joint_prediction = self.eef_to_joint(poses)
@@ -111,12 +106,12 @@ class EEFAdapters(nn.Module):
         return (loss_in, 10 * pos_loss + rot_loss), joint_prediction, pose_prediction
 
     def eef_to_joint(self, poses):
-        pose_input = (poses - self.pose_mean) / self.pose_std
+        pose_input = (poses - self.pose_mean) / self.pose_log_std.exp().clamp_min(1e-3)
         return self.mlp_in(pose_input) * self.state_scale + self.state_mean
 
     def predict_pose_values(self, joints):
         joint_input = (joints - self.state_mean) / self.state_scale
-        return self.mlp_out(joint_input) * self.pose_std + self.pose_mean
+        return self.mlp_out(joint_input) * self.pose_log_std.exp().clamp_min(1e-3) + self.pose_mean
 
     def joint_to_eef(self, joints):
         poses = self.predict_pose_values(joints)
