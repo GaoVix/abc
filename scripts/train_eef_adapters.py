@@ -73,23 +73,21 @@ def rotation_matrix(rotation6):
 
 
 class MLP(nn.Sequential):
-    def __init__(self, input_dim, hidden, output_dim, depth=1):
-        layers = [
-            nn.Linear(input_dim, hidden),
-            nn.GELU(approximate="tanh"),
-        ]
-        for _ in range(depth - 1):
-            layers.extend((nn.Linear(hidden, hidden), nn.GELU(approximate="tanh")))
-        layers.append(nn.Linear(hidden, output_dim))
+    def __init__(self, sizes):
+        layers = []
+        for index, (input_dim, output_dim) in enumerate(zip(sizes, sizes[1:])):
+            layers.append(nn.Linear(input_dim, output_dim))
+            if index < len(sizes) - 2:
+                layers.append(nn.GELU(approximate="tanh"))
         super().__init__(*layers)
 
 
 class EEFAdapters(nn.Module):
 
-    def __init__(self, state_mean, state_scale, ik_depth=4):
+    def __init__(self, state_mean, state_scale, ik_sizes=(18,64,128,256,128,64,12), fk_sizes=(12,64,128,64,18)):
         super().__init__()
-        self.mlp_in = MLP(18, 256, 12, depth=ik_depth)
-        self.mlp_out = MLP(12, 256, 18)
+        self.mlp_in = MLP(ik_sizes)
+        self.mlp_out = MLP(fk_sizes)
         self.register_buffer("state_mean", torch.as_tensor(state_mean, dtype=torch.float32).clone())
         self.register_buffer("state_scale", torch.as_tensor(state_scale, dtype=torch.float32).clone())
         self.pose_mean = nn.Parameter(torch.zeros(18))
@@ -123,8 +121,15 @@ class EEFAdapters(nn.Module):
 def load_adapters(checkpoint, device="cpu"):
     saved = torch.load(checkpoint, map_location=device, weights_only=True)
     model_state = saved["model"]
-    ik_depth = sum(key.startswith("mlp_in.") and key.endswith(".weight") for key in model_state) - 1
-    model = EEFAdapters(model_state["state_mean"], model_state["state_scale"], ik_depth=ik_depth).to(device)
+    sizes = {}
+    for name in ("mlp_in", "mlp_out"):
+        keys = sorted(
+            (key for key in model_state if key.startswith(f"{name}.") and key.endswith(".weight")),
+            key=lambda key: int(key.split(".")[1]),
+        )
+        sizes[name] = [model_state[keys[0]].shape[1]] + [model_state[key].shape[0] for key in keys]
+    model = EEFAdapters(model_state["state_mean"], model_state["state_scale"],
+                        ik_sizes=sizes["mlp_in"], fk_sizes=sizes["mlp_out"]).to(device)
     model.load_state_dict(model_state)
     return model.eval()
 
