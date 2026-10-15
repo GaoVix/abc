@@ -24,7 +24,9 @@ import tyro
 from prepare import download_url
 
 
-HF, REPO = "https://huggingface.co", "XDOF/ABC-130k"
+# Use the mirror by default; HF_ENDPOINT can select the official host or another endpoint.
+HF = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com").rstrip("/")
+REPO = "XDOF/ABC-130k"
 CACHE, UA = Path(os.environ.get("ABC_CACHE", "/tmp/abc_minimal_cache")), "abc-minimal-hf-task/1.0"
 
 
