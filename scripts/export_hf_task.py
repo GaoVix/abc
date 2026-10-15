@@ -28,7 +28,7 @@ if __name__ == "__main__":
 
 import tyro
 
-from prepare import download_url
+from prepare import download_url, verify_sha256
 
 
 # Use the mirror by default; HF_ENDPOINT can select the official host or another endpoint.
@@ -134,10 +134,25 @@ def read_json(url: str, tok: str | None):
             time.sleep(2 * attempt)
 
 
+def pin_revision(cfg: Config, tok: str | None) -> None:
+    """Resolve a moving branch once so listing and downloads use one snapshot."""
+    if len(cfg.revision) != 40 or any(c not in "0123456789abcdefABCDEF" for c in cfg.revision):
+        print(f"[source] resolving {cfg.repo_id}@{cfg.revision}...", flush=True)
+        info, _ = read_json(f"{HF}/api/datasets/{cfg.repo_id}/revision/{quote(cfg.revision)}", tok)
+        revision = info.get("sha")
+        if (not isinstance(revision, str) or len(revision) != 40
+                or any(c not in "0123456789abcdefABCDEF" for c in revision)):
+            raise RuntimeError("HF did not provide a commit SHA; refusing to use a moving data source")
+        cfg.revision = revision
+    print(f"[source] repo={cfg.repo_id}, task={cfg.task}, revision={cfg.revision}", flush=True)
+
+
 def list_files(cfg: Config, split: str, tok: str | None, suffix: str) -> list[dict]:
     """List every file under the task/split whose path ends with ``suffix``."""
     path = f"data/{split}/{cfg.task}"
-    url = f"{HF}/api/datasets/{cfg.repo_id}/tree/{cfg.revision}/{quote(path)}?recursive=1&expand=1"
+    # Path and size are available without expanded commit/security metadata.
+    # Omitting that extra metadata allows 1000 entries per page instead of 50.
+    url = f"{HF}/api/datasets/{cfg.repo_id}/tree/{cfg.revision}/{quote(path)}?recursive=1&expand=0"
     out, seen = [], set()
     while url:
         if url in seen:
@@ -149,11 +164,14 @@ def list_files(cfg: Config, split: str, tok: str | None, suffix: str) -> list[di
         if isinstance(payload, dict) and "error" in payload:
             raise RuntimeError(payload["error"])
         out += [
-            {"path": e["path"], "size": int(e.get("size") or 0)}
+            {"path": e["path"], "size": int(e.get("size") or 0),
+             "sha256": (e.get("lfs") or {}).get("oid")}
             for e in payload
             if e.get("type") == "file" and e.get("path", "").endswith(suffix)
         ]
-        print(f"[list] {split} {suffix.lstrip('/')} page {page}: {len(out)} files found", flush=True)
+        directories = sum(e.get("type") == "directory" for e in payload)
+        print(f"[list] {split} {suffix.lstrip('/')} page {page}: "
+              f"{len(payload)} entries ({directories} directories), {len(out)} matching files total", flush=True)
         url = next_page(link)
     return sorted(out, key=lambda e: e["path"])
 
@@ -184,15 +202,27 @@ def local_path(root: Path, item: dict) -> Path:
 
 def download(cfg: Config, tok: str | None, item: dict, root: Path) -> None:
     episode = Path(item["path"]).parts[3]
+    expected_sha256 = item.get("sha256")
+    if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            or any(char not in "0123456789abcdefABCDEF" for char in expected_sha256)):
+        raise RuntimeError(
+            f"HF did not provide a usable source SHA256 for {item['path']}. "
+            "For a gated dataset, accept access on Hugging Face and set an authorized HF_TOKEN. "
+            "Refusing to download without a content checksum."
+        )
+    dst = local_path(root, item)
     url = f"{HF}/datasets/{cfg.repo_id}/resolve/{cfg.revision}/{quote(item['path'])}"
     download_url(
         url,
-        local_path(root, item),
+        dst,
         expected=item["size"] or None,
         require_size=False,
         headers=headers(tok),
         label=episode,
     )
+    print(f"[sha256] verifying {episode}/{dst.name}...", flush=True)
+    verify_sha256(dst, expected_sha256.lower(), item["path"])
+    print(f"[sha256 OK] {episode}/{dst.name}", flush=True)
 
 
 def write_manifest(cfg: Config, split: str, files: list[dict],
@@ -249,6 +279,7 @@ def main(cfg: Config) -> None:
     print(f"[network] endpoint={HF}, ipv4={cfg.ipv4}", flush=True)
     tok = token(cfg)
     with ipv4_network(cfg.ipv4):
+        pin_revision(cfg, tok)
         for split in (("train", "val") if cfg.split == "all" else (cfg.split,)):
             run_split(cfg, split, tok)
 
