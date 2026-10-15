@@ -6,18 +6,25 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
+import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+if __name__ == "__main__":
+    print(f"[start] loading {Path(__file__).resolve()}", flush=True)
 
 import tyro
 
@@ -47,6 +54,25 @@ class Config:
     max_episodes: Annotated[int | None, tyro.conf.arg(help="Optional per-split cap for smoke tests.")] = None
     dry_run: Annotated[bool, tyro.conf.arg(help="List only; do not download or convert.")] = False
     keep_mcaps: Annotated[bool, tyro.conf.arg(help="Keep staged raw MCAPs after conversion.")] = False
+    ipv4: Annotated[bool, tyro.conf.arg(help="Use IPv4 for listing and downloads; --no-ipv4 restores system defaults.")] = True
+
+
+@contextmanager
+def ipv4_network(enabled: bool):
+    """Constrain this command's urllib connections, including download_url, to IPv4."""
+    if not enabled:
+        yield
+        return
+    getaddrinfo = socket.getaddrinfo
+
+    def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = ipv4_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = getaddrinfo
 
 
 def token(cfg: Config) -> str | None:
@@ -70,14 +96,19 @@ def next_page(link: str | None) -> str | None:
         return None
     for part in link.split(","):
         if 'rel="next"' in part:
-            return part[part.find("<") + 1 : part.find(">")]
+            url = urllib.parse.urljoin(HF + "/", part[part.find("<") + 1 : part.find(">")])
+            parsed = urllib.parse.urlsplit(url)
+            # Keep official-host pagination links on the selected mirror.
+            if parsed.hostname == "huggingface.co":
+                return HF + urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, parsed.fragment))
+            return url
     return None
 
 
 def open_hf(url: str, tok: str | None):
     req = urllib.request.Request(url, headers=headers(tok))
     try:
-        return urllib.request.urlopen(req, timeout=300)
+        return urllib.request.urlopen(req, timeout=30)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise RuntimeError(
@@ -90,16 +121,30 @@ def open_hf(url: str, tok: str | None):
 
 
 def read_json(url: str, tok: str | None):
-    with open_hf(url, tok) as r:
-        return json.loads(r.read()), r.headers.get("Link")
+    for attempt in range(1, 4):
+        try:
+            with open_hf(url, tok) as r:
+                return json.loads(r.read()), r.headers.get("Link")
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code < 500 and e.code not in (408, 429):
+                raise
+            if attempt == 3:
+                raise RuntimeError(f"HF file listing failed after 3 attempts: {url}: {e}") from e
+            print(f"[retry {attempt}/3] file listing: {e}; retrying...", flush=True)
+            time.sleep(2 * attempt)
 
 
 def list_files(cfg: Config, split: str, tok: str | None, suffix: str) -> list[dict]:
     """List every file under the task/split whose path ends with ``suffix``."""
     path = f"data/{split}/{cfg.task}"
     url = f"{HF}/api/datasets/{cfg.repo_id}/tree/{cfg.revision}/{quote(path)}?recursive=1&expand=1"
-    out = []
+    out, seen = [], set()
     while url:
+        if url in seen:
+            raise RuntimeError(f"HF listing returned a repeated pagination URL: {url}")
+        seen.add(url)
+        page = len(seen)
+        print(f"[list] {split} {suffix.lstrip('/')} page {page}: requesting (30s timeout)...", flush=True)
         payload, link = read_json(url, tok)
         if isinstance(payload, dict) and "error" in payload:
             raise RuntimeError(payload["error"])
@@ -108,6 +153,7 @@ def list_files(cfg: Config, split: str, tok: str | None, suffix: str) -> list[di
             for e in payload
             if e.get("type") == "file" and e.get("path", "").endswith(suffix)
         ]
+        print(f"[list] {split} {suffix.lstrip('/')} page {page}: {len(out)} files found", flush=True)
         url = next_page(link)
     return sorted(out, key=lambda e: e["path"])
 
@@ -200,9 +246,11 @@ def run_split(cfg: Config, split: str, tok: str | None) -> None:
 
 
 def main(cfg: Config) -> None:
+    print(f"[network] endpoint={HF}, ipv4={cfg.ipv4}", flush=True)
     tok = token(cfg)
-    for split in (("train", "val") if cfg.split == "all" else (cfg.split,)):
-        run_split(cfg, split, tok)
+    with ipv4_network(cfg.ipv4):
+        for split in (("train", "val") if cfg.split == "all" else (cfg.split,)):
+            run_split(cfg, split, tok)
 
 
 if __name__ == "__main__":
