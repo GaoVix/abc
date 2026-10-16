@@ -18,6 +18,7 @@ from abc_minimal.config import (
     validate_vla_checkpoint_config,
 )
 from abc_minimal.dit import CLIPTextEmbedder, DiTPolicy, load_pretrained
+from abc_minimal.eef_adapters import EEFInferenceAdapter
 from abc_minimal.preprocess import (
     normalize,
     parse_norm_stats,
@@ -72,6 +73,11 @@ class InferencePolicy:
 
     fast_rtc_warmup_replays = 1
     fast_inference_replay_warmups = 1
+    _warming_up = False
+
+    def reset(self) -> None:
+        if getattr(self, "eef_adapter", None) is not None:
+            self.eef_adapter.reset()
 
     def enable_fast_inference(
         self,
@@ -117,8 +123,10 @@ class InferencePolicy:
             }
         if warmup_noise is None:
             warmup_noise = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
+        self._warming_up = True
         for _ in range(max(1, replay_warmups)):
             self.infer(warmup_obs, noise=warmup_noise)
+        self._warming_up = False
         torch.cuda.synchronize(self.device)
         if rtc_prefix_length is not None:
             self.warmup_rtc(warmup_obs, warmup_noise, rtc_prefix_length)
@@ -162,6 +170,7 @@ class InferencePolicy:
             (*leading, self.chunk_length, self.action_dim), dtype=np.float32
         )
         replays = self.fast_rtc_warmup_replays if self._fast_inference_enabled else 1
+        self._warming_up = True
         for _ in range(replays):
             self.infer(
                 obs,
@@ -169,6 +178,7 @@ class InferencePolicy:
                 action_prefix=action_prefix,
                 prefix_length=prefix_length,
             )
+        self._warming_up = False
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
@@ -202,6 +212,11 @@ class DiTInferencePolicy(InferencePolicy):
         self._prompt = config.prompt
         self.task_vec = self.embedder.encode([self._prompt]).to(self.device)
         self._fast_inference_enabled = False
+        adapter_path = getattr(config, "eef_adapters", None)
+        self.eef_adapter = (
+            EEFInferenceAdapter(adapter_path, self.device, config.execute_chunk_dim)
+            if adapter_path else None
+        )
 
     def set_prompt(self, prompt: str) -> None:
         if prompt == self._prompt:
@@ -240,6 +255,9 @@ class DiTInferencePolicy(InferencePolicy):
         prefix_length = int(prefix_length or 0)
         m = self.model_config
         state = np.asarray(obs["state"], dtype=np.float32)
+        raw_state = state
+        if self.eef_adapter is not None:
+            state = self.eef_adapter.state(state)
         batched = state.ndim == 2
         prompt = obs.get("prompt", self._prompt)
         if batched:
@@ -286,8 +304,14 @@ class DiTInferencePolicy(InferencePolicy):
                 batch, num_steps=self.diffusion_steps, noise=noise_t
             )
         else:
+            # Reuse the preceding MLP_out camera poses directly for MLP_in;
+            # retain the original joint prefix for execution and IK seeds.
+            # Warmup prefixes are synthetic and must not consume this cache.
+            prefix_for_policy = action_prefix
+            if self.eef_adapter is not None and prefix_length and not self._warming_up:
+                prefix_for_policy = self.eef_adapter.action_prefix(action_prefix, prefix_length)
             prefix = self.normalized_action_prefix(
-                action_prefix, prefix_length
+                prefix_for_policy, prefix_length
             ).reshape(num_worlds, m.chunk_length, m.action_dim)
             prefix_t = torch.from_numpy(prefix).to(
                 device=self.device, dtype=batch["state"].dtype
@@ -303,6 +327,8 @@ class DiTInferencePolicy(InferencePolicy):
         actions_np = unnormalize(actions_np, self.norm_stats["actions"]).astype(
             np.float32
         )
+        if self.eef_adapter is not None and not self._warming_up:
+            actions_np = self.eef_adapter.actions(actions_np, raw_state, action_prefix, prefix_length)
         return actions_np if batched else actions_np[0]
 
 

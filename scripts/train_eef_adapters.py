@@ -157,7 +157,7 @@ def main():
     parser.add_argument("--camera-transform", type=Path, default=CAMERA_TRANSFORM, help="JSON with T_top_camera_from_world")
     parser.add_argument("--dit-checkpoint", type=Path, default=REPO / "cache/abc_dit_xl_200k_model.pt", help="Checkpoint supplying state mean/std for joint sampling and both MLPs")
     parser.add_argument("--output", type=Path, default=REPO / "outputs/eef_adapters")
-    parser.add_argument("--steps", type=int, default=100000)
+    parser.add_argument("--steps", type=int, default=1000000)
     parser.add_argument("--batch-size", type=int, default=40960)
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     args = parser.parse_args()
