@@ -11,7 +11,7 @@ conditioned, and the training/sampling forward calls.
 import os
 import time
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +48,7 @@ from abc_minimal.dit import (
     load_pretrained,
     task_name_to_prompt,
 )
+from abc_minimal.eef_adapters import EEFTrainingAdapter
 from abc_minimal.operator import load_operator_label_maps
 from abc_minimal.preprocess import load_norm_stats, parse_norm_stats
 from abc_minimal.vla import VLAPolicy, stack_camera_batch
@@ -207,6 +208,12 @@ def _build_dit_model(config, cache_root, device, resume_ckpt, rank, distributed)
     """Construct DiTPolicy and load its starting weights. Returns (model, norm_stats)."""
     checkpoint_path = cache_root / config.pretrained_ckpt_name
     backbone = config.model.vision_backbone
+    starting_ckpt = resume_ckpt
+    if starting_ckpt is None and config.load_pretrained:
+        starting_ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
+    adapter_checkpoint = (starting_ckpt or {}).get("eef_adapters") or config.eef_adapters
+    if adapter_checkpoint is not None:
+        config.model.action_dim = 20
     model = DiTPolicy(config.model)
     ckpt_norm_stats = None
     if resume_ckpt is not None:
@@ -215,8 +222,8 @@ def _build_dit_model(config, cache_root, device, resume_ckpt, rank, distributed)
         if rank == 0:
             print(f"resuming from {config.resume_from}")
     elif config.load_pretrained:
-        ckpt = load_pretrained(model, checkpoint_path)
-        ckpt_norm_stats = ckpt.get("norm_stats") if isinstance(ckpt, dict) else None
+        load_pretrained(model, starting_ckpt)
+        ckpt_norm_stats = starting_ckpt.get("norm_stats") if isinstance(starting_ckpt, dict) else None
         if rank == 0:
             print(f"loaded pretrained checkpoint {checkpoint_path}")
     elif backbone == "clip":
@@ -249,6 +256,8 @@ def _build_dit_model(config, cache_root, device, resume_ckpt, rank, distributed)
     norm_stats = _resolve_training_norm_stats(
         config, cache_root, ckpt_norm_stats, rank
     )
+    if adapter_checkpoint is not None:
+        model.eef_adapters = EEFTrainingAdapter(adapter_checkpoint, norm_stats)
     return model, norm_stats
 
 
@@ -404,6 +413,8 @@ def main(config: TrainConfig):
     # VLA lets SigLIP own image normalization (raw [0, 1]); DiT normalizes per backbone.
     norm_preset = None if is_vla else "auto"
     data_model_config = config.vla_model if is_vla else config.model
+    if hasattr(module, "eef_adapters"):
+        data_model_config = replace(data_model_config, action_dim=14)
     train_loader, train_components = build_train_loader(
         config, components, norm_stats, data_scope, resume_step,
         model_config=data_model_config,
@@ -458,6 +469,9 @@ def main(config: TrainConfig):
         if global_step >= config.train_steps:
             break
         batch = batch_to_device(batch, device, embedder, camera_keys)
+        if hasattr(module, "eef_adapters"):
+            module.eef_adapters.joint_noise_probability.fill_(max(1 - 2 * global_step / config.train_steps, 0))
+            batch = module.eef_adapters.prepare(batch)
         loss = model(batch, **flow)
         loss.backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), config.optim.max_grad_norm))
@@ -497,7 +511,7 @@ def main(config: TrainConfig):
             model_state, optimizer_state = fsdp_state_dicts(model, optimizer) if fsdp else (None, None)
             if data_scope.checkpoint_writer:
                 path = output_dir / f"{global_step}.pt"
-                model_config = asdict(config.vla_model) if is_vla else None
+                model_config = asdict(config.vla_model if is_vla else config.model)
                 save_checkpoint(path, module=module, optimizer=optimizer, scheduler=scheduler,
                                 global_step=global_step, norm_stats=norm_stats,
                                 batch_size=config.batch_size, data_world=data_scope.world,
@@ -514,6 +528,8 @@ def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
                     distributed, rank, wandb, global_step):
     """Per-component val_recon_error (generation MSE) and val_loss (diffusion loss)."""
     module.eval()
+    if hasattr(module, "eef_adapters"):
+        module.eef_adapters.joint_noise_probability.zero_()
     sharded = hasattr(module, "unshard")  # FSDP2 root: sample_actions bypasses its forward hook
     if sharded:
         module.unshard()
@@ -524,10 +540,13 @@ def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
         err_sum, elem_count, loss_sum, batch_count = 0.0, 0, 0.0, 0
         for vb in vl:
             vb = batch_to_device(vb, device, embedder, camera_keys)
+            if hasattr(module, "eef_adapters"):
+                vb = module.eef_adapters.prepare(vb)
             with torch.no_grad():
-                pred = module.sample_actions(vb, num_steps=config.flow.num_diffusion_steps)
-                err_sum += F.mse_loss(pred, vb["actions"], reduction="sum").item()
-                elem_count += vb["actions"].numel()
+                sample_batch = module.eef_adapters(vb) if hasattr(module, "eef_adapters") else vb
+                pred = module.sample_actions(sample_batch, num_steps=config.flow.num_diffusion_steps)
+                err_sum += F.mse_loss(pred, sample_batch["actions"], reduction="sum").item()
+                elem_count += sample_batch["actions"].numel()
                 loss_sum += module(
                     vb, max_action_prefix=0, prefix_conditioning_prob=0.0
                 ).item()

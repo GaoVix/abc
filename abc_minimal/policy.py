@@ -18,7 +18,7 @@ from abc_minimal.config import (
     validate_vla_checkpoint_config,
 )
 from abc_minimal.dit import CLIPTextEmbedder, DiTPolicy, load_pretrained
-from abc_minimal.eef_adapters import EEFInferenceAdapter
+from abc_minimal.eef_adapters import EEF_GRIPPER_INDICES, EEF_POSE_INDICES, EEFInferenceAdapter
 from abc_minimal.preprocess import (
     normalize,
     parse_norm_stats,
@@ -139,9 +139,11 @@ class InferencePolicy:
         self,
         action_prefix: np.ndarray,
         prefix_length: int,
+        stats=None,
     ) -> np.ndarray:
         """Pad a prefix to a full chunk and normalize it (leading batch dims ok)."""
-        chunk_length, action_dim = self.chunk_length, self.action_dim
+        stats = self.norm_stats["actions"] if stats is None else stats
+        chunk_length, action_dim = self.chunk_length, len(stats["mean"])
         prefix = np.asarray(action_prefix, dtype=np.float32)
         if prefix.shape[-2:] == (prefix_length, action_dim):
             full_prefix = np.zeros(
@@ -154,7 +156,7 @@ class InferencePolicy:
                 f"action_prefix must end in shape {(chunk_length, action_dim)} "
                 f"or {(prefix_length, action_dim)}, got {prefix.shape}"
             )
-        return normalize(prefix, self.norm_stats["actions"]).astype(
+        return normalize(prefix, stats).astype(
             np.float32, copy=False
         )
 
@@ -201,9 +203,11 @@ class DiTInferencePolicy(InferencePolicy):
         self.device = torch.device(device)
         self.diffusion_steps = config.diffusion_steps
         self.chunk_length = self.model_config.chunk_length
-        self.action_dim = self.model_config.action_dim
+        ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
+        self.model_config.action_dim = model_state_dict(ckpt)["y_embedder.weight"].shape[1]
+        self.action_dim = 14 if self.model_config.action_dim == 20 else self.model_config.action_dim
         self.model = DiTPolicy(self.model_config).to(self.device)
-        ckpt = load_pretrained(self.model, checkpoint)
+        load_pretrained(self.model, ckpt)
         self.model.eval()
         self.norm_preset = preset_for_backbone(self.model_config.vision_backbone)
         self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
@@ -212,11 +216,20 @@ class DiTInferencePolicy(InferencePolicy):
         self._prompt = config.prompt
         self.task_vec = self.embedder.encode([self._prompt]).to(self.device)
         self._fast_inference_enabled = False
-        adapter_path = getattr(config, "eef_adapters", None)
+        adapter_checkpoint = getattr(config, "eef_adapters", None) or ckpt.get("eef_adapters")
         self.eef_adapter = (
-            EEFInferenceAdapter(adapter_path, self.device, config.execute_chunk_dim)
-            if adapter_path else None
+            EEFInferenceAdapter(adapter_checkpoint, self.device, config.execute_chunk_dim, self.model_config.action_dim)
+            if adapter_checkpoint else None
         )
+        self.action_norm_stats = self.norm_stats["actions"]
+        if self.model_config.action_dim == 20:
+            self.action_norm_stats = {
+                key: np.empty(20, dtype=np.float32)
+                for key in ("mean", "std")
+            }
+            for key, values in self.action_norm_stats.items():
+                values[EEF_POSE_INDICES] = getattr(self.eef_adapter.mlps, f"pose_{key}").cpu().numpy()
+                values[EEF_GRIPPER_INDICES] = self.norm_stats["actions"][key][[6, 13]]
 
     def set_prompt(self, prompt: str) -> None:
         if prompt == self._prompt:
@@ -304,14 +317,13 @@ class DiTInferencePolicy(InferencePolicy):
                 batch, num_steps=self.diffusion_steps, noise=noise_t
             )
         else:
-            # Reuse the preceding MLP_out camera poses directly for MLP_in;
-            # retain the original joint prefix for execution and IK seeds.
-            # Warmup prefixes are synthetic and must not consume this cache.
             prefix_for_policy = action_prefix
-            if self.eef_adapter is not None and prefix_length and not self._warming_up:
+            if self.eef_adapter is not None and not self._warming_up:
                 prefix_for_policy = self.eef_adapter.action_prefix(action_prefix, prefix_length)
+            elif m.action_dim == 20:
+                prefix_for_policy = np.zeros((*np.shape(action_prefix)[:-1], 20), dtype=np.float32)
             prefix = self.normalized_action_prefix(
-                prefix_for_policy, prefix_length
+                prefix_for_policy, prefix_length, self.action_norm_stats
             ).reshape(num_worlds, m.chunk_length, m.action_dim)
             prefix_t = torch.from_numpy(prefix).to(
                 device=self.device, dtype=batch["state"].dtype
@@ -324,7 +336,7 @@ class DiTInferencePolicy(InferencePolicy):
                 noise=noise_t,
             )
         actions_np = actions.float().detach().cpu().numpy()
-        actions_np = unnormalize(actions_np, self.norm_stats["actions"]).astype(
+        actions_np = unnormalize(actions_np, self.action_norm_stats).astype(
             np.float32
         )
         if self.eef_adapter is not None and not self._warming_up:

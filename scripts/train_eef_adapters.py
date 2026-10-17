@@ -84,14 +84,23 @@ class MLP(nn.Sequential):
 
 class EEFAdapters(nn.Module):
 
-    def __init__(self, state_mean, state_scale, ik_sizes=(18,64,128,256,512,256,128,64,12), fk_sizes=(12,64,128,64,18)):
+    def __init__(
+        self, state_mean, state_scale, pose_mean, pose_std,
+        ik_sizes=(18, 64, 128, 256, 512, 256, 128, 64, 12), fk_sizes=(12, 64, 128, 64, 18),
+    ):
         super().__init__()
         self.mlp_in = MLP(ik_sizes)
         self.mlp_out = MLP(fk_sizes)
         self.register_buffer("state_mean", torch.as_tensor(state_mean, dtype=torch.float32).clone())
         self.register_buffer("state_scale", torch.as_tensor(state_scale, dtype=torch.float32).clone())
-        self.pose_mean = nn.Parameter(torch.zeros(18))
-        self.pose_log_std = nn.Parameter(torch.zeros(18))
+        self.register_buffer("pose_mean", torch.as_tensor(pose_mean, dtype=torch.float32).clone())
+        self.register_buffer("pose_std", torch.as_tensor(pose_std, dtype=torch.float32).clone())
+        if self.pose_mean.shape != (18,) or self.pose_std.shape != (18,):
+            raise ValueError("Pose mean and std must each contain 18 values")
+        if not torch.isfinite(self.pose_mean).all() or not torch.isfinite(self.pose_std).all():
+            raise ValueError("Pose mean and std must be finite")
+        if (self.pose_std < 0).any():
+            raise ValueError("Pose std must be nonnegative")
 
     def forward(self, joints, poses):
         joint_prediction = self.eef_to_joint(poses)
@@ -104,12 +113,12 @@ class EEFAdapters(nn.Module):
         return (loss_in, 10 * pos_loss + rot_loss), joint_prediction, pose_prediction
 
     def eef_to_joint(self, poses):
-        pose_input = (poses - self.pose_mean) / self.pose_log_std.exp().clamp_min(1e-3)
+        pose_input = (poses - self.pose_mean) / (self.pose_std + 1e-6)
         return self.mlp_in(pose_input) * self.state_scale + self.state_mean
 
     def predict_pose_values(self, joints):
         joint_input = (joints - self.state_mean) / self.state_scale
-        return self.mlp_out(joint_input) * self.pose_log_std.exp().clamp_min(1e-3) + self.pose_mean
+        return self.mlp_out(joint_input) * (self.pose_std + 1e-6) + self.pose_mean
 
     def joint_to_eef(self, joints):
         poses = self.predict_pose_values(joints)
@@ -119,7 +128,7 @@ class EEFAdapters(nn.Module):
 
 
 def load_adapters(checkpoint, device="cpu"):
-    saved = torch.load(checkpoint, map_location=device, weights_only=True)
+    saved = checkpoint if isinstance(checkpoint, dict) else torch.load(checkpoint, map_location=device, weights_only=True)
     model_state = saved["model"]
     sizes = {}
     for name in ("mlp_in", "mlp_out"):
@@ -128,8 +137,10 @@ def load_adapters(checkpoint, device="cpu"):
             key=lambda key: int(key.split(".")[1]),
         )
         sizes[name] = [model_state[keys[0]].shape[1]] + [model_state[key].shape[0] for key in keys]
-    model = EEFAdapters(model_state["state_mean"], model_state["state_scale"],
-                        ik_sizes=sizes["mlp_in"], fk_sizes=sizes["mlp_out"]).to(device)
+    with torch.random.fork_rng(devices=[]):
+        model = EEFAdapters(model_state["state_mean"], model_state["state_scale"],
+                            model_state["pose_mean"], model_state["pose_std"],
+                            ik_sizes=sizes["mlp_in"], fk_sizes=sizes["mlp_out"]).to(device)
     model.load_state_dict(model_state)
     return model.eval()
 
@@ -156,8 +167,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera-transform", type=Path, default=CAMERA_TRANSFORM, help="JSON with T_top_camera_from_world")
     parser.add_argument("--dit-checkpoint", type=Path, default=REPO / "cache/abc_dit_xl_200k_model.pt", help="Checkpoint supplying state mean/std for joint sampling and both MLPs")
+    parser.add_argument("--pose-norm-stats", type=Path, required=True, help="JSON with 18-dimensional EEF pose mean and std")
     parser.add_argument("--output", type=Path, default=REPO / "outputs/eef_adapters")
-    parser.add_argument("--steps", type=int, default=1000000)
+    parser.add_argument("--steps", type=int, default=350000)
     parser.add_argument("--batch-size", type=int, default=40960)
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     args = parser.parse_args()
@@ -168,8 +180,10 @@ def main():
         raise RuntimeError("CUDA is required for mjwarp FK training")
     device = "cuda"
     norm_stats = parse_norm_stats(torch.load(args.dit_checkpoint, map_location="cpu", mmap=True, weights_only=False)["norm_stats"])
+    pose_stats = json.loads(args.pose_norm_stats.read_text())
     generator = PairGenerator(norm_stats, args.batch_size, device, args.camera_transform)
-    model = EEFAdapters(generator.joint_mean, generator.joint_std + 1e-6).to(device)
+    model = EEFAdapters(generator.joint_mean, generator.joint_std + 1e-6,
+                        pose_stats["mean"], pose_stats["std"]).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     args.output.mkdir(parents=True, exist_ok=True)
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}

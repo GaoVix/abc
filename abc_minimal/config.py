@@ -169,6 +169,7 @@ class TrainConfig:
     load_pretrained: bool = False
     pretrained_ckpt_name: str = "abc_dit_xl_200k_model.pt"
     inherit_ckpt_norm_stats: bool = True  # scale inputs with the checkpoint's own norm_stats, as during pretraining
+    eef_adapters: str | None = None
     resume_from: str | None = None
     dino_bf16: bool = True
     # Backbone compute only; parameters and pool/head stay FP32.
@@ -374,6 +375,8 @@ def validate_train_config(
 
     if config.load_pretrained and config.resume_from:
         errors.append("--load-pretrained and --resume-from are mutually exclusive")
+    if config.eef_adapters and config.policy != "dit":
+        errors.append("--eef-adapters is supported for DiT finetuning only")
     if config.fsdp and (config.policy != "vla" or config.compile_siglip):
         errors.append("--fsdp is VLA-only and excludes --compile-siglip")
 
