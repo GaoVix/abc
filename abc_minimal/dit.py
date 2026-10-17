@@ -939,8 +939,10 @@ class DiTPolicy(nn.Module):
         prefix_noise_scale=0.0,
     ):
         """Flow-matching training loss with optional action-prefix conditioning.
-        batch: state (B,14), images dict, actions (B,30,14), task_vec_clip (B,512),
+        batch: state (B,14), images dict, actions (B,T,D), task_vec_clip (B,512),
         optional state_is_masked (B,) bool."""
+        if hasattr(self, "eef_adapters"):
+            batch = self.eef_adapters(batch)
         state = batch["state"]
         actions = batch["actions"]
         N, T_chunk, D_action = actions.shape
@@ -964,6 +966,10 @@ class DiTPolicy(nn.Module):
             t_per_pos = t
 
         x_t = (1 - t_per_pos) * actions + t_per_pos * noise
+        if hasattr(self, "eef_adapters"):
+            x_t, noise = self.eef_adapters.noise(batch, t_per_pos, x_t, noise)
+            if prefix_mask_expanded is not None:
+                x_t = torch.where(prefix_mask_expanded, actions, x_t)
         if prefix_noise_scale > 0.0 and prefix_mask_expanded is not None:
             x_t = x_t + prefix_mask_expanded.float() * torch.randn_like(x_t) * prefix_noise_scale
 
@@ -1046,10 +1052,16 @@ class DiTPolicy(nn.Module):
 
 def load_pretrained(model, ckpt_path):
     """Load a production checkpoint (model-only, compile prefixes stripped)."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+    ckpt = ckpt_path if isinstance(ckpt_path, dict) else torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
     sd = ckpt["model"] if "model" in ckpt else ckpt
     sd = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v for k, v in sd.items()}
+    resized = []
+    for key in ("y_embedder.weight", "final_layer.linear.weight", "final_layer.linear.bias"):
+        if sd[key].shape != model.state_dict()[key].shape:
+            sd.pop(key)
+            resized.append(key)
     missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing = [key for key in missing if key not in resized]
     if missing:
         raise RuntimeError(
             f"checkpoint is missing model keys — wrong checkpoint for "

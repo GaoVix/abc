@@ -21,6 +21,7 @@ from abc_minimal.config import (
     validate_model_config,
     validate_vla_model_config,
 )
+from abc_minimal.eval_progress import EvalProgress
 from abc_minimal.policy import (
     DiTInferencePolicy,
     VLAInferencePolicy,
@@ -535,6 +536,9 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
         env = _make_env(config, tuple(model_config.camera_keys))
         rollout = rollout_worlds
     physics = resolved_physics(env)
+    if physics is not None and getattr(policy, "eef_adapter", None) is not None:
+        for controller in policy.eef_adapter.controllers:
+            controller.dt = 1.0 / physics["control_hz"]
     if physics is not None:
         print(
             f"[physics] dt={physics['physics_dt']} "
@@ -565,6 +569,7 @@ def rollout_worlds(
     """Roll out the worlds one at a time in CPU MuJoCo; returns their records."""
     rng = np.random.default_rng(config.policy_seed)
     worlds = []
+    progress = EvalProgress(config.num_worlds, config.num_chunks, detailed=config.log_every_chunk)
     fast_inference_ready = False
     rtc_warmup_ready = False
     action_shape = (model_config.chunk_length, model_config.action_dim)
@@ -587,12 +592,13 @@ def rollout_worlds(
                 env.forget_arm_state()
                 try:
                     obs = env.reset(seed=seed, options=options)
-                    print(f"world={world_index:03d} unplaceable from the carried "
-                          "arm pose, placed from init_q")
+                    progress.write(f"world={world_index:03d} unplaceable from the carried "
+                                   "arm pose, placed from init_q")
                 except RandomizationSamplingError:
                     seed = int(config.seed + world_index + 100_000)
-                    print(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
+                    progress.write(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
                     obs = env.reset(seed=seed, options=options)
+            policy.reset()
             if config.fast_inference and not fast_inference_ready:
                 warmup_rng = np.random.default_rng(config.policy_seed)
                 warmup_noise = sample_noise(warmup_rng)
@@ -676,6 +682,7 @@ def rollout_worlds(
                         inference_lead_steps=config.rtc_inference_lead_steps,
                         execute_chunk_dim=config.execute_chunk_dim,
                     )
+                progress.start(world_index)
                 for chunk in range(config.num_chunks):
                     t_chunk = time.perf_counter()
                     chunk_infer_s = current_infer_s
@@ -712,6 +719,7 @@ def rollout_worlds(
                             break
                     steps_s = time.perf_counter() - t_steps
                     if rollout_over(final_eval):
+                        progress.chunk(chunk + 1, reward=float(final_eval.get("reward", 0.0)))
                         break
                     if rtc is None and chunk + 1 < config.num_chunks:
                         t_obs = time.perf_counter()
@@ -752,21 +760,14 @@ def rollout_worlds(
                         ),
                     }
                     chunk_metrics.append(without_missing_counts(metric))
-                    if config.log_every_chunk:
-                        rtc_text = (
-                            f" rtc_ready_at_chunk_end={rtc_ready}"
-                            if config.rtc
-                            else ""
-                        )
-                        print(
-                            f"world={world_index:03d} chunk={chunk:02d} "
-                            f"infer={metric['infer_s'] * 1000:.0f}ms "
-                            f"steps={metric['steps_s'] * 1000:.0f}ms "
-                            f"render={metric['obs_render_s'] * 1000:.0f}ms "
-                            f"{progress_text(final_eval, 'num_bottles_in_bin')} "
-                            f"done={rollout_over(final_eval)}{rtc_text}",
-                            flush=True,
-                        )
+                    progress.chunk(
+                        chunk + 1,
+                        reward=metric["reward"],
+                        infer_s=metric["infer_s"],
+                        steps_s=metric["steps_s"],
+                        render_s=metric["obs_render_s"],
+                        rtc_ready=rtc_ready,
+                    )
             finally:
                 if rtc is not None:
                     rtc.close()
@@ -788,13 +789,9 @@ def rollout_worlds(
                 "video_path": str(video_path) if video_path is not None else None,
             }
             worlds.append(world)
-            print(
-                f"world={world_index:03d} done success={world['success']} "
-                f"{progress_text(final_eval, 'max_bottles_in_bin_so_far')} "
-                f"steps={steps}",
-                flush=True,
-            )
+            progress.finish_world(success=world["success"], reward=world["reward"])
     finally:
+        progress.close()
         env.close()
     return worlds
 

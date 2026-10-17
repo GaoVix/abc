@@ -252,7 +252,7 @@ To run the evaluation, download the sim assets once (`uv run prepare.py --sim`;
 the first launch also compiles MJWarp's CUDA kernels, ~1 min):
 
 ```bash
-# 20 worlds, save a video of each rollout, log per-chunk progress.
+# 20 worlds, save a video of each rollout, show chunk timings in one progress bar.
 uv run eval_policy.py \
     --checkpoint cache/bottles_75k.pt \
     --num-worlds 20 \
@@ -273,6 +273,11 @@ uv run eval_policy.py \
 Any catalogue task is selected by name with `--task`. The task list, eval
 flags, prompt defaults, and the released checkpoints' expected numbers are all
 documented in the [abc_sim README](abc_sim/README.md#sim-eval).
+
+Evaluation displays one progress bar for the entire run, with completed worlds,
+the current world/batch and chunk, and the running success rate. `--log-every-chunk`
+adds chunk timings to that same bar. Detailed per-chunk metrics remain in
+`summary.json` regardless of this flag.
 
 ## Real-robot deployment
 

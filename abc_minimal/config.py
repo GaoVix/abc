@@ -127,6 +127,9 @@ MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
     "tshirt": [
         MixtureComponent("train_real", "val_real", 1.0, "folding_tshirt_pile_and_stacking"),
     ],
+    "load_the_plates_into_the_dish_rack": [
+        MixtureComponent("train_real", "val_real", 1.0, "load_the_plates_into_the_dish_rack"),
+    ],
     # Single-task sim finetuning: point --cache-root at a cache holding exactly
     # one task's episodes (prepare.py --sim-data <task> into a fresh root). The
     # component reads everything under train_sim/, and each episode's own
@@ -158,12 +161,15 @@ class TrainConfig:
     num_workers: int = 16
     train_steps: int = 75_000
 
-    mixture_preset: Literal["bottles", "tshirt", "sim_task"] = "bottles"
+    mixture_preset: Literal[
+        "bottles", "tshirt", "sim_task", "load_the_plates_into_the_dish_rack"
+    ] = "bottles"
     mixture: list[MixtureComponent] = field(default_factory=list)
 
     load_pretrained: bool = False
     pretrained_ckpt_name: str = "abc_dit_xl_200k_model.pt"
     inherit_ckpt_norm_stats: bool = True  # scale inputs with the checkpoint's own norm_stats, as during pretraining
+    eef_adapters: str | None = None
     resume_from: str | None = None
     dino_bf16: bool = True
     # Backbone compute only; parameters and pool/head stay FP32.
@@ -262,6 +268,7 @@ class SimEvalConfig:
     policy: Literal["auto", "dit", "vla"] = "auto"
     task: str = "put_plastic_bottles_in_bin"  # any abc_sim task name, alias, or prompt
     norm_stats_path: str | None = None
+    eef_adapters: str | None = None  # IK/FK checkpoint path.
     output_dir: str | None = None  # None resolves to $REPO/outputs/sim_eval_<task>.
     num_worlds: int = 5
     seed: int = 20260511
@@ -283,7 +290,7 @@ class SimEvalConfig:
     rtc: bool = True  # condition each inference on the next rtc_prefix_length unexecuted actions (prefix == lead)
     rtc_prefix_length: int = 4
     rtc_inference_lead_steps: int = 4
-    log_every_chunk: bool = False
+    log_every_chunk: bool = False  # Show chunk timings in the single progress bar.
     save_video: bool = False
     video_fps: int = 30
     video_every_n_actions: int = 1
@@ -368,6 +375,8 @@ def validate_train_config(
 
     if config.load_pretrained and config.resume_from:
         errors.append("--load-pretrained and --resume-from are mutually exclusive")
+    if config.eef_adapters and config.policy != "dit":
+        errors.append("--eef-adapters is supported for DiT finetuning only")
     if config.fsdp and (config.policy != "vla" or config.compile_siglip):
         errors.append("--fsdp is VLA-only and excludes --compile-siglip")
 
@@ -655,5 +664,3 @@ def validate_vla_checkpoint_config(
             + "\n".join(f"  - {problem}" for problem in problems)
         )
     return True
-
-
