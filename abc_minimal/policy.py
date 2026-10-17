@@ -73,7 +73,6 @@ class InferencePolicy:
 
     fast_rtc_warmup_replays = 1
     fast_inference_replay_warmups = 1
-    _warming_up = False
 
     def reset(self) -> None:
         if getattr(self, "eef_adapter", None) is not None:
@@ -123,10 +122,8 @@ class InferencePolicy:
             }
         if warmup_noise is None:
             warmup_noise = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
-        self._warming_up = True
         for _ in range(max(1, replay_warmups)):
-            self.infer(warmup_obs, noise=warmup_noise)
-        self._warming_up = False
+            self.infer(warmup_obs, noise=warmup_noise, _warmup=True)
         torch.cuda.synchronize(self.device)
         if rtc_prefix_length is not None:
             self.warmup_rtc(warmup_obs, warmup_noise, rtc_prefix_length)
@@ -172,15 +169,14 @@ class InferencePolicy:
             (*leading, self.chunk_length, self.action_dim), dtype=np.float32
         )
         replays = self.fast_rtc_warmup_replays if self._fast_inference_enabled else 1
-        self._warming_up = True
         for _ in range(replays):
             self.infer(
                 obs,
                 noise=noise,
                 action_prefix=action_prefix,
                 prefix_length=prefix_length,
+                _warmup=True,
             )
-        self._warming_up = False
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
@@ -262,11 +258,13 @@ class DiTInferencePolicy(InferencePolicy):
         noise: np.ndarray | None = None,
         action_prefix: np.ndarray | None = None,
         prefix_length: int | None = 0,
+        _warmup: bool = False,
     ) -> np.ndarray:
         if action_prefix is not None and prefix_length is None:
             prefix_length = np.shape(action_prefix)[-2]
         prefix_length = int(prefix_length or 0)
         m = self.model_config
+        action_adapter = None if _warmup else self.eef_adapter
         state = np.asarray(obs["state"], dtype=np.float32)
         raw_state = state
         if self.eef_adapter is not None:
@@ -318,8 +316,8 @@ class DiTInferencePolicy(InferencePolicy):
             )
         else:
             prefix_for_policy = action_prefix
-            if self.eef_adapter is not None and not self._warming_up:
-                prefix_for_policy = self.eef_adapter.action_prefix(action_prefix, prefix_length)
+            if action_adapter is not None:
+                prefix_for_policy = action_adapter.action_prefix(action_prefix, prefix_length)
             elif m.action_dim == 20:
                 prefix_for_policy = np.zeros((*np.shape(action_prefix)[:-1], 20), dtype=np.float32)
             prefix = self.normalized_action_prefix(
@@ -339,8 +337,8 @@ class DiTInferencePolicy(InferencePolicy):
         actions_np = unnormalize(actions_np, self.action_norm_stats).astype(
             np.float32
         )
-        if self.eef_adapter is not None and not self._warming_up:
-            actions_np = self.eef_adapter.actions(actions_np, raw_state, action_prefix, prefix_length)
+        if action_adapter is not None:
+            actions_np = action_adapter.actions(actions_np, raw_state, action_prefix, prefix_length)
         return actions_np if batched else actions_np[0]
 
 
@@ -444,6 +442,7 @@ class VLAInferencePolicy(InferencePolicy):
         noise: np.ndarray | None = None,
         action_prefix: np.ndarray | None = None,
         prefix_length: int | None = 0,
+        _warmup: bool = False,
     ) -> np.ndarray:
         if action_prefix is not None and prefix_length is None:
             prefix_length = np.shape(action_prefix)[-2]
