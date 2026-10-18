@@ -128,7 +128,8 @@ MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
         MixtureComponent("train_real", "val_real", 1.0, "folding_tshirt_pile_and_stacking"),
     ],
     "load_the_plates_into_the_dish_rack": [
-        MixtureComponent("train_real", "val_real", 1.0, "load_the_plates_into_the_dish_rack"),
+        MixtureComponent("train_real", "val_real", 0.8, "load_the_plates_into_the_dish_rack"),
+        MixtureComponent("train_sim", "val_sim", 0.2, "sim_load_the_plates_into_the_dish_rack"),
     ],
     # Single-task sim finetuning: point --cache-root at a cache holding exactly
     # one task's episodes (prepare.py --sim-data <task> into a fresh root). The

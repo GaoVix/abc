@@ -11,7 +11,7 @@ import warp as wp
 
 from abc_sim.rendering.replay.renderer import _put_model_and_data_safe
 from deploy.robot.control.mink_ik import MinkArmController
-from scripts.train_eef_adapters import JOINT_STATE_INDICES, load_adapters, rotation_matrix
+from scripts.train_eef_adapters import CAMERA_TRANSFORM, JOINT_STATE_INDICES, load_adapters, rotation_matrix
 
 KINEMATIC_MODEL = Path(__file__).resolve().parents[1] / "abc_sim/models/yam_dishrack_base.xml"
 EEF_POSE_INDICES = [*range(9), *range(10, 19)]
@@ -20,8 +20,11 @@ EEF_GRIPPER_INDICES = [9, 19]
 
 class EEFKinematics:
     def __init__(self, camera_transform):
+        camera_transform = Path(camera_transform)
+        if not camera_transform.is_file() and camera_transform.parts[-2:] == ("scripts", CAMERA_TRANSFORM.name):
+            camera_transform = CAMERA_TRANSFORM
         self.camera_transform = str(camera_transform)
-        self.camera = np.asarray(json.loads(Path(camera_transform).read_text())["T_top_camera_from_world"])
+        self.camera = np.asarray(json.loads(camera_transform.read_text())["T_top_camera_from_world"])
         self.model = mujoco.MjModel.from_xml_path(str(KINEMATIC_MODEL))
         self.data = mujoco.MjData(self.model)
         joints = [self.model.joint(f"{side}_joint{j}").id for side in ("left", "right") for j in range(1, 7)]
