@@ -33,7 +33,9 @@ uv run torchrun --standalone --nproc-per-node 4 train.py \
   --num-workers 16 \
   --train-steps 10000 \
   --log-every 5 \
-  --val-every 10000 \
+  --log-wandb \
+  --wandb-project abc-dishrack \
+  --val-every 1000 \
   --ckpt-every 10000
 
 
