@@ -219,7 +219,7 @@ def run_sim_task_viewer(cfg: VizPolicyConfig) -> None:
         float(gym_env.model.opt.timestep),
         getattr(gym_env, "_control_decimation", None),
     )
-    action_shape = (model_config.chunk_length, model_config.action_dim)
+    action_shape = (model_config.chunk_length, policy.noise_dim)
     print(
         f"task={sim.task} prompt={sim.prompt!r} control={1.0 / step_period_s:.0f}Hz",
         flush=True,

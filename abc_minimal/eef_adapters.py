@@ -103,15 +103,12 @@ class EEFTrainingAdapter(torch.nn.Module):
         return torch.cat((poses[..., :9], actions[..., 6:7], poses[..., 9:], actions[..., 13:14]), dim=-1)
 
     def noise(self, batch, t, x_t, noise):
-        clean, noisy, endpoint = self.eef_to_joint(torch.stack((batch["actions"], x_t, noise))).unbind(0)
+        clean, noisy = self.eef_to_joint(torch.stack((batch["actions"], x_t))).unbind(0)
         joint_noise = torch.randn_like(clean)
         joint_noise[..., [6, 13]] = noise[..., EEF_GRIPPER_INDICES]
         joint_noisy = (1 - t) * clean + t * joint_noise
         d = self.eef_noise_weight
-        return self.joint_to_eef(torch.stack((
-            d * noisy + (1 - d) * joint_noisy,
-            d * endpoint + (1 - d) * joint_noise,
-        ))).unbind(0)
+        return d * noisy + (1 - d) * joint_noisy, clean
 
 
 class EEFInferenceAdapter(EEFKinematics):

@@ -98,7 +98,7 @@ def rollout_batched_worlds(
     """Roll out the worlds ``parallel_worlds`` at a time; returns their records."""
     n = config.parallel_worlds
     camera_keys = model_config.camera_keys
-    action_shape = (model_config.chunk_length, model_config.action_dim)
+    action_shape = (model_config.chunk_length, policy.noise_dim)
     # One noise stream per world, so a world's rollout does not depend on the batch width.
     rngs = [np.random.default_rng([config.policy_seed, i]) for i in range(config.num_worlds)]
 

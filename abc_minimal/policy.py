@@ -18,7 +18,7 @@ from abc_minimal.config import (
     validate_vla_checkpoint_config,
 )
 from abc_minimal.dit import CLIPTextEmbedder, DiTPolicy, load_pretrained
-from abc_minimal.eef_adapters import EEF_GRIPPER_INDICES, EEF_POSE_INDICES, EEFInferenceAdapter
+from abc_minimal.eef_adapters import EEF_GRIPPER_INDICES, EEF_POSE_INDICES, EEFInferenceAdapter, EEFTrainingAdapter
 from abc_minimal.preprocess import (
     normalize,
     parse_norm_stats,
@@ -74,6 +74,10 @@ class InferencePolicy:
     fast_rtc_warmup_replays = 1
     fast_inference_replay_warmups = 1
 
+    @property
+    def noise_dim(self):
+        return 20 if hasattr(self.model, "eef_adapters") else self.model_config.action_dim
+
     def reset(self) -> None:
         if getattr(self, "eef_adapter", None) is not None:
             self.eef_adapter.reset()
@@ -121,7 +125,7 @@ class InferencePolicy:
                 "prompt": self.config.prompt,
             }
         if warmup_noise is None:
-            warmup_noise = np.zeros((m.chunk_length, m.action_dim), dtype=np.float32)
+            warmup_noise = np.zeros((m.chunk_length, self.noise_dim), dtype=np.float32)
         for _ in range(max(1, replay_warmups)):
             self.infer(warmup_obs, noise=warmup_noise, _warmup=True)
         torch.cuda.synchronize(self.device)
@@ -217,6 +221,8 @@ class DiTInferencePolicy(InferencePolicy):
             EEFInferenceAdapter(adapter_checkpoint, self.device, config.execute_chunk_dim, self.model_config.action_dim)
             if adapter_checkpoint else None
         )
+        if ckpt.get("eef_adapters") and self.model_config.action_dim == 14:
+            self.model.eef_adapters = EEFTrainingAdapter(adapter_checkpoint, self.norm_stats).to(self.device).eval()
         self.action_norm_stats = self.norm_stats["actions"]
         if self.model_config.action_dim == 20:
             self.action_norm_stats = {
@@ -307,7 +313,7 @@ class DiTInferencePolicy(InferencePolicy):
         noise_t = None
         if noise is not None:
             noise_arr = np.asarray(noise, dtype=np.float32).reshape(
-                num_worlds, m.chunk_length, m.action_dim
+                num_worlds, m.chunk_length, self.noise_dim
             )
             noise_t = torch.from_numpy(noise_arr).to(self.device)
         if self.eef_adapter is not None and m.action_dim == 20:

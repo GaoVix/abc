@@ -572,7 +572,7 @@ def rollout_worlds(
     progress = EvalProgress(config.num_worlds, config.num_chunks, detailed=config.log_every_chunk)
     fast_inference_ready = False
     rtc_warmup_ready = False
-    action_shape = (model_config.chunk_length, model_config.action_dim)
+    action_shape = (model_config.chunk_length, policy.noise_dim)
 
     def sample_noise(generator: np.random.Generator) -> np.ndarray:
         return generator.standard_normal(action_shape, dtype=np.float32)
