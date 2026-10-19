@@ -310,6 +310,10 @@ class DiTInferencePolicy(InferencePolicy):
                 num_worlds, m.chunk_length, m.action_dim
             )
             noise_t = torch.from_numpy(noise_arr).to(self.device)
+        if self.eef_adapter is not None and m.action_dim == 20:
+            if noise_t is None:
+                noise_t = torch.randn(num_worlds, m.chunk_length, m.action_dim, device=self.device)
+            noise_t = self.eef_adapter.mlps.transform_eef_noise(noise_t)
         if action_prefix is None:
             actions = self.model.sample_actions(
                 batch, num_steps=self.diffusion_steps, noise=noise_t

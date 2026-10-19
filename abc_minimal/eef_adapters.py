@@ -69,7 +69,7 @@ class EEFTrainingAdapter(torch.nn.Module):
         for name in ("state", "actions"):
             self.register_buffer(f"{name}_mean", torch.as_tensor(norm_stats[name]["mean"], dtype=torch.float32).clone())
             self.register_buffer(f"{name}_scale", torch.as_tensor(norm_stats[name]["std"], dtype=torch.float32).clone() + 1e-6)
-        self.register_buffer("joint_noise_probability", torch.ones(()))
+        self.register_buffer("eef_noise_weight", torch.zeros(()))
 
     @torch.no_grad()
     def prepare(self, batch):
@@ -89,7 +89,12 @@ class EEFTrainingAdapter(torch.nn.Module):
         poses = (batch["eef_actions"] - self.mlps.pose_mean) / (self.mlps.pose_std + 1e-6)
         actions = torch.cat((poses[..., :9], batch["actions"][..., 6:7],
                              poses[..., 9:], batch["actions"][..., 13:14]), dim=-1)
-        return {**batch, "state": state, "actions": actions, "joint_actions": batch["actions"]}
+        return {**batch, "state": state, "actions": actions}
+
+    def eef_to_joint(self, actions):
+        joints = self.mlps.mlp_in(actions[..., EEF_POSE_INDICES]) * self.mlps.state_scale + self.mlps.state_mean
+        joints = (joints - self.actions_mean[JOINT_STATE_INDICES]) / self.actions_scale[JOINT_STATE_INDICES]
+        return torch.cat((joints[..., :6], actions[..., 9:10], joints[..., 6:], actions[..., 19:20]), dim=-1)
 
     def joint_to_eef(self, actions):
         physical = actions * self.actions_scale + self.actions_mean
@@ -98,12 +103,15 @@ class EEFTrainingAdapter(torch.nn.Module):
         return torch.cat((poses[..., :9], actions[..., 6:7], poses[..., 9:], actions[..., 13:14]), dim=-1)
 
     def noise(self, batch, t, x_t, noise):
-        joints = batch["joint_actions"]
-        joint_noise = torch.randn_like(joints)
-        joint_noisy = (1 - t) * joints + t * joint_noise
-        eef_noisy, eef_noise = self.joint_to_eef(torch.stack((joint_noisy, joint_noise))).unbind(0)
-        use_joints = torch.rand(len(joints), 1, 1, device=joints.device) < self.joint_noise_probability
-        return torch.where(use_joints, eef_noisy, x_t), torch.where(use_joints, eef_noise, noise)
+        clean, noisy, endpoint = self.eef_to_joint(torch.stack((batch["actions"], x_t, noise))).unbind(0)
+        joint_noise = torch.randn_like(clean)
+        joint_noise[..., [6, 13]] = noise[..., EEF_GRIPPER_INDICES]
+        joint_noisy = (1 - t) * clean + t * joint_noise
+        d = self.eef_noise_weight
+        return self.joint_to_eef(torch.stack((
+            d * noisy + (1 - d) * joint_noisy,
+            d * endpoint + (1 - d) * joint_noise,
+        ))).unbind(0)
 
 
 class EEFInferenceAdapter(EEFKinematics):

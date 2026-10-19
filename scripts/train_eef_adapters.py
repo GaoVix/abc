@@ -116,6 +116,11 @@ class EEFAdapters(nn.Module):
         pose_input = (poses - self.pose_mean) / (self.pose_std + 1e-6)
         return self.mlp_in(pose_input) * self.state_scale + self.state_mean
 
+    def transform_eef_noise(self, noise):
+        arms = noise.unflatten(-1, (2, 10))
+        poses = self.mlp_out(self.mlp_in(arms[..., :9].flatten(-2))).unflatten(-1, (2, 9))
+        return torch.cat((poses, arms[..., 9:]), dim=-1).flatten(-2)
+
     def predict_pose_values(self, joints):
         joint_input = (joints - self.state_mean) / self.state_scale
         return self.mlp_out(joint_input) * (self.pose_std + 1e-6) + self.pose_mean

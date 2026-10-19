@@ -470,7 +470,7 @@ def main(config: TrainConfig):
             break
         batch = batch_to_device(batch, device, embedder, camera_keys)
         if hasattr(module, "eef_adapters"):
-            module.eef_adapters.joint_noise_probability.fill_(max(1 - 2 * global_step / config.train_steps, 0))
+            module.eef_adapters.eef_noise_weight.fill_(min(2 * global_step / config.train_steps, 1))
             batch = module.eef_adapters.prepare(batch)
         loss = model(batch, **flow)
         loss.backward()
@@ -529,7 +529,7 @@ def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
     """Per-component val_recon_error (generation MSE) and val_loss (diffusion loss)."""
     module.eval()
     if hasattr(module, "eef_adapters"):
-        module.eef_adapters.joint_noise_probability.zero_()
+        module.eef_adapters.eef_noise_weight.fill_(1)
     sharded = hasattr(module, "unshard")  # FSDP2 root: sample_actions bypasses its forward hook
     if sharded:
         module.unshard()
@@ -544,7 +544,11 @@ def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
                 vb = module.eef_adapters.prepare(vb)
             with torch.no_grad():
                 sample_batch = module.eef_adapters(vb) if hasattr(module, "eef_adapters") else vb
-                pred = module.sample_actions(sample_batch, num_steps=config.flow.num_diffusion_steps)
+                noise = (
+                    module.eef_adapters.mlps.transform_eef_noise(torch.randn_like(sample_batch["actions"]))
+                    if hasattr(module, "eef_adapters") else None
+                )
+                pred = module.sample_actions(sample_batch, num_steps=config.flow.num_diffusion_steps, noise=noise)
                 err_sum += F.mse_loss(pred, sample_batch["actions"], reduction="sum").item()
                 elem_count += sample_batch["actions"].numel()
                 loss_sum += module(
