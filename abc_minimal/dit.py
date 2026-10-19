@@ -979,11 +979,12 @@ class DiTPolicy(nn.Module):
         c = self.compute_cond(state, batch["task_vec_clip"], t_cond)
         prediction = self.predict_velocity(x_t, c, vision_tokens)
 
-        target = noise - actions
         if hasattr(self, "eef_adapters"):
             pred_noised_joint = clean_joint + prediction
             prediction = self.eef_adapters.joint_to_eef(pred_noised_joint)
             target = self.eef_adapters.joint_to_eef(x_t)
+        else:
+            target = noise - actions
         if prefix_mask_expanded is not None:
             postfix_mask = ~prefix_mask_expanded
             masked_loss = ((target - prediction) ** 2) * postfix_mask.float()
@@ -996,7 +997,7 @@ class DiTPolicy(nn.Module):
             noise = torch.randn(state.shape[0], self.chunk_length, dim,
                                 device=state.device, dtype=self.y_embedder.weight.dtype)
         noise = noise.to(device=state.device, dtype=self.y_embedder.weight.dtype)
-        if hasattr(self, "eef_adapters") and noise.shape[-1] == 20:
+        if hasattr(self, "eef_adapters"):
             noise = self.eef_adapters.eef_to_joint(noise)
         return noise
 

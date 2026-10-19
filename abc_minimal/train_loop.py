@@ -11,7 +11,7 @@ conditioned, and the training/sampling forward calls.
 import os
 import time
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -413,8 +413,6 @@ def main(config: TrainConfig):
     # VLA lets SigLIP own image normalization (raw [0, 1]); DiT normalizes per backbone.
     norm_preset = None if is_vla else "auto"
     data_model_config = config.vla_model if is_vla else config.model
-    if hasattr(module, "eef_adapters"):
-        data_model_config = replace(data_model_config, action_dim=14)
     train_loader, train_components = build_train_loader(
         config, components, norm_stats, data_scope, resume_step,
         model_config=data_model_config,

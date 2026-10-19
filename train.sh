@@ -27,6 +27,7 @@ uv run torchrun --standalone --nproc-per-node 4 train.py \
   --load-pretrained \
   --eef-adapters output/eef_adapters_fixed_stats_350k/best.pt \
   --cache-root cache/dishrack_real \
+  --output-dir output/dit_eef_pose_residual_20261019 \
   --pretrained-ckpt-name "$PWD/cache/abc_dit_xl_200k_model.pt" \
   --mixture-preset load_the_plates_into_the_dish_rack \
   --batch-size 90 \
