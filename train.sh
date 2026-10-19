@@ -31,7 +31,7 @@ uv run torchrun --standalone --nproc-per-node 4 train.py \
   --mixture-preset load_the_plates_into_the_dish_rack \
   --batch-size 90 \
   --num-workers 16 \
-  --train-steps 50000 \
+  --train-steps 100000 \
   --log-every 5 \
   --log-wandb \
   --wandb-project abc-dishrack \
