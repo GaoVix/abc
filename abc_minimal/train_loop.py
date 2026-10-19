@@ -470,7 +470,7 @@ def main(config: TrainConfig):
             break
         batch = batch_to_device(batch, device, embedder, camera_keys)
         if hasattr(module, "eef_adapters"):
-            module.eef_adapters.eef_noise_weight.fill_(min(2 * global_step / config.train_steps, 1))
+            module.eef_adapters.eef_noise_weight.fill_(min(global_step / (0.3 * config.train_steps), 1))
             batch = module.eef_adapters.prepare(batch)
         loss = model(batch, **flow)
         loss.backward()
