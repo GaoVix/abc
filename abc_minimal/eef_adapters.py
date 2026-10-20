@@ -69,7 +69,6 @@ class EEFTrainingAdapter(torch.nn.Module):
         for name in ("state", "actions"):
             self.register_buffer(f"{name}_mean", torch.as_tensor(norm_stats[name]["mean"], dtype=torch.float32).clone())
             self.register_buffer(f"{name}_scale", torch.as_tensor(norm_stats[name]["std"], dtype=torch.float32).clone() + 1e-6)
-        self.register_buffer("eef_noise_weight", torch.zeros(()))
 
     @torch.no_grad()
     def prepare(self, batch):
@@ -97,18 +96,11 @@ class EEFTrainingAdapter(torch.nn.Module):
         return torch.cat((joints[..., :6], actions[..., 9:10], joints[..., 6:], actions[..., 19:20]), dim=-1)
 
     def joint_to_eef(self, actions):
+        """Decode the joint-shaped DiT output as normalized EEF velocity."""
         physical = actions * self.actions_scale + self.actions_mean
         joints = (physical[..., JOINT_STATE_INDICES] - self.mlps.state_mean) / self.mlps.state_scale
         poses = self.mlps.mlp_out(joints)
         return torch.cat((poses[..., :9], actions[..., 6:7], poses[..., 9:], actions[..., 13:14]), dim=-1)
-
-    def noise(self, batch, t, x_t, noise):
-        clean, noisy = self.eef_to_joint(torch.stack((batch["actions"], x_t))).unbind(0)
-        joint_noise = torch.randn_like(clean)
-        joint_noise[..., [6, 13]] = noise[..., EEF_GRIPPER_INDICES]
-        joint_noisy = (1 - t) * clean + t * joint_noise
-        d = self.eef_noise_weight
-        return d * noisy + (1 - d) * joint_noisy, clean
 
 
 class EEFInferenceAdapter(EEFKinematics):

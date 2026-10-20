@@ -924,11 +924,16 @@ class DiTPolicy(nn.Module):
         return self.cond_proj(cond_concat).to(model_dtype)
 
     def predict_velocity(self, x_t, c, vision_tokens, prefix_mask=None):
-        """Run the action head: velocity normally, joint residual with EEF adapters."""
+        """Predict action-space velocity, wrapping the 14D DiT for EEF actions."""
+        if hasattr(self, "eef_adapters"):
+            x_t = self.eef_adapters.eef_to_joint(x_t)
         z = self.y_embedder(x_t) + self.pos_embed.data[:, : x_t.shape[1], :]
         for block in self.blocks:
             z = block(z, c, vision_tokens, prefix_mask)
-        return self.final_layer(z, c, prefix_mask)
+        prediction = self.final_layer(z, c, prefix_mask)
+        if hasattr(self, "eef_adapters"):
+            prediction = self.eef_adapters.joint_to_eef(prediction)
+        return prediction
 
     def forward(
         self,
@@ -939,7 +944,7 @@ class DiTPolicy(nn.Module):
         prefix_conditioning_prob=1.0,
         prefix_noise_scale=0.0,
     ):
-        """Flow-matching loss, or EEF reconstruction loss with EEF adapters.
+        """Flow-matching loss in joint space, or EEF space with adapters.
         batch: state (B,14), images dict, actions (B,T,D), task_vec_clip (B,512),
         optional state_is_masked (B,) bool."""
         if hasattr(self, "eef_adapters"):
@@ -967,72 +972,62 @@ class DiTPolicy(nn.Module):
             t_per_pos = t
 
         x_t = (1 - t_per_pos) * actions + t_per_pos * noise
-        if hasattr(self, "eef_adapters"):
-            x_t, clean_joint = self.eef_adapters.noise(batch, t_per_pos, x_t, noise)
-            if prefix_mask_expanded is not None:
-                x_t = torch.where(prefix_mask_expanded, clean_joint, x_t)
         if prefix_noise_scale > 0.0 and prefix_mask_expanded is not None:
             x_t = x_t + prefix_mask_expanded.float() * torch.randn_like(x_t) * prefix_noise_scale
 
         vision_tokens = self.build_vision_tokens(batch["images"])
         t_cond = t_per_pos.squeeze(-1) if prefix_mask_expanded is not None else t[:, 0, 0]
         c = self.compute_cond(state, batch["task_vec_clip"], t_cond)
-        prediction = self.predict_velocity(x_t, c, vision_tokens)
+        v_t = self.predict_velocity(x_t, c, vision_tokens)
 
-        if hasattr(self, "eef_adapters"):
-            pred_noised_joint = clean_joint + prediction
-            prediction = self.eef_adapters.joint_to_eef(pred_noised_joint)
-            target = self.eef_adapters.joint_to_eef(x_t)
-        else:
-            target = noise - actions
+        u_t = noise - actions
         if prefix_mask_expanded is not None:
             postfix_mask = ~prefix_mask_expanded
-            masked_loss = ((target - prediction) ** 2) * postfix_mask.float()
+            masked_loss = ((u_t - v_t) ** 2) * postfix_mask.float()
             return masked_loss.sum() / (postfix_mask.float().sum() * D_action + 1e-8)
-        return F.mse_loss(target, prediction)
-
-    def _sample_noise(self, state, noise):
-        if noise is None:
-            dim = 20 if hasattr(self, "eef_adapters") else self.action_dim
-            noise = torch.randn(state.shape[0], self.chunk_length, dim,
-                                device=state.device, dtype=self.y_embedder.weight.dtype)
-        noise = noise.to(device=state.device, dtype=self.y_embedder.weight.dtype)
-        if hasattr(self, "eef_adapters"):
-            noise = self.eef_adapters.eef_to_joint(noise)
-        return noise
-
-    def _sampling_step(self, x_t, prediction, t, dt):
-        if hasattr(self, "eef_adapters"):
-            # The residual is x_t - clean; move toward clean over the remaining time.
-            prediction = prediction.float() / t
-        return (x_t + dt * prediction).to(x_t.dtype)
+        return F.mse_loss(u_t, v_t)
 
     @torch.no_grad()
     def sample_actions(self, batch, num_steps=10, noise=None):
-        """Multistep joint sampling, using residual predictions with EEF adapters.
+        """Euler integration from noise in joint space, or EEF space with adapters.
         Vision tokens and the static conditioning are computed once and reused
         across steps, like production infer()."""
         state = batch["state"]
         B = state.shape[0]
         model_dtype = self.y_embedder.weight.dtype
-        x_t = self._sample_noise(state, noise)
+        if noise is None:
+            noise = torch.randn(
+                B,
+                self.chunk_length,
+                20 if hasattr(self, "eef_adapters") else self.action_dim,
+                device=state.device,
+                dtype=model_dtype,
+            )
+        x_t = noise.to(device=state.device, dtype=model_dtype)
         vision_tokens = self.build_vision_tokens(batch["images"])
         dt = -1.0 / num_steps
         for i in range(num_steps):
-            time = 1.0 + i * dt
-            t = torch.full((B,), time, device=state.device, dtype=model_dtype)
+            t = torch.full((B,), 1.0 + i * dt, device=state.device, dtype=model_dtype)
             c = self.compute_cond(state, batch["task_vec_clip"], t)
-            prediction = self.predict_velocity(x_t, c, vision_tokens)
-            x_t = self._sampling_step(x_t, prediction, time, dt)
+            v = self.predict_velocity(x_t, c, vision_tokens)
+            x_t = x_t + v * dt
         return x_t
 
     @torch.no_grad()
     def sample_actions_rtc(self, batch, action_prefix, prefix_length: int, num_steps=10, noise=None):
-        """Multistep sampling with per-position action-prefix conditioning."""
+        """Euler sampling with per-position action-prefix conditioning."""
         state = batch["state"]
         B = state.shape[0]
         model_dtype = self.y_embedder.weight.dtype
-        x_t = self._sample_noise(state, noise)
+        if noise is None:
+            noise = torch.randn(
+                B,
+                self.chunk_length,
+                20 if hasattr(self, "eef_adapters") else self.action_dim,
+                device=state.device,
+                dtype=model_dtype,
+            )
+        x_t = noise.to(device=state.device, dtype=model_dtype)
         action_prefix = action_prefix.to(device=state.device, dtype=model_dtype)
 
         prefix_pos = torch.arange(self.chunk_length, device=state.device) < prefix_length
@@ -1043,17 +1038,16 @@ class DiTPolicy(nn.Module):
         vision_tokens = self.build_vision_tokens(batch["images"])
         dt = -1.0 / num_steps
         for i in range(num_steps):
-            time = 1.0 + i * dt
-            t = torch.full((B,), time, device=state.device, dtype=model_dtype)
+            t = torch.full((B,), 1.0 + i * dt, device=state.device, dtype=model_dtype)
             t_pair = torch.stack([torch.zeros_like(t), t], dim=1)
             c_pair = self.compute_cond(state, batch["task_vec_clip"], t_pair)
-            prediction = self.predict_velocity(
+            v = self.predict_velocity(
                 x_t,
                 c_pair,
                 vision_tokens,
                 prefix_t_mask,
             )
-            x_t = self._sampling_step(x_t, prediction, time, dt)
+            x_t = x_t + v * dt
             x_t = torch.where(prefix_mask, action_prefix, x_t)
         return x_t
 
@@ -1063,13 +1057,7 @@ def load_pretrained(model, ckpt_path):
     ckpt = ckpt_path if isinstance(ckpt_path, dict) else torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
     sd = ckpt["model"] if "model" in ckpt else ckpt
     sd = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v for k, v in sd.items()}
-    resized = []
-    for key in ("y_embedder.weight", "final_layer.linear.weight", "final_layer.linear.bias"):
-        if sd[key].shape != model.state_dict()[key].shape:
-            sd.pop(key)
-            resized.append(key)
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    missing = [key for key in missing if key not in resized]
     if missing:
         raise RuntimeError(
             f"checkpoint is missing model keys — wrong checkpoint for "

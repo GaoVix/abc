@@ -468,7 +468,6 @@ def main(config: TrainConfig):
             break
         batch = batch_to_device(batch, device, embedder, camera_keys)
         if hasattr(module, "eef_adapters"):
-            module.eef_adapters.eef_noise_weight.fill_(min(global_step / (0.3 * config.train_steps), 1))
             batch = module.eef_adapters.prepare(batch)
         loss = model(batch, **flow)
         loss.backward()
@@ -526,8 +525,6 @@ def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
                     distributed, rank, wandb, global_step):
     """Per-component val_recon_error (generation MSE) and val_loss (diffusion loss)."""
     module.eval()
-    if hasattr(module, "eef_adapters"):
-        module.eef_adapters.eef_noise_weight.fill_(1)
     sharded = hasattr(module, "unshard")  # FSDP2 root: sample_actions bypasses its forward hook
     if sharded:
         module.unshard()
@@ -543,8 +540,6 @@ def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
             with torch.no_grad():
                 sample_batch = module.eef_adapters(vb) if hasattr(module, "eef_adapters") else vb
                 pred = module.sample_actions(sample_batch, num_steps=config.flow.num_diffusion_steps)
-                if hasattr(module, "eef_adapters"):
-                    pred = module.eef_adapters.joint_to_eef(pred)
                 err_sum += F.mse_loss(pred, sample_batch["actions"], reduction="sum").item()
                 elem_count += sample_batch["actions"].numel()
                 loss_sum += module(

@@ -217,14 +217,16 @@ class DiTInferencePolicy(InferencePolicy):
         self.task_vec = self.embedder.encode([self._prompt]).to(self.device)
         self._fast_inference_enabled = False
         adapter_checkpoint = getattr(config, "eef_adapters", None) or ckpt.get("eef_adapters")
+        eef_flow = adapter_checkpoint is not None and self.model_config.action_dim == 14
         self.eef_adapter = (
-            EEFInferenceAdapter(adapter_checkpoint, self.device, config.execute_chunk_dim, self.model_config.action_dim)
+            EEFInferenceAdapter(adapter_checkpoint, self.device, config.execute_chunk_dim,
+                                20 if eef_flow else self.model_config.action_dim)
             if adapter_checkpoint else None
         )
-        if ckpt.get("eef_adapters") and self.model_config.action_dim == 14:
+        if eef_flow:
             self.model.eef_adapters = EEFTrainingAdapter(adapter_checkpoint, self.norm_stats).to(self.device).eval()
         self.action_norm_stats = self.norm_stats["actions"]
-        if self.model_config.action_dim == 20:
+        if self.noise_dim == 20:
             self.action_norm_stats = {
                 key: np.empty(20, dtype=np.float32)
                 for key in ("mean", "std")
@@ -328,11 +330,11 @@ class DiTInferencePolicy(InferencePolicy):
             prefix_for_policy = action_prefix
             if action_adapter is not None:
                 prefix_for_policy = action_adapter.action_prefix(action_prefix, prefix_length)
-            elif m.action_dim == 20:
+            elif self.noise_dim == 20:
                 prefix_for_policy = np.zeros((*np.shape(action_prefix)[:-1], 20), dtype=np.float32)
             prefix = self.normalized_action_prefix(
                 prefix_for_policy, prefix_length, self.action_norm_stats
-            ).reshape(num_worlds, m.chunk_length, m.action_dim)
+            ).reshape(num_worlds, m.chunk_length, self.noise_dim)
             prefix_t = torch.from_numpy(prefix).to(
                 device=self.device, dtype=batch["state"].dtype
             )
