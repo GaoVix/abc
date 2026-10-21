@@ -19,7 +19,7 @@ JOINT_STATE_INDICES = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
 
 
 class PairGenerator:
-    def __init__(self, norm_stats, batch_size, device, camera_transform=CAMERA_TRANSFORM):
+    def __init__(self, norm_stats, batch_size, device, camera_transform=CAMERA_TRANSFORM, rotation_dim=6):
         wp.init()
         stream = wp.stream_from_torch(device)
         wp.set_device(stream.device)
@@ -28,6 +28,7 @@ class PairGenerator:
         data = mujoco.MjData(model)
         self.batch_size = batch_size
         self.device = device
+        self.rotation_dim = rotation_dim
         self.camera_from_world = torch.tensor(
             json.loads(camera_transform.read_text())["T_top_camera_from_world"],
             dtype=torch.float32,
@@ -50,7 +51,9 @@ class PairGenerator:
         mjw.kinematics(self.model, self.data)
         positions = self.site_pos[:, self.sites, :] @ self.camera_from_world[:3, :3].T + self.camera_from_world[:3, 3]
         rotations = self.camera_from_world[:3, :3] @ self.site_rot[:, self.sites, :, :]
-        return torch.cat((positions, rotations[:, :, :, 0], rotations[:, :, :, 1]), dim=-1).flatten(1)
+        orientation = (rotation_vector(rotations) if self.rotation_dim == 3
+                       else torch.cat((rotations[..., 0], rotations[..., 1]), dim=-1))
+        return torch.cat((positions, orientation), dim=-1).flatten(1)
 
     def __call__(self):
         joints = self.rng.normal(self.joint_mean, self.joint_std, size=(self.batch_size, 12)).astype(np.float32)
@@ -206,7 +209,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera-transform", type=Path, default=CAMERA_TRANSFORM, help="JSON with T_top_camera_from_world")
     parser.add_argument("--dit-checkpoint", type=Path, default=REPO / "cache/abc_dit_xl_200k_model.pt", help="Checkpoint supplying state mean/std for joint sampling and both MLPs")
-    parser.add_argument("--pose-norm-stats", type=Path, required=True, help="JSON with 18-dimensional EEF pose mean and std")
+    parser.add_argument("--pose-norm-stats", type=Path, required=True, help="JSON with 12D rotvec or 18D rotation6D EEF pose mean/std (grippers excluded)")
     parser.add_argument("--output", type=Path, default=REPO / "outputs/eef_adapters")
     parser.add_argument("--steps", type=int, default=350000)
     parser.add_argument("--batch-size", type=int, default=40960)
@@ -220,7 +223,10 @@ def main():
     device = "cuda"
     norm_stats = parse_norm_stats(torch.load(args.dit_checkpoint, map_location="cpu", mmap=True, weights_only=False)["norm_stats"])
     pose_stats = json.loads(args.pose_norm_stats.read_text())
-    generator = PairGenerator(norm_stats, args.batch_size, device, args.camera_transform)
+    pose_dim = len(pose_stats["mean"])
+    if pose_dim not in (12, 18):
+        parser.error("Pose statistics must contain 12 (rotvec) or 18 (rotation6D) values")
+    generator = PairGenerator(norm_stats, args.batch_size, device, args.camera_transform, rotation_dim=pose_dim // 2 - 3)
     model = EEFAdapters(generator.joint_mean, generator.joint_std + 1e-6,
                         pose_stats["mean"], pose_stats["std"]).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
