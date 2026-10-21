@@ -32,7 +32,6 @@ class MinkArmController:
         posture_cost: float = 5e-3,
         max_joint_delta: float = 0.12,
         solver: str = "daqp",
-        model=None,
     ) -> None:
         try:
             import mink
@@ -48,7 +47,7 @@ class MinkArmController:
         self.iterations = max(1, int(iterations))
         self.max_joint_delta = float(max_joint_delta)
         self.solver = solver
-        self.model = model if model is not None else mujoco.MjModel.from_xml_path(str(find_yam_model()))
+        self.model = mujoco.MjModel.from_xml_path(str(find_yam_model()))
         if self.model.nq != 6 or self.model.nv != 6:
             raise RuntimeError(
                 f"Expected a six-DoF YAM model, got nq={self.model.nq}, nv={self.model.nv}"

@@ -924,16 +924,10 @@ class DiTPolicy(nn.Module):
         return self.cond_proj(cond_concat).to(model_dtype)
 
     def predict_velocity(self, x_t, c, vision_tokens, prefix_mask=None):
-        """Predict action-space velocity, wrapping the 14D DiT for EEF actions."""
-        if hasattr(self, "eef_adapters"):
-            x_t = self.eef_adapters.eef_to_joint(x_t)
         z = self.y_embedder(x_t) + self.pos_embed.data[:, : x_t.shape[1], :]
         for block in self.blocks:
             z = block(z, c, vision_tokens, prefix_mask)
-        prediction = self.final_layer(z, c, prefix_mask)
-        if hasattr(self, "eef_adapters"):
-            prediction = self.eef_adapters.joint_to_eef(prediction)
-        return prediction
+        return self.final_layer(z, c, prefix_mask)
 
     def forward(
         self,
@@ -944,11 +938,9 @@ class DiTPolicy(nn.Module):
         prefix_conditioning_prob=1.0,
         prefix_noise_scale=0.0,
     ):
-        """Flow-matching loss in joint space, or EEF space with adapters.
-        batch: state (B,14), images dict, actions (B,T,D), task_vec_clip (B,512),
+        """Flow-matching training loss with optional action-prefix conditioning.
+        batch: state (B,14), images dict, actions (B,30,14), task_vec_clip (B,512),
         optional state_is_masked (B,) bool."""
-        if hasattr(self, "eef_adapters"):
-            batch = self.eef_adapters(batch)
         state = batch["state"]
         actions = batch["actions"]
         N, T_chunk, D_action = actions.shape
@@ -989,7 +981,7 @@ class DiTPolicy(nn.Module):
 
     @torch.no_grad()
     def sample_actions(self, batch, num_steps=10, noise=None):
-        """Euler integration from noise in joint space, or EEF space with adapters.
+        """Euler flow integration from noise to actions (production tau=1 path).
         Vision tokens and the static conditioning are computed once and reused
         across steps, like production infer()."""
         state = batch["state"]
@@ -999,7 +991,7 @@ class DiTPolicy(nn.Module):
             noise = torch.randn(
                 B,
                 self.chunk_length,
-                20 if hasattr(self, "eef_adapters") else self.action_dim,
+                self.action_dim,
                 device=state.device,
                 dtype=model_dtype,
             )
@@ -1023,7 +1015,7 @@ class DiTPolicy(nn.Module):
             noise = torch.randn(
                 B,
                 self.chunk_length,
-                20 if hasattr(self, "eef_adapters") else self.action_dim,
+                self.action_dim,
                 device=state.device,
                 dtype=model_dtype,
             )
@@ -1054,7 +1046,7 @@ class DiTPolicy(nn.Module):
 
 def load_pretrained(model, ckpt_path):
     """Load a production checkpoint (model-only, compile prefixes stripped)."""
-    ckpt = ckpt_path if isinstance(ckpt_path, dict) else torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
     sd = ckpt["model"] if "model" in ckpt else ckpt
     sd = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)

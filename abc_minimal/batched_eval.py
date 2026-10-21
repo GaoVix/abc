@@ -19,12 +19,12 @@ import torch
 
 import abc_sim
 from abc_minimal.config import SimEvalConfig
-from abc_minimal.eval_progress import EvalProgress
 from abc_minimal.eval_policy import (
     RTCManager,
     SimPolicy,
     _optional_int,
     jsonable,
+    progress_text,
     video_frame,
     without_missing_counts,
 )
@@ -98,7 +98,7 @@ def rollout_batched_worlds(
     """Roll out the worlds ``parallel_worlds`` at a time; returns their records."""
     n = config.parallel_worlds
     camera_keys = model_config.camera_keys
-    action_shape = (model_config.chunk_length, policy.noise_dim)
+    action_shape = (model_config.chunk_length, model_config.action_dim)
     # One noise stream per world, so a world's rollout does not depend on the batch width.
     rngs = [np.random.default_rng([config.policy_seed, i]) for i in range(config.num_worlds)]
 
@@ -106,14 +106,12 @@ def rollout_batched_worlds(
         return np.stack([rngs[i].standard_normal(action_shape, dtype=np.float32) for i in batch])
 
     worlds = []
-    progress = EvalProgress(config.num_worlds, config.num_chunks, detailed=config.log_every_chunk)
     warmed_up = False
     try:
         for batch_start in range(0, config.num_worlds, n):
             batch = range(batch_start, batch_start + n)
             t0 = time.perf_counter()
             obs = env.reset([int(config.seed + i) for i in batch], options)
-            policy.reset()
             missing = [name for name in camera_keys if name not in obs["images"]]
             if missing:
                 raise ValueError(
@@ -190,7 +188,6 @@ def rollout_batched_worlds(
                         inference_lead_steps=config.rtc_inference_lead_steps,
                         execute_chunk_dim=config.execute_chunk_dim,
                     )
-                progress.start(batch_start, n)
                 for chunk in range(config.num_chunks):
                     t_chunk = time.perf_counter()
                     chunk_infer_s = current_infer_s
@@ -222,9 +219,10 @@ def rollout_batched_worlds(
                         steps += active
                         newly_diverged = active & ~np.isfinite(env.qpos).all(axis=1)
                         for index in np.flatnonzero(newly_diverged):
-                            progress.write(
+                            print(
                                 f"world={batch_start + index:03d} physics diverged "
-                                f"at step {steps[index]}; recorded as failed"
+                                f"at step {steps[index]}; recorded as failed",
+                                flush=True,
                             )
                         diverged |= newly_diverged
                         if config.save_video and batch_steps % config.video_every_n_actions == 0:
@@ -238,7 +236,6 @@ def rollout_batched_worlds(
                             break
                     steps_s = time.perf_counter() - t_steps
                     if not active.any():
-                        progress.chunk(chunk + 1, active=0)
                         break
                     if rtc is None and chunk + 1 < config.num_chunks:
                         t_obs = time.perf_counter()
@@ -278,14 +275,18 @@ def rollout_batched_worlds(
                             "max_bottles": counts(result, "max_bottles_in_bin_so_far", index),
                         }
                         chunk_metrics[index].append(without_missing_counts(metric))
-                    progress.chunk(
-                        chunk + 1,
-                        active=int(active.sum()),
-                        infer_s=logged_infer_s,
-                        steps_s=steps_s,
-                        render_s=rtc_obs_s,
-                        rtc_ready=rtc_ready,
-                    )
+                    if config.log_every_chunk:
+                        rtc_text = (
+                            f" rtc_ready_at_chunk_end={rtc_ready}" if config.rtc else ""
+                        )
+                        print(
+                            f"batch={batch_start:03d} chunk={chunk:02d} "
+                            f"active={int(active.sum())}/{n} "
+                            f"infer={logged_infer_s * 1000:.0f}ms "
+                            f"steps={steps_s * 1000:.0f}ms "
+                            f"render={rtc_obs_s * 1000:.0f}ms{rtc_text}",
+                            flush=True,
+                        )
             finally:
                 if rtc is not None:
                     rtc.close()
@@ -315,8 +316,12 @@ def rollout_batched_worlds(
                 if diverged[index]:
                     world["diverged"] = True
                 worlds.append(world)
-                progress.finish_world(success=world["success"], reward=world["reward"])
+                print(
+                    f"world={world_index:03d} done success={world['success']} "
+                    f"{progress_text(final_eval, 'max_bottles_in_bin_so_far')} "
+                    f"steps={world['steps']}",
+                    flush=True,
+                )
     finally:
-        progress.close()
         env.close()
     return worlds

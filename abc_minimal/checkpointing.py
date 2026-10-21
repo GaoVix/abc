@@ -128,13 +128,6 @@ def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_sta
         "global_step": global_step,
         "norm_stats": norm_stats,
     }
-    if hasattr(module, "eef_adapters"):
-        payload["model"] = {key: value for key, value in payload["model"].items()
-                            if not key.startswith("eef_adapters.")}
-        payload["eef_adapters"] = {
-            "model": module.eef_adapters.mlps.state_dict(),
-            "config": {"camera_transform": module.eef_adapters.kinematics.camera_transform},
-        }
     if batch_size is not None:
         payload["batch_size"] = int(batch_size)
     if data_world is not None:

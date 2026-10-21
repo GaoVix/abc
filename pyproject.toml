@@ -13,8 +13,6 @@ dependencies = [
     "torch==2.11.0+cu128 ; sys_platform == 'linux'",
     "torchcodec==0.11.0+cpu ; sys_platform == 'linux'",
     "mujoco~=3.8.0",
-    "mink==1.1.0",
-    "daqp",
     "mujoco-warp==3.8.0.3",
     "warp-lang==1.13.0",
     "mjviser",
@@ -28,7 +26,6 @@ dependencies = [
     "sentencepiece>=0.2.0",
     # tyro powers the dataclass CLI configs.
     "tyro",
-    "tqdm",
     "huggingface_hub",
     "mcap",
     "mcap-protobuf-support",
