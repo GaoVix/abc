@@ -137,7 +137,7 @@ def convert_episode(record, dataset, models, sim_model, output):
     try:
         mcap = dataset / record["source_relative"]
         calibration = record["calibration"]
-        real_model = models / record["model_name"]
+        real_model = models / "yam_bimanual_empty.xml"
         signature = conversion_signature(record, mcap, real_model, sim_model)
         destination = output / f"{record['split']}_real" / episode
         report_path = destination / "joint_conversion_report.json"
@@ -198,7 +198,7 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--model-dir", type=Path, default=REPO / "abc_sim/models")
     parser.add_argument("--sim-model", type=Path, default=REPO / "abc_sim/models/yam_dishrack_base.xml")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--episodes", nargs="*")
