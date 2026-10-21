@@ -16,7 +16,7 @@ from torch import nn
 from abc_minimal.config import ClipConfig, DiTConfig, MixtureComponent, PromptConfig, TrainConfig
 from abc_minimal.dataloader import EpisodeDataset, collate
 from abc_minimal.dit import CLIPTextEmbedder, DiTPolicy, load_pretrained
-from abc_minimal.eef_adapters import EEF_POSE_INDICES, EEFTrainingAdapter
+from abc_minimal.eef_adapters import EEFTrainingAdapter
 from abc_minimal.operator import load_operator_label_maps
 from abc_minimal.preprocess import parse_norm_stats
 from scripts.train_eef_adapters import JOINT_STATE_INDICES
@@ -31,8 +31,11 @@ GROUPS = {
 
 def mse_groups(prediction, target):
     error = (prediction.float() - target.float()).square()
+    groups = GROUPS if error.shape[-1] == 20 else {
+        "position": [0, 1, 2, 7, 8, 9], "rotation3d": [3, 4, 5, 10, 11, 12], "gripper": [6, 13],
+    }
     return {"all": error.mean().item(), **{
-        name: error[..., indices].mean().item() for name, indices in GROUPS.items()
+        name: error[..., indices].mean().item() for name, indices in groups.items()
     }}
 
 
@@ -45,7 +48,9 @@ def fit_decoder_latents(adapter, target, raw_prediction, steps, restarts=2):
     physical = raw_prediction.detach() * adapter.actions_scale + adapter.actions_mean
     start = ((physical[..., JOINT_STATE_INDICES] - adapter.mlps.state_mean)
              / adapter.mlps.state_scale).reshape(-1, 12)
-    pose_target = target[..., EEF_POSE_INDICES].detach().reshape(-1, 18)
+    action_dim = target.shape[-1]
+    pose_indices = [i for i in range(action_dim) if i not in (action_dim // 2 - 1, action_dim - 1)]
+    pose_target = target[..., pose_indices].detach().reshape(-1, action_dim - 2)
     with torch.no_grad():
         best = (adapter.mlps.mlp_out(start) - pose_target).square().mean(-1)
         initial = best.mean().item()
@@ -61,7 +66,7 @@ def fit_decoder_latents(adapter, target, raw_prediction, steps, restarts=2):
         with torch.no_grad():
             best = torch.minimum(best, (adapter.mlps.mlp_out(latent) - pose_target).square().mean(-1))
     return {"initial_pose_mse": initial, "best_found_pose_mse": best.mean().item(),
-            "best_found_all_mse_with_perfect_grippers": best.mean().item() * 18 / 20,
+            "best_found_all_mse_with_perfect_grippers": best.mean().item() * (action_dim - 2) / action_dim,
             "steps_per_restart": steps, "restarts": restarts}
 
 
@@ -74,13 +79,14 @@ def encoder_probe(adapter, steps, seed):
     """
     torch.manual_seed(seed)
     device = adapter.actions_mean.device
+    action_dim = getattr(adapter, "action_dim", 20)
     with torch.no_grad():
-        calibration = adapter.eef_to_joint(torch.randn(4096, 20, device=device))
+        calibration = adapter.eef_to_joint(torch.randn(4096, action_dim, device=device))
         mean, scale = calibration.mean(0), calibration.std(0).clamp_min(1e-6)
-        heldout = torch.randn(4096, 20, device=device)
+        heldout = torch.randn(4096, action_dim, device=device)
         heldout_encoded = (adapter.eef_to_joint(heldout) - mean) / scale
     probes = [nn.Sequential(nn.Linear(dim, 256), nn.GELU(), nn.Linear(256, 256),
-                            nn.GELU(), nn.Linear(256, 20)).to(device) for dim in (14, 20)]
+                            nn.GELU(), nn.Linear(256, action_dim)).to(device) for dim in (14, action_dim)]
     optimizer = torch.optim.Adam([p for probe in probes for p in probe.parameters()], lr=1e-3)
     history = []
     for step in range(steps + 1):
@@ -93,7 +99,7 @@ def encoder_probe(adapter, steps, seed):
                   f"full_eef={row['full_eef_input']['all']:.5f}", flush=True)
         if step == steps:
             break
-        noise = torch.randn(256, 20, device=device)
+        noise = torch.randn(256, action_dim, device=device)
         with torch.no_grad():
             encoded = (adapter.eef_to_joint(noise) - mean) / scale
         loss = ((probes[0](encoded) - noise).square().mean()
@@ -136,7 +142,10 @@ def fk_reference_checks(adapter, raw, prepared, clean):
     joints = torch.cat((physical_state[:, None], physical_actions), dim=1)[..., JOINT_STATE_INDICES]
     kinematics = adapter.kinematics
     cpu_pose = kinematics.fk(joints.flatten(0, 1).cpu().numpy())
-    cpu_pose = torch.from_numpy(cpu_pose).to(clean.device).reshape(*joints.shape[:2], 18)
+    pose_dim = cpu_pose.shape[-1]
+    arm_dim = pose_dim // 2
+    pose_indices = [*range(arm_dim), *range(arm_dim + 1, pose_dim + 1)]
+    cpu_pose = torch.from_numpy(cpu_pose).to(clean.device).reshape(*joints.shape[:2], pose_dim)
     precision = torch.get_float32_matmul_precision()
     try:
         torch.set_float32_matmul_precision("highest")
@@ -149,8 +158,8 @@ def fk_reference_checks(adapter, raw, prepared, clean):
 
     def normalized_actions(poses):
         values = clean.clone()
-        values[..., EEF_POSE_INDICES] = (poses[:, 1:] - adapter.mlps.pose_mean) / (adapter.mlps.pose_std + 1e-6)
-        values[..., [9, 19]] = raw["actions"][..., [6, 13]]
+        values[..., pose_indices] = (poses[:, 1:] - adapter.mlps.pose_mean) / (adapter.mlps.pose_std + 1e-6)
+        values[..., [arm_dim, pose_dim + 1]] = raw["actions"][..., [6, 13]]
         return values
 
     cpu_clean = normalized_actions(cpu_pose)
@@ -159,7 +168,7 @@ def fk_reference_checks(adapter, raw, prepared, clean):
         "fk_backend": "GPU Warp versus CPU MuJoCo" if clean.is_cuda else "CPU reference only",
         "matmul_precision": precision,
         "fk_physical_max_abs_error": (cpu_pose - original_pose).abs().max().item(),
-        "fk_position_max_abs_error": (cpu_pose - original_pose)[..., [0, 1, 2, 9, 10, 11]].abs().max().item(),
+        "fk_position_max_abs_error": (cpu_pose - original_pose)[..., [0, 1, 2, arm_dim, arm_dim + 1, arm_dim + 2]].abs().max().item(),
         "normalized_target_max_abs_error": (cpu_clean - clean).abs().max().item(),
         "normalized_target_mse": mse_groups(cpu_clean, clean),
         "fk_highest_precision_max_abs_error": (cpu_pose - highest_pose).abs().max().item(),
@@ -271,6 +280,7 @@ def main():
     model.eef_adapters = EEFTrainingAdapter(checkpoint["eef_adapters"], stats)
     root = Path(__file__).resolve().parents[1]
     report = {"checkpoint": str(args.checkpoint), "global_step": checkpoint.get("global_step"),
+              "eef_action_dim": model.eef_adapters.action_dim,
               "seed": args.seed, "device": str(device),
               "saved_training_setup": {key: saved.get(key) for key in
                                        ("load_pretrained", "pretrained_ckpt_name", "resume_from", "eef_adapters", "flow")},
@@ -332,7 +342,7 @@ def main():
                 for time in (0.05, 0.5, 1.0):
                     rows = [r["mse"] for r in result["velocity"] if r["t"] == time]
                     print(f"  t={time:.2f}: " + " ".join(f"{g}={np.mean([r[g] for r in rows]):.5f}"
-                                                        for g in ("all", *GROUPS)), flush=True)
+                                                        for g in rows[0]), flush=True)
                 if first_validation:
                     for row in result["velocity"]:
                         if "decoder_oracle" in row:
@@ -355,7 +365,7 @@ def main():
                     for row in batch["velocity"] if row["t"] == time]
             summary["per_t"][str(time)] = {
                 group: sum(weight * mse[group] for weight, mse in rows) / sum(weight for weight, _ in rows)
-                for group in ("all", *GROUPS)
+                for group in rows[0][1]
             }
         report["summary"][split] = summary
         print(f"SUMMARY {split}: {json.dumps(summary)}", flush=True)

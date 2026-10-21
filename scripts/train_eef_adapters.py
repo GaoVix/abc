@@ -66,10 +66,38 @@ class PairGenerator:
 
 
 def rotation_matrix(rotation6):
+    """Decode a rotation vector (3D) or continuous rotation representation (6D)."""
+    if rotation6.shape[-1] == 3:
+        x, y, z = rotation6.unbind(-1)
+        zero = torch.zeros_like(x)
+        skew = torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), -1).unflatten(-1, (3, 3))
+        angle = rotation6.norm(dim=-1)[..., None, None]
+        return (torch.eye(3, device=rotation6.device, dtype=rotation6.dtype)
+                + torch.sinc(angle / torch.pi) * skew
+                + .5 * torch.sinc(angle / (2 * torch.pi)).square() * (skew @ skew))
     first = F.normalize(rotation6[..., :3], dim=-1)
     second = rotation6[..., 3:]
     second = F.normalize(second - (first * second).sum(-1, keepdim=True) * first, dim=-1)
     return torch.stack((first, second, torch.cross(first, second, dim=-1)), dim=-1)
+
+
+def rotation_vector(matrix):
+    """Principal rotation vector (radians), including rotations near zero and pi."""
+    a, b, c, d, e, f, g, h, i = matrix.flatten(-2).unbind(-1)
+    terms = torch.stack((1 + a + e + i, 1 + a - e - i, 1 - a + e - i, 1 - a - e + i), -1)
+    candidates = torch.stack((
+        torch.stack((terms[..., 0], h - f, c - g, d - b), -1),
+        torch.stack((h - f, terms[..., 1], b + d, c + g), -1),
+        torch.stack((c - g, b + d, terms[..., 2], f + h), -1),
+        torch.stack((d - b, c + g, f + h, terms[..., 3]), -1),
+    ), -2)
+    index = terms.argmax(-1, keepdim=True)
+    quaternion = candidates.gather(-2, index[..., None].expand(*index.shape, 4)).squeeze(-2)
+    quaternion = quaternion / (2 * terms.gather(-1, index).clamp_min(1e-8).sqrt())
+    quaternion = F.normalize(quaternion, dim=-1)
+    quaternion = torch.where(quaternion[..., :1] < 0, -quaternion, quaternion)
+    angle = 2 * torch.atan2(quaternion[..., 1:].norm(dim=-1, keepdim=True), quaternion[..., :1])
+    return quaternion[..., 1:] * (2 / torch.sinc(angle / (2 * torch.pi)))
 
 
 class MLP(nn.Sequential):
@@ -86,17 +114,21 @@ class EEFAdapters(nn.Module):
 
     def __init__(
         self, state_mean, state_scale, pose_mean, pose_std,
-        ik_sizes=(18, 64, 128, 256, 512, 256, 128, 64, 12), fk_sizes=(12, 64, 128, 64, 18),
+        ik_sizes=None, fk_sizes=None,
     ):
         super().__init__()
+        self.pose_dim = len(pose_mean)
+        self.arm_pose_dim = self.pose_dim // 2
+        ik_sizes = ik_sizes or (self.pose_dim, 64, 128, 256, 512, 256, 128, 64, 12)
+        fk_sizes = fk_sizes or (12, 64, 128, 64, self.pose_dim)
         self.mlp_in = MLP(ik_sizes)
         self.mlp_out = MLP(fk_sizes)
         self.register_buffer("state_mean", torch.as_tensor(state_mean, dtype=torch.float32).clone())
         self.register_buffer("state_scale", torch.as_tensor(state_scale, dtype=torch.float32).clone())
         self.register_buffer("pose_mean", torch.as_tensor(pose_mean, dtype=torch.float32).clone())
         self.register_buffer("pose_std", torch.as_tensor(pose_std, dtype=torch.float32).clone())
-        if self.pose_mean.shape != (18,) or self.pose_std.shape != (18,):
-            raise ValueError("Pose mean and std must each contain 18 values")
+        if self.pose_mean.shape not in ((12,), (18,)) or self.pose_mean.shape != self.pose_std.shape:
+            raise ValueError("Pose mean and std must each contain 12 (rotvec) or 18 (rotation6d) values")
         if not torch.isfinite(self.pose_mean).all() or not torch.isfinite(self.pose_std).all():
             raise ValueError("Pose mean and std must be finite")
         if (self.pose_std < 0).any():
@@ -105,8 +137,8 @@ class EEFAdapters(nn.Module):
     def forward(self, joints, poses):
         joint_prediction = self.eef_to_joint(poses)
         pose_prediction = self.predict_pose_values(joints)
-        pred = pose_prediction.reshape(-1, 2, 9)
-        target = poses.reshape(-1, 2, 9)
+        pred = pose_prediction.reshape(-1, 2, self.arm_pose_dim)
+        target = poses.reshape(-1, 2, self.arm_pose_dim)
         pos_loss = F.mse_loss(pred[:, :, :3], target[:, :, :3])
         rot_loss = F.mse_loss(pred[:, :, 3:], target[:, :, 3:])
         loss_in = ((joint_prediction - joints) / self.state_scale).square().mean()
@@ -117,9 +149,9 @@ class EEFAdapters(nn.Module):
         return self.mlp_in(pose_input) * self.state_scale + self.state_mean
 
     def transform_eef_noise(self, noise):
-        arms = noise.unflatten(-1, (2, 10))
-        poses = self.mlp_out(self.mlp_in(arms[..., :9].flatten(-2))).unflatten(-1, (2, 9))
-        return torch.cat((poses, arms[..., 9:]), dim=-1).flatten(-2)
+        arms = noise.unflatten(-1, (2, self.arm_pose_dim + 1))
+        poses = self.mlp_out(self.mlp_in(arms[..., :self.arm_pose_dim].flatten(-2))).unflatten(-1, (2, self.arm_pose_dim))
+        return torch.cat((poses, arms[..., self.arm_pose_dim:]), dim=-1).flatten(-2)
 
     def predict_pose_values(self, joints):
         joint_input = (joints - self.state_mean) / self.state_scale
@@ -127,6 +159,8 @@ class EEFAdapters(nn.Module):
 
     def joint_to_eef(self, joints):
         poses = self.predict_pose_values(joints)
+        if self.arm_pose_dim == 6:
+            return poses
         poses = poses.reshape(*poses.shape[:-1], 2, 9)
         rotation = rotation_matrix(poses[..., 3:])
         return torch.cat((poses[..., :3], rotation[..., :, 0], rotation[..., :, 1]), -1).flatten(-2)
@@ -153,13 +187,13 @@ def load_adapters(checkpoint, device="cpu"):
 @torch.no_grad()
 def validate(model, joints, poses, fk):
     (loss_in, loss_out), predicted_joints, predicted_poses = model(joints, poses)
-    expected_poses = poses.reshape(-1, 2, 9)
+    expected_poses = poses.reshape(-1, 2, model.arm_pose_dim)
     r2 = rotation_matrix(expected_poses[:, :, 3:])
     metrics = {"loss": (loss_in + loss_out).item(),
                "in_loss": loss_in.item(), "out_loss": loss_out.item(),
                "in_joint_rmse_rad": (predicted_joints - joints).square().mean().sqrt().item()}
     for name, prediction in (("in", fk(predicted_joints)), ("out", predicted_poses)):
-        prediction = prediction.reshape(-1, 2, 9)
+        prediction = prediction.reshape(-1, 2, model.arm_pose_dim)
         position_error = prediction[:, :, :3] - expected_poses[:, :, :3]
         r1 = rotation_matrix(prediction[:, :, 3:])
         cosine = (((r1 * r2).sum((-1, -2)) - 1) / 2).clamp(-1, 1)

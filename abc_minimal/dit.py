@@ -999,7 +999,7 @@ class DiTPolicy(nn.Module):
             noise = torch.randn(
                 B,
                 self.chunk_length,
-                20 if hasattr(self, "eef_adapters") else self.action_dim,
+                self.eef_adapters.action_dim if hasattr(self, "eef_adapters") else self.action_dim,
                 device=state.device,
                 dtype=model_dtype,
             )
@@ -1023,7 +1023,7 @@ class DiTPolicy(nn.Module):
             noise = torch.randn(
                 B,
                 self.chunk_length,
-                20 if hasattr(self, "eef_adapters") else self.action_dim,
+                self.eef_adapters.action_dim if hasattr(self, "eef_adapters") else self.action_dim,
                 device=state.device,
                 dtype=model_dtype,
             )

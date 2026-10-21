@@ -11,7 +11,7 @@ import warp as wp
 
 from abc_sim.rendering.replay.renderer import _put_model_and_data_safe
 from deploy.robot.control.mink_ik import MinkArmController
-from scripts.train_eef_adapters import CAMERA_TRANSFORM, JOINT_STATE_INDICES, load_adapters, rotation_matrix
+from scripts.train_eef_adapters import CAMERA_TRANSFORM, JOINT_STATE_INDICES, load_adapters, rotation_matrix, rotation_vector
 
 KINEMATIC_MODEL = Path(__file__).resolve().parents[1] / "abc_sim/models/yam_dishrack_base.xml"
 EEF_POSE_INDICES = [*range(9), *range(10, 19)]
@@ -19,7 +19,8 @@ EEF_GRIPPER_INDICES = [9, 19]
 
 
 class EEFKinematics:
-    def __init__(self, camera_transform):
+    def __init__(self, camera_transform, rotation_dim=6):
+        self.rotation_dim = rotation_dim
         camera_transform = Path(camera_transform)
         if not camera_transform.is_file() and camera_transform.parts[-2:] == ("scripts", CAMERA_TRANSFORM.name):
             camera_transform = CAMERA_TRANSFORM
@@ -32,14 +33,16 @@ class EEFKinematics:
         self.sites = [self.model.site(f"{side}_tcp_site").id for side in ("left", "right")]
 
     def fk(self, joints):
-        poses = []
+        positions, rotations = [], []
         for values in np.asarray(joints).reshape(-1, 12):
             self.data.qpos[self.qpos_indices] = values
             mujoco.mj_kinematics(self.model, self.data)
-            positions = self.data.site_xpos[self.sites, :] @ self.camera[:3, :3].T + self.camera[:3, 3]
-            rotations = self.camera[:3, :3] @ self.data.site_xmat[self.sites, :].reshape(2, 3, 3)
-            poses.append(np.concatenate((positions, rotations[:, :, 0], rotations[:, :, 1]), axis=-1).reshape(18))
-        return np.asarray(poses, dtype=np.float32)
+            positions.append(self.data.site_xpos[self.sites, :] @ self.camera[:3, :3].T + self.camera[:3, 3])
+            rotations.append(self.camera[:3, :3] @ self.data.site_xmat[self.sites, :].reshape(2, 3, 3))
+        rotations = np.asarray(rotations)
+        orientation = (rotation_vector(torch.from_numpy(rotations)).numpy() if self.rotation_dim == 3
+                       else np.concatenate((rotations[..., 0], rotations[..., 1]), axis=-1))
+        return np.concatenate((np.asarray(positions), orientation), axis=-1).reshape(-1, 2 * (3 + self.rotation_dim)).astype(np.float32)
 
     def fk_batch(self, joints):
         batch_key = (len(joints), joints.device, torch.cuda.current_stream(joints.device).cuda_stream)
@@ -57,7 +60,9 @@ class EEFKinematics:
         site_rot = wp.to_torch(self.warp_data.site_xmat)[:, self.sites]
         positions = site_pos @ self.camera_tensor[:3, :3].T + self.camera_tensor[:3, 3]
         rotations = self.camera_tensor[:3, :3] @ site_rot
-        return torch.cat((positions, rotations[..., 0], rotations[..., 1]), dim=-1).flatten(1)
+        orientation = (rotation_vector(rotations) if self.rotation_dim == 3
+                       else torch.cat((rotations[..., 0], rotations[..., 1]), dim=-1))
+        return torch.cat((positions, orientation), dim=-1).flatten(1)
 
 
 class EEFTrainingAdapter(torch.nn.Module):
@@ -65,7 +70,10 @@ class EEFTrainingAdapter(torch.nn.Module):
         super().__init__()
         saved = checkpoint if isinstance(checkpoint, dict) else torch.load(checkpoint, map_location="cpu", weights_only=True)
         self.mlps = load_adapters(saved)
-        self.kinematics = EEFKinematics(saved["config"]["camera_transform"])
+        self.arm_pose_dim = self.mlps.arm_pose_dim
+        self.action_dim = self.mlps.pose_dim + 2
+        self.pose_indices = [*range(self.arm_pose_dim), *range(self.arm_pose_dim + 1, self.action_dim - 1)]
+        self.kinematics = EEFKinematics(saved["config"]["camera_transform"], rotation_dim=self.arm_pose_dim - 3)
         for name in ("state", "actions"):
             self.register_buffer(f"{name}_mean", torch.as_tensor(norm_stats[name]["mean"], dtype=torch.float32).clone())
             self.register_buffer(f"{name}_scale", torch.as_tensor(norm_stats[name]["std"], dtype=torch.float32).clone() + 1e-6)
@@ -75,7 +83,7 @@ class EEFTrainingAdapter(torch.nn.Module):
         state = batch["state"] * self.state_scale + self.state_mean
         actions = batch["actions"] * self.actions_scale + self.actions_mean
         joints = torch.cat((state[:, None], actions), dim=1)[..., JOINT_STATE_INDICES]
-        poses = self.kinematics.fk_batch(joints.flatten(0, 1)).reshape(*joints.shape[:2], 18)
+        poses = self.kinematics.fk_batch(joints.flatten(0, 1)).reshape(*joints.shape[:2], self.mlps.pose_dim)
         return {**batch, "eef_state": poses[:, 0], "eef_actions": poses[:, 1:]}
 
     def forward(self, batch):
@@ -86,21 +94,23 @@ class EEFTrainingAdapter(torch.nn.Module):
         ) / self.state_scale[JOINT_STATE_INDICES]
         state = torch.where(batch["state_is_masked"][:, None], torch.zeros_like(state), state)
         poses = (batch["eef_actions"] - self.mlps.pose_mean) / (self.mlps.pose_std + 1e-6)
-        actions = torch.cat((poses[..., :9], batch["actions"][..., 6:7],
-                             poses[..., 9:], batch["actions"][..., 13:14]), dim=-1)
+        actions = torch.cat((poses[..., :self.arm_pose_dim], batch["actions"][..., 6:7],
+                             poses[..., self.arm_pose_dim:], batch["actions"][..., 13:14]), dim=-1)
         return {**batch, "state": state, "actions": actions}
 
     def eef_to_joint(self, actions):
-        joints = self.mlps.mlp_in(actions[..., EEF_POSE_INDICES]) * self.mlps.state_scale + self.mlps.state_mean
+        joints = self.mlps.mlp_in(actions[..., self.pose_indices]) * self.mlps.state_scale + self.mlps.state_mean
         joints = (joints - self.actions_mean[JOINT_STATE_INDICES]) / self.actions_scale[JOINT_STATE_INDICES]
-        return torch.cat((joints[..., :6], actions[..., 9:10], joints[..., 6:], actions[..., 19:20]), dim=-1)
+        return torch.cat((joints[..., :6], actions[..., self.arm_pose_dim:self.arm_pose_dim + 1],
+                          joints[..., 6:], actions[..., -1:]), dim=-1)
 
     def joint_to_eef(self, actions):
         """Decode the joint-shaped DiT output as normalized EEF velocity."""
         physical = actions * self.actions_scale + self.actions_mean
         joints = (physical[..., JOINT_STATE_INDICES] - self.mlps.state_mean) / self.mlps.state_scale
         poses = self.mlps.mlp_out(joints)
-        return torch.cat((poses[..., :9], actions[..., 6:7], poses[..., 9:], actions[..., 13:14]), dim=-1)
+        return torch.cat((poses[..., :self.arm_pose_dim], actions[..., 6:7],
+                          poses[..., self.arm_pose_dim:], actions[..., 13:14]), dim=-1)
 
 
 class EEFInferenceAdapter(EEFKinematics):
