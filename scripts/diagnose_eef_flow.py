@@ -125,6 +125,57 @@ def optimizer_audit(checkpoint, model):
 
 
 @torch.no_grad()
+def fk_reference_checks(adapter, raw, prepared, clean):
+    """Separate camera-matmul precision from CPU/Warp FK and normalization errors.
+
+    Preserve the training-precision targets. Only the reference FK call uses
+    highest FP32 precision; restore the setting before evaluating the model.
+    """
+    physical_state = raw["state"] * adapter.state_scale + adapter.state_mean
+    physical_actions = raw["actions"] * adapter.actions_scale + adapter.actions_mean
+    joints = torch.cat((physical_state[:, None], physical_actions), dim=1)[..., JOINT_STATE_INDICES]
+    kinematics = adapter.kinematics
+    cpu_pose = kinematics.fk(joints.flatten(0, 1).cpu().numpy())
+    cpu_pose = torch.from_numpy(cpu_pose).to(clean.device).reshape(*joints.shape[:2], 18)
+    precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        highest_pose = kinematics.fk_batch(joints.flatten(0, 1)).reshape_as(cpu_pose)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    original_pose = torch.cat((prepared["eef_state"][:, None], prepared["eef_actions"]), dim=1)
+    if not all(torch.isfinite(pose).all().item() for pose in (cpu_pose, highest_pose, original_pose)):
+        raise RuntimeError("Nonfinite FK reference values")
+
+    def normalized_actions(poses):
+        values = clean.clone()
+        values[..., EEF_POSE_INDICES] = (poses[:, 1:] - adapter.mlps.pose_mean) / (adapter.mlps.pose_std + 1e-6)
+        values[..., [9, 19]] = raw["actions"][..., [6, 13]]
+        return values
+
+    cpu_clean = normalized_actions(cpu_pose)
+    highest_clean = normalized_actions(highest_pose)
+    checks = {
+        "fk_backend": "GPU Warp versus CPU MuJoCo" if clean.is_cuda else "CPU reference only",
+        "matmul_precision": precision,
+        "fk_physical_max_abs_error": (cpu_pose - original_pose).abs().max().item(),
+        "fk_position_max_abs_error": (cpu_pose - original_pose)[..., [0, 1, 2, 9, 10, 11]].abs().max().item(),
+        "normalized_target_max_abs_error": (cpu_clean - clean).abs().max().item(),
+        "normalized_target_mse": mse_groups(cpu_clean, clean),
+        "fk_highest_precision_max_abs_error": (cpu_pose - highest_pose).abs().max().item(),
+        "normalized_target_highest_precision_max_abs_error": (cpu_clean - highest_clean).abs().max().item(),
+        "normalization_formula_max_abs_error": (normalized_actions(original_pose) - clean).abs().max().item(),
+    }
+    original_matches = checks["fk_physical_max_abs_error"] <= 5e-5 and checks["normalized_target_max_abs_error"] <= 1e-3
+    highest_matches = checks["fk_highest_precision_max_abs_error"] <= 5e-5 and checks["normalized_target_highest_precision_max_abs_error"] <= 1e-3
+    checks["fk_reference_status"] = ("consistent" if original_matches else
+                                     "camera_matmul_precision_difference" if highest_matches else
+                                     "mismatch_after_highest_precision")
+    reference_prepared = {**prepared, "eef_state": cpu_pose[:, 0], "eef_actions": cpu_pose[:, 1:]}
+    return checks, reference_prepared
+
+
+@torch.no_grad()
 def evaluate_batch(model, raw, times, draws, generator, sample_steps, latent_steps):
     adapter = model.eef_adapters
     prepared = adapter.prepare(raw)
@@ -134,18 +185,9 @@ def evaluate_batch(model, raw, times, draws, generator, sample_steps, latent_ste
     result = {"clean_zero_baseline": mse_groups(torch.zeros_like(clean), clean),
               "clean_max_abs": clean.abs().max().item(), "velocity": [], "sampling": []}
 
-    # Independent CPU MuJoCo reference, including undoing the dataset's joint normalization.
-    physical = raw["actions"] * adapter.actions_scale + adapter.actions_mean
-    cpu_pose = adapter.kinematics.fk(physical[..., JOINT_STATE_INDICES].flatten(0, 1).cpu().numpy())
-    cpu_pose = torch.from_numpy(cpu_pose).to(clean.device).reshape(*clean.shape[:2], 18)
-    expected_clean = clean.clone()
-    expected_clean[..., EEF_POSE_INDICES] = (cpu_pose - adapter.mlps.pose_mean) / (adapter.mlps.pose_std + 1e-6)
-    expected_clean[..., [9, 19]] = raw["actions"][..., [6, 13]]
-    result["pipeline_checks"] = {
-        "fk_backend": "GPU Warp versus CPU MuJoCo" if clean.is_cuda else "CPU reference only",
-        "fk_physical_max_abs_error": (cpu_pose - prepared["eef_actions"]).abs().max().item(),
-        "normalized_target_max_abs_error": (expected_clean - clean).abs().max().item(),
-    }
+    checks, reference_prepared = fk_reference_checks(adapter, raw, prepared, clean)
+    result["pipeline_checks"] = checks
+    reference_batch = adapter(reference_prepared)
     for draw in range(draws):
         noise = torch.randn(clean.shape, generator=generator, device=clean.device)
         uniform_t = torch.rand(len(clean), 1, 1, generator=generator, device=clean.device)
@@ -167,6 +209,16 @@ def evaluate_batch(model, raw, times, draws, generator, sample_steps, latent_ste
             if draw == 0 and time == 0.5:
                 actual = model(prepared, noise=noise, t=torch.full((len(clean), 1, 1), time, device=clean.device))
                 result["pipeline_checks"]["forward_loss_absolute_difference"] = abs(actual.item() - row["mse"]["all"])
+                reference_x = (1 - time) * reference_batch["actions"] + time * noise
+                reference_cond = model.compute_cond(reference_batch["state"], raw["task_vec_clip"],
+                                                    torch.full((len(clean),), time, device=clean.device))
+                reference_pred = model.predict_velocity(reference_x, reference_cond, vision)
+                reference_target = noise - reference_batch["actions"]
+                result["cpu_fk_reference_comparison"] = {
+                    "t": time, "original_mse": row["mse"],
+                    "cpu_reference_mse": mse_groups(reference_pred, reference_target),
+                    "prediction_change_mse": mse_groups(reference_pred, pred),
+                }
             if draw == 0 and time in (0.5, 1.0) and latent_steps:
                 with torch.enable_grad():
                     row["decoder_oracle"] = fit_decoder_latents(adapter, target, captured[0], latent_steps)
@@ -227,6 +279,8 @@ def main():
               "optimizer_adapters": optimizer_audit(checkpoint, model), "splits": {},
               "notes": ["All datasets use eval transforms, no state masking, and no action prefix.",
                         "Per-t losses and small fixed sample budgets do not reproduce the logged aggregate val_loss.",
+                        "Original targets and model evaluations retain training matmul precision; highest precision is used only for reference FK.",
+                        "CPU/Warp FK discrepancies are reported for investigation and do not suppress the remaining probes.",
                         "Decoder-oracle and finite encoder-probe errors are not theoretical loss lower bounds.",
                         "Checkpoint metadata does not certify the training objective; use this run's EEF-flow checkpoint."]}
     del checkpoint
@@ -271,6 +325,10 @@ def main():
                 checks = result["pipeline_checks"]
                 print(f"{split} batch={len(batches)} uniform_loss={np.mean(result['uniform_t_loss']):.5f} "
                       f"checks={checks}", flush=True)
+                if checks["fk_reference_status"] != "consistent":
+                    print(f"  FK reference warning: {checks['fk_reference_status']}; continuing with original training targets", flush=True)
+                if offset == 0:
+                    print(f"  cpu_fk_reference_comparison={result['cpu_fk_reference_comparison']}", flush=True)
                 for time in (0.05, 0.5, 1.0):
                     rows = [r["mse"] for r in result["velocity"] if r["t"] == time]
                     print(f"  t={time:.2f}: " + " ".join(f"{g}={np.mean([r[g] for r in rows]):.5f}"
@@ -281,10 +339,9 @@ def main():
                             print(f"  decoder_oracle t={row['t']}: {row['decoder_oracle']}", flush=True)
                     print(f"  sampling={result['sampling']}", flush=True)
                 save()
-                if (checks["fk_physical_max_abs_error"] > 5e-5
-                        or checks["normalized_target_max_abs_error"] > 1e-3
+                if (checks["normalization_formula_max_abs_error"] > 1e-6
                         or checks.get("forward_loss_absolute_difference", 0) > 1e-4 * (1 + np.mean(result["uniform_t_loss"]))):
-                    raise RuntimeError(f"Pipeline mismatch; inspect {output} before interpreting probes")
+                    raise RuntimeError(f"Normalization or loss formula mismatch; inspect {output}")
     if args.probe_steps:
         report["encoder_probe"] = encoder_probe(model.eef_adapters, args.probe_steps, args.seed + 1)
     report["summary"] = {}
