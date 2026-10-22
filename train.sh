@@ -3,8 +3,8 @@ cd "$(dirname "$0")" || exit 1
 
 uv run torchrun --standalone --nproc-per-node 4 train.py \
   --load-pretrained \
-  --cache-root cache/dishrack_real \
-  --output-dir output/dit_joint_baseline \
+  --cache-root "${TRAIN_CACHE_ROOT:-cache/dishrack_real}" \
+  --output-dir "${TRAIN_OUTPUT_DIR:-output/dit_joint_baseline}" \
   --pretrained-ckpt-name "$PWD/cache/abc_dit_xl_200k_model.pt" \
   --mixture-preset load_the_plates_into_the_dish_rack \
   --batch-size 90 \
