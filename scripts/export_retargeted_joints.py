@@ -17,7 +17,7 @@ from mcap_protobuf.decoder import DecoderFactory
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from abc_minimal.export_mcap import ACTION_TOPICS, STATE_TOPICS, export_episode, floor_indices
+from abc_minimal.export_mcap import ACTION_TOPICS, STATE_TOPICS, export_episode
 from scripts.verify_camera_fk_ik import Robot, pose
 
 
@@ -39,9 +39,8 @@ def aligned_rows(mcap, metadata, offset_seconds):
         reader = make_reader(stream, decoder_factories=[DecoderFactory()])
         for _, channel, message, value in reader.iter_decoded_messages(topics=list(messages), log_time_order=False):
             messages[channel.topic].append((message.log_time, list(value.position)))
-    ticks = metadata["t0_ns"] + (np.arange(metadata["num_steps"], dtype=np.int64) + 1) * metadata["tick_ns"]
     offset = round(offset_seconds * 1_000_000_000)
-    state_query = np.asarray(metadata["top_camera_timestamps_ns"], dtype=np.int64) + offset
+    query = np.asarray(metadata["top_camera_timestamps_ns"], dtype=np.int64) + offset
     columns, held = [], {}
     for name, dim in topics:
         values = sorted(messages[name], key=lambda pair: pair[0])
@@ -49,17 +48,12 @@ def aligned_rows(mcap, metadata, offset_seconds):
             raise ValueError(f"Missing training-data topic: {name}")
         timestamps = np.array([row[0] for row in values], dtype=np.int64)
         positions = np.array([row[1] for row in values], dtype=np.float64).reshape(-1, dim)
-        if (name, dim) in STATE_TOPICS:
-            keep = np.concatenate((np.diff(timestamps) != 0, [True]))
-            timestamps, positions = timestamps[keep], positions[keep]
-            query = state_query
-            columns.append(np.column_stack([
-                np.interp(query - timestamps[0], timestamps - timestamps[0], positions[:, index])
-                for index in range(dim)
-            ]))
-        else:
-            query = ticks + offset
-            columns.append(positions[floor_indices(timestamps, query)])
+        keep = np.concatenate((np.diff(timestamps) != 0, [True]))
+        timestamps, positions = timestamps[keep], positions[keep]
+        columns.append(np.column_stack([
+            np.interp(query - timestamps[0], timestamps - timestamps[0], positions[:, index])
+            for index in range(dim)
+        ]))
         held[name] = int(np.sum((query < timestamps[0]) | (query > timestamps[-1])))
     return np.concatenate(columns, axis=1), held
 
@@ -159,13 +153,13 @@ def convert_episode(record, dataset, models, sim_model, output):
         temporary = work / "states_actions.bin.tmp"
         converted.tofile(temporary)
         temporary.replace(work / "states_actions.bin")
-        metadata["alignment"] = "fixed_clock_30hz_state_interpolated_to_selected_top_frame"
+        metadata["alignment"] = "fixed_clock_30hz_state_action_interpolated_to_selected_top_frame"
         metadata["joint_conversion"] = {
             "report": "joint_conversion_report.json", "solver": "MinkArmController",
             "state_time_offset_s": calibration["state_time_offset_s"],
             "sampling": {
                 "state": "linear interpolation at selected top frame timestamp + calibrated offset",
-                "action": "floor sampling at tick + calibrated offset",
+                "action": "linear interpolation at selected top frame timestamp + calibrated offset",
             },
             "source_camera_topic": calibration["camera_topic"], "target_camera": "simulation top",
         }
