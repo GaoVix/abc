@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from abc_minimal.base_compensation import BaseCompensatedEnv
 from abc_minimal.config import (
     SimEvalConfig,
     validate_model_config,
@@ -534,6 +535,8 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     else:
         env = _make_env(config, tuple(model_config.camera_keys))
         rollout = rollout_worlds
+    if config.compensate_arm_bases:
+        env = BaseCompensatedEnv(env, out_dir)
     physics = resolved_physics(env)
     if physics is not None:
         print(
