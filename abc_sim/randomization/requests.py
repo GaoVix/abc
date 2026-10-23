@@ -17,6 +17,7 @@ class DishRackResetRequest:
     cycle_dish_rack: int = 0
     randomize_variants: bool | None = None
     randomize_scales: bool | None = None
+    randomize_arm_bases: bool = False
 
     @classmethod
     def from_value(cls, value: Any | None) -> "DishRackResetRequest":
@@ -58,6 +59,7 @@ class DishRackResetRequest:
             cycle_dish_rack=_int_value("cycle_dish_rack"),
             randomize_variants=randomize_variants,
             randomize_scales=randomize_scales,
+            randomize_arm_bases=bool(value.get("randomize_arm_bases", False)),
         )
 
 
