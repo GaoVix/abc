@@ -51,7 +51,6 @@ class BaseCompensation:
                     spec.delete(joint)
             self.controllers.append(MinkArmController(
                 np.zeros(6), model=spec.compile(), target_link=f"{side}_link_6",
-                joint_limits=False, max_velocity=0, max_joint_delta=np.inf,
             ))
         self.stats = {
             name: {"arm_solves": 0, "solve_calls": 0, "not_converged": 0,
