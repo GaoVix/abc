@@ -6,6 +6,7 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from deploy.robot.control.mink_ik import MinkArmController
 
@@ -50,7 +51,6 @@ class BaseCompensation:
                     spec.delete(joint)
             self.controllers.append(MinkArmController(
                 np.zeros(6), model=spec.compile(), target_link=f"{side}_link_6",
-                max_velocity=0, max_joint_delta=np.inf,
             ))
         self.stats = {
             name: {"arm_solves": 0, "solve_calls": 0, "not_converged": 0,
@@ -87,20 +87,20 @@ class BaseCompensation:
                 for side in self.sides]
 
     def _solve(self, arm, target, seed):
-        link_target = self.world_from_camera @ target @ self.tcp_from_link[arm]
-        quaternion = np.empty(4)
-        mujoco.mju_mat2Quat(quaternion, link_target[:3, :3].ravel())
+        target = self.world_from_camera @ target
+        link_target = target @ self.tcp_from_link[arm]
+        quaternion = Rotation.from_matrix(link_target[:3, :3]).as_quat()[[3, 0, 1, 2]]
         joints = seed.copy()
-        for calls in range(11):
+        for calls in range(1, 11):
+            joints = self.controllers[arm].solve(link_target[:3, 3], quaternion, joints)
             self.data.qpos[self.qpos[arm]] = joints
             mujoco.mj_kinematics(self.model, self.data)
-            current = self.camera_from_world @ _pose(self.data.site(f"{self.sides[arm]}_tcp_site"))
+            current = _pose(self.data.site(f"{self.sides[arm]}_tcp_site"))
             position_error = np.linalg.norm(current[:3, 3] - target[:3, 3]) * 1000
-            cosine = (np.trace(current[:3, :3].T @ target[:3, :3]) - 1) / 2
-            rotation_error = np.rad2deg(np.arccos(np.clip(cosine, -1, 1)))
-            if (position_error <= 0.1 and rotation_error <= 0.1) or calls == 10:
+            rotation_error = np.rad2deg(Rotation.from_matrix(
+                current[:3, :3] @ target[:3, :3].T).magnitude())
+            if position_error <= 0.1 and rotation_error <= 0.1:
                 break
-            joints = self.controllers[arm].solve(link_target[:3, 3], quaternion, joints)
         return joints, position_error, rotation_error, calls
 
     def convert(self, joints, *, state=False):
