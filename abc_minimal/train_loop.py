@@ -48,6 +48,7 @@ from abc_minimal.dit import (
     load_pretrained,
     task_name_to_prompt,
 )
+from abc_minimal.kinematics import EEFPoseFK
 from abc_minimal.operator import load_operator_label_maps
 from abc_minimal.preprocess import load_norm_stats, parse_norm_stats
 from abc_minimal.vla import VLAPolicy, stack_camera_batch
@@ -416,6 +417,7 @@ def main(config: TrainConfig):
         operator_label_maps=operator_label_maps,
         norm_preset=norm_preset,
     )
+    eef_fk = EEFPoseFK(norm_stats["actions"], device)
 
     wandb = None
     if config.log_wandb and rank == 0:
@@ -487,7 +489,7 @@ def main(config: TrainConfig):
         if global_step % config.val_every == 0:
             _run_validation(
                 config, module, val_loaders, device, embedder, camera_keys,
-                distributed, rank, wandb, global_step,
+                distributed, rank, wandb, global_step, eef_fk,
             )
             model.train()
             t_last = time.monotonic()
@@ -511,42 +513,58 @@ def main(config: TrainConfig):
 
 
 def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
-                    distributed, rank, wandb, global_step):
-    """Per-component val_recon_error (generation MSE) and val_loss (diffusion loss)."""
+                    distributed, rank, wandb, global_step, eef_fk):
+    """Per-component generation MSE, diffusion loss, and EEF pose errors."""
     module.eval()
     sharded = hasattr(module, "unshard")  # FSDP2 root: sample_actions bypasses its forward hook
     if sharded:
         module.unshard()
     per_component_recon = {}
     per_component_loss = {}
+    per_component_position = {}
+    per_component_rotation = {}
     skipped_val = []
     for name, vl in val_loaders.items():
         err_sum, elem_count, loss_sum, batch_count = 0.0, 0, 0.0, 0
+        position_sum, rotation_sum, pose_count = 0.0, 0.0, 0
         for vb in vl:
             vb = batch_to_device(vb, device, embedder, camera_keys)
             with torch.no_grad():
                 pred = module.sample_actions(vb, num_steps=config.flow.num_diffusion_steps)
                 err_sum += F.mse_loss(pred, vb["actions"], reduction="sum").item()
                 elem_count += vb["actions"].numel()
+                positions, rotations = eef_fk(torch.stack((pred, vb["actions"])))
+                position_error = positions[0] - positions[1]
+                position_sum += position_error.square().sum().item()
+                relative = rotations[0].double().transpose(-1, -2) @ rotations[1].double()
+                sine = (relative - relative.transpose(-1, -2)).norm(dim=(-1, -2)) / (8 ** 0.5)
+                cosine = (relative.diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2
+                rotation_sum += torch.atan2(sine, cosine).rad2deg().sum().item()
+                pose_count += position_error.numel() // 3
                 loss_sum += module(
                     vb, max_action_prefix=0, prefix_conditioning_prob=0.0
                 ).item()
                 batch_count += 1
         stats = torch.tensor(
-            [err_sum, float(elem_count), loss_sum, float(batch_count)], device=device
+            [err_sum, float(elem_count), loss_sum, float(batch_count),
+             position_sum, rotation_sum, float(pose_count)], device=device
         )
         if distributed:
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
         if stats[1].item() > 0:
             per_component_recon[name] = (stats[0] / stats[1]).item()
             per_component_loss[name] = (stats[2] / stats[3]).item()
+            per_component_position[name] = (stats[4] / stats[6]).sqrt().item() * 1000
+            per_component_rotation[name] = (stats[5] / stats[6]).item()
         else:
             skipped_val.append(name)
     if sharded:
         module.reshard()
     if rank == 0:
         if per_component_recon:
-            parts = "  ".join(f"{n}={v:.4f}" for n, v in per_component_recon.items())
+            parts = "  ".join(f"{n}={v:.4f}, eef={per_component_position[n]:.2f}mm"
+                              f"/{per_component_rotation[n]:.2f}deg"
+                              for n, v in per_component_recon.items())
             avg = sum(per_component_recon.values()) / len(per_component_recon)
             avg_loss = sum(per_component_loss.values()) / len(per_component_loss)
             print(f"step {global_step:6d}  val_recon_error {avg:.4f}  "
@@ -555,6 +573,10 @@ def _run_validation(config, module, val_loaders, device, embedder, camera_keys,
                 log = {"val_recon_error": avg, "val_loss": avg_loss}
                 log.update({f"val_recon_error/{n}": v for n, v in per_component_recon.items()})
                 log.update({f"val_loss/{n}": v for n, v in per_component_loss.items()})
+                log.update({f"val_eef_position_rmse_mm/{n}": v
+                            for n, v in per_component_position.items()})
+                log.update({f"val_eef_rotation_mean_deg/{n}": v
+                            for n, v in per_component_rotation.items()})
                 wandb.log(log, step=global_step)
         else:
             print(f"step {global_step:6d}  val skipped (no full validation batches)")
