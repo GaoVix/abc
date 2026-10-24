@@ -28,6 +28,7 @@ class MinkArmController:
         gain: float = 0.6,
         max_velocity: float = 3.0,
         limit_margin: float = 0.1,
+        joint_limits: bool = True,
         limit_gain: float = 0.5,
         posture_cost: float = 5e-3,
         max_joint_delta: float = 0.12,
@@ -60,8 +61,15 @@ class MinkArmController:
         if target_link not in body_names:
             raise RuntimeError(f"YAM target link {target_link!r} was not found")
         self.target_link = target_link
-        self.configuration = mink.Configuration(self.model)
         self.lower, self.upper = self._joint_limits(limit_margin)
+        posture_target = np.zeros(6)
+        finite = np.isfinite(self.lower) & np.isfinite(self.upper)
+        posture_target[finite] = 0.5 * (self.lower[finite] + self.upper[finite])
+        if not joint_limits:
+            self.model.jnt_limited[:] = False
+            self.lower[:] = -np.inf
+            self.upper[:] = np.inf
+        self.configuration = mink.Configuration(self.model)
         self.home = np.clip(
             np.asarray(home, dtype=float).reshape(6), self.lower, self.upper
         )
@@ -74,9 +82,6 @@ class MinkArmController:
             gain=float(gain),
             lm_damping=1e-6,
         )
-        posture_target = np.zeros(6)
-        finite = np.isfinite(self.lower) & np.isfinite(self.upper)
-        posture_target[finite] = 0.5 * (self.lower[finite] + self.upper[finite])
         posture = mink.PostureTask(self.model, cost=float(posture_cost))
         posture.set_target(posture_target)
         self.tasks = [self.frame_task, posture]
@@ -86,7 +91,7 @@ class MinkArmController:
                 gain=float(limit_gain),
                 min_distance_from_limits=self._effective_margin(limit_margin),
             )
-        ]
+        ] if joint_limits else []
         if max_velocity > 0:
             velocities = {
                 mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, index): float(
