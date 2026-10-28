@@ -1,4 +1,4 @@
-"""Select a DP100 grid path, then solve the whole trajectory with SLSQP."""
+"""Select a DP100 grid path, then solve whole-trajectory IK."""
 
 import argparse
 import json
@@ -6,10 +6,12 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
-from scipy.optimize import NonlinearConstraint, minimize
+import torch
+from scipy.optimize import Bounds, NonlinearConstraint, minimize
 from scipy.spatial.distance import cdist
 from scipy.spatial.transform import Rotation
 from scipy.sparse import block_diag, csr_matrix, diags, eye, kron
+from torch.func import hessian, vmap
 
 from abc_minimal.eef_pose_grid_gpu import GPUEEFPoseGrid
 
@@ -51,6 +53,78 @@ def select_path(candidates, pose_costs):
     for frame in range(len(candidates) - 1, 0, -1):
         choice[frame - 1] = parents[frame - 1][choice[frame]]
     return choice
+
+
+def quaternion_product(a, b):
+    return torch.cat((a[:1] * b[:1] - torch.dot(a[1:], b[1:]).reshape(1),
+                      a[0] * b[1:] + b[0] * a[1:] + torch.linalg.cross(a[1:], b[1:])))
+
+
+class PoseConstraintHessian:
+    def __init__(self, model, data, joints, site, targets):
+        qpos = model.jnt_qposadr[joints]
+        previous = data.qpos[qpos].copy()
+        data.qpos[qpos] = 0
+        mujoco.mj_kinematics(model, data)
+        anchors = data.xanchor[joints].copy()
+        axes = data.xaxis[joints].copy()
+        self.site_position = torch.as_tensor(data.site_xpos[site].copy(), dtype=torch.float64)
+        site_rotation = data.site_xmat[site].reshape(3, 3)
+        site_quaternion = Rotation.from_matrix(site_rotation).as_quat()[[3, 0, 1, 2]]
+        self.site_quaternion = torch.as_tensor(site_quaternion, dtype=torch.float64)
+        self.anchors = torch.as_tensor(anchors, dtype=torch.float64)
+        self.axes = torch.as_tensor(axes, dtype=torch.float64)
+        self.skews = torch.as_tensor(np.array([
+            [[0, -z, y], [z, 0, -x], [-y, x, 0]] for x, y, z in axes
+        ]), dtype=torch.float64)
+        self.target_positions = torch.as_tensor(targets[:, :3, 3].copy(), dtype=torch.float64)
+        target_quaternions = Rotation.from_matrix(targets[:, :3, :3]).as_quat()[:, [3, 0, 1, 2]]
+        target_quaternions[:, 1:] *= -1
+        self.target_quaternions = torch.as_tensor(target_quaternions.copy(), dtype=torch.float64)
+        self.scale = torch.tensor([1000, 1000, 1000, 180 / np.pi,
+                                   180 / np.pi, 180 / np.pi], dtype=torch.float64)
+        data.qpos[qpos] = previous
+        mujoco.mj_kinematics(model, data)
+        self.batched_hessian = vmap(hessian(self.weighted_residual, argnums=0))
+
+    def weighted_residual(self, q, target_position, target_quaternion, multipliers):
+        rotation = torch.eye(3, dtype=q.dtype)
+        position = torch.zeros(3, dtype=q.dtype)
+        quaternion = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=q.dtype)
+        for i in range(6):
+            axis = self.axes[i]
+            angle = q[i]
+            joint_rotation = (torch.cos(angle) * torch.eye(3, dtype=q.dtype)
+                              + (1 - torch.cos(angle)) * torch.outer(axis, axis)
+                              + torch.sin(angle) * self.skews[i])
+            position = position + rotation @ ((torch.eye(3, dtype=q.dtype) - joint_rotation)
+                                            @ self.anchors[i])
+            rotation = rotation @ joint_rotation
+            joint_quaternion = torch.cat((torch.cos(angle / 2).reshape(1),
+                                          axis * torch.sin(angle / 2)))
+            quaternion = quaternion_product(quaternion, joint_quaternion)
+        position = position + rotation @ self.site_position
+        quaternion = quaternion_product(quaternion_product(quaternion, self.site_quaternion),
+                                        target_quaternion)
+        quaternion = torch.where(quaternion[0] < 0, -quaternion, quaternion)
+        vector = quaternion[1:]
+        squared_norm = torch.dot(vector, vector)
+        norm = torch.sqrt(squared_norm + 1e-30)
+        w = quaternion[0]
+        safe_w = torch.where(torch.abs(w) > 1e-12, w, torch.ones_like(w))
+        factor = torch.where(squared_norm < 1e-8,
+                             2 / safe_w - 2 * squared_norm / (3 * safe_w ** 3),
+                             2 * torch.atan2(norm, w) / norm)
+        residual = torch.cat((position - target_position, vector * factor))
+        return torch.dot(residual * self.scale, multipliers)
+
+    def __call__(self, x, multipliers):
+        q = torch.as_tensor(x.reshape(-1, 6), dtype=torch.float64)
+        v = torch.as_tensor(multipliers.reshape(-1, 6), dtype=torch.float64)
+        blocks = list(self.batched_hessian(q, self.target_positions,
+                                           self.target_quaternions, v).numpy())
+        blocks[0] = csr_matrix(blocks[0])
+        return block_diag(blocks, format="csr")
 
 
 class Trajectory:
@@ -146,13 +220,15 @@ def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_fram
     problem = Trajectory(model, data, side, targets, seeds, smoothness)
     bounds = np.tile(model.jnt_range[problem.joints], (len(seeds), 1))
     if solver == "trust-constr":
-        zero_hessian = csr_matrix((seeds.size, seeds.size))
+        constraint_hessian = PoseConstraintHessian(model, data, problem.joints,
+                                                   problem.site, targets)
         constraint = NonlinearConstraint(problem.scaled_constraints, 0, 0,
                                         jac=problem.sparse_constraint_jacobian,
-                                        hess=lambda x, multipliers: zero_hessian)
+                                        hess=constraint_hessian)
         result = minimize(problem.objective, seeds.ravel().copy(), jac=problem.gradient,
                           hess=problem.objective_hessian, method="trust-constr",
-                          bounds=bounds, constraints=[constraint],
+                          bounds=Bounds(bounds[:, 0], bounds[:, 1], keep_feasible=True),
+                          constraints=[constraint],
                           options={"maxiter": maxiter, "gtol": 1e-8, "xtol": 1e-10,
                                    "sparse_jacobian": True})
     else:
@@ -169,8 +245,11 @@ def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_fram
         residual = pose_error(joints, model, data, problem.joints, problem.site, target)
         errors[frame] = (np.linalg.norm(residual[:3]) * 1000,
                          np.rad2deg(np.linalg.norm(residual[3:])))
+    within_bounds = ((q.ravel() >= bounds[:, 0] - 1e-10)
+                     & (q.ravel() <= bounds[:, 1] + 1e-10)).reshape(-1, 6).all(axis=1)
     return {"q": q, "seeds": seeds, "ranks": choice + 1,
             "errors_mm_deg": errors, "optimizer_success": result.success,
+            "joint_bounds_passed": within_bounds,
             "iterations": result.nit, "message": result.message}
 
 
@@ -196,3 +275,6 @@ if __name__ == "__main__":
     print("saved:", args.output)
     print("pose passed:", np.all(result["errors_mm_deg"] <= 0.1, axis=1).sum(),
           "/", len(result["q"]))
+    print("pose and bounds passed:",
+          (np.all(result["errors_mm_deg"] <= 0.1, axis=1)
+           & result["joint_bounds_passed"]).sum(), "/", len(result["q"]))
