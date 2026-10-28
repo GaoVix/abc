@@ -6,9 +6,10 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import NonlinearConstraint, minimize
 from scipy.spatial.distance import cdist
 from scipy.spatial.transform import Rotation
+from scipy.sparse import block_diag, csr_matrix, diags, eye, kron
 
 from abc_minimal.eef_pose_grid_gpu import GPUEEFPoseGrid
 
@@ -37,14 +38,14 @@ def set_median_bases(model, data):
     return world_from_camera
 
 
-def select_path(candidates):
+def select_path(candidates, pose_costs):
     parents = []
-    cost = np.zeros(len(candidates[0]))
-    for previous, current in zip(candidates, candidates[1:]):
-        transition = cdist(previous, current, "sqeuclidean") + cost[:, None]
+    cost = pose_costs[0].copy()
+    for frame, (previous, current) in enumerate(zip(candidates, candidates[1:]), 1):
+        transition = cdist(previous, current, "sqeuclidean") / 0.1 ** 2 + cost[:, None]
         parent = np.argmin(transition, axis=0)
         parents.append(parent)
-        cost = transition[parent, np.arange(len(current))]
+        cost = transition[parent, np.arange(len(current))] + pose_costs[frame]
     choice = np.empty(len(candidates), dtype=np.int32)
     choice[-1] = np.argmin(cost)
     for frame in range(len(candidates) - 1, 0, -1):
@@ -60,6 +61,15 @@ class Trajectory:
         self.site = model.site(f"{side}_tcp_site").id
         self.residual = np.empty((len(reference), 6))
         self.jac = np.zeros((reference.size, reference.size))
+        frames = len(reference)
+        diagonal = np.ones(frames)
+        diagonal[:-1] += self.weight
+        diagonal[1:] += self.weight
+        off_diagonal = np.full(frames - 1, -self.weight)
+        self.hessian = kron(diags((off_diagonal, diagonal, off_diagonal), (-1, 0, 1)),
+                            eye(6), format="csr")
+        self.constraint_scale = diags(np.tile([1000, 1000, 1000, 180 / np.pi,
+                                                180 / np.pi, 180 / np.pi], frames), format="csr")
         self.last_x = None
 
     def objective(self, x):
@@ -93,8 +103,22 @@ class Trajectory:
         self.evaluate(x)
         return self.jac
 
+    def sparse_constraint_jacobian(self, x):
+        self.evaluate(x)
+        blocks = [self.jac[i:i + 6, i:i + 6]
+                  for i in range(0, self.reference.size, 6)]
+        blocks[0] = csr_matrix(blocks[0])
+        return self.constraint_scale @ block_diag(blocks, format="csr")
 
-def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_frame=False):
+    def scaled_constraints(self, x):
+        return self.constraint_scale @ self.constraints(x)
+
+    def objective_hessian(self, x):
+        return self.hessian
+
+
+def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_frame=False,
+                   solver="slsqp", maxiter=500):
     """Solve TCP poses against the real-data median bases; targets are world-frame by default."""
     world_from_camera = set_median_bases(model, data)
     if camera_frame:
@@ -105,7 +129,7 @@ def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_fram
     base_from_world[:3, :3] = rotation.T
     base_from_world[:3, 3] = -rotation.T @ base.xpos
 
-    candidates = []
+    candidates, pose_costs = [], []
     for frame, target in enumerate(targets):
         for radius in (1, 2, 3, 4):
             found = grid.query(base_from_world @ target, k=100, neighbors=radius)
@@ -114,18 +138,31 @@ def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_fram
         if not len(found["rows"]):
             raise ValueError(f"No grid candidates for frame {frame}")
         candidates.append(found["joints"].astype(np.float64))
+        pose_costs.append((found["position_error_m"] / 0.01) ** 2
+                          + (found["rotation_error_rad"] / 0.1) ** 2)
 
-    choice = select_path(candidates)
+    choice = select_path(candidates, pose_costs)
     seeds = np.stack([candidate[index] for candidate, index in zip(candidates, choice)])
     problem = Trajectory(model, data, side, targets, seeds, smoothness)
     bounds = np.tile(model.jnt_range[problem.joints], (len(seeds), 1))
-    result = minimize(
-        problem.objective, seeds.ravel().copy(), jac=problem.gradient,
-        method="SLSQP", bounds=bounds,
-        constraints={"type": "eq", "fun": problem.constraints,
-                     "jac": problem.constraint_jacobian},
-        options={"ftol": 1e-10, "maxiter": 500},
-    )
+    if solver == "trust-constr":
+        zero_hessian = csr_matrix((seeds.size, seeds.size))
+        constraint = NonlinearConstraint(problem.scaled_constraints, 0, 0,
+                                        jac=problem.sparse_constraint_jacobian,
+                                        hess=lambda x, multipliers: zero_hessian)
+        result = minimize(problem.objective, seeds.ravel().copy(), jac=problem.gradient,
+                          hess=problem.objective_hessian, method="trust-constr",
+                          bounds=bounds, constraints=[constraint],
+                          options={"maxiter": maxiter, "gtol": 1e-8, "xtol": 1e-10,
+                                   "sparse_jacobian": True})
+    else:
+        result = minimize(
+            problem.objective, seeds.ravel().copy(), jac=problem.gradient,
+            method="SLSQP", bounds=bounds,
+            constraints={"type": "eq", "fun": problem.constraints,
+                         "jac": problem.constraint_jacobian},
+            options={"ftol": 1e-10, "maxiter": maxiter},
+        )
     q = result.x.reshape(-1, 6)
     errors = np.empty((len(seeds), 2))
     for frame, (joints, target) in enumerate(zip(q, targets)):
@@ -143,6 +180,8 @@ if __name__ == "__main__":
     parser.add_argument("--grid", required=True)
     parser.add_argument("--side", choices=("left", "right"), default="left")
     parser.add_argument("--smoothness", type=float, default=1.0)
+    parser.add_argument("--solver", choices=("slsqp", "trust-constr"), default="slsqp")
+    parser.add_argument("--maxiter", type=int, default=500)
     parser.add_argument("--camera-frame", action="store_true",
                         help="Input poses use the calibrated top-camera/OpenCV frame")
     parser.add_argument("--model", default=str(Path(__file__).resolve().parents[1]
@@ -151,7 +190,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     model = mujoco.MjModel.from_xml_path(args.model)
     result = solve_sequence(model, mujoco.MjData(model), args.side, np.load(args.poses),
-                            GPUEEFPoseGrid(args.grid), args.smoothness, args.camera_frame)
+                            GPUEEFPoseGrid(args.grid), args.smoothness, args.camera_frame,
+                            args.solver, args.maxiter)
     np.savez(args.output, **result)
     print("saved:", args.output)
     print("pose passed:", np.all(result["errors_mm_deg"] <= 0.1, axis=1).sum(),
