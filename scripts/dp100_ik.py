@@ -1,12 +1,14 @@
 """Select a DP100 grid path, then solve the whole trajectory with SLSQP."""
 
 import argparse
+import json
 from pathlib import Path
 
 import mujoco
 import numpy as np
 from scipy.optimize import minimize
 from scipy.spatial.distance import cdist
+from scipy.spatial.transform import Rotation
 
 from abc_minimal.eef_pose_grid_gpu import GPUEEFPoseGrid
 
@@ -14,6 +16,25 @@ if __package__:
     from .scipy_ik import pose_error, pose_jacobian
 else:
     from scipy_ik import pose_error, pose_jacobian
+
+
+MEDIAN_BASE = Path(__file__).resolve().parents[1] / "outputs/base_pose_median_20261026/median_base_poses.json"
+
+
+def set_median_bases(model, data):
+    mujoco.mj_forward(model, data)
+    top = data.camera("top")
+    world_from_camera = np.eye(4)
+    world_from_camera[:3, :3] = top.xmat.reshape(3, 3) @ np.diag([1.0, -1.0, -1.0])
+    world_from_camera[:3, 3] = top.xpos
+    median = json.loads(MEDIAN_BASE.read_text())["poses"]
+    for side in ("left", "right"):
+        transform = world_from_camera @ np.asarray(median[side]["T_camera_from_base"])
+        body = model.body(f"{side}_arm")
+        body.pos[:] = transform[:3, 3]
+        body.quat[:] = Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]
+    mujoco.mj_forward(model, data)
+    return world_from_camera
 
 
 def select_path(candidates):
@@ -73,9 +94,11 @@ class Trajectory:
         return self.jac
 
 
-def solve_sequence(model, data, side, targets, grid, smoothness=1.0):
-    """Targets are world-frame TCP transforms; model/data define the grid's arm base."""
-    mujoco.mj_forward(model, data)
+def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_frame=False):
+    """Solve TCP poses against the real-data median bases; targets are world-frame by default."""
+    world_from_camera = set_median_bases(model, data)
+    if camera_frame:
+        targets = world_from_camera @ targets
     base = data.body(f"{side}_arm")
     base_from_world = np.eye(4)
     rotation = base.xmat.reshape(3, 3)
@@ -120,13 +143,15 @@ if __name__ == "__main__":
     parser.add_argument("--grid", required=True)
     parser.add_argument("--side", choices=("left", "right"), default="left")
     parser.add_argument("--smoothness", type=float, default=1.0)
+    parser.add_argument("--camera-frame", action="store_true",
+                        help="Input poses use the calibrated top-camera/OpenCV frame")
     parser.add_argument("--model", default=str(Path(__file__).resolve().parents[1]
                                                 / "abc_sim/models/yam_dishrack_base.xml"))
     parser.add_argument("--output", default="dp100_ik.npz")
     args = parser.parse_args()
     model = mujoco.MjModel.from_xml_path(args.model)
     result = solve_sequence(model, mujoco.MjData(model), args.side, np.load(args.poses),
-                            GPUEEFPoseGrid(args.grid), args.smoothness)
+                            GPUEEFPoseGrid(args.grid), args.smoothness, args.camera_frame)
     np.savez(args.output, **result)
     print("saved:", args.output)
     print("pose passed:", np.all(result["errors_mm_deg"] <= 0.1, axis=1).sum(),
