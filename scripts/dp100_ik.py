@@ -1,4 +1,4 @@
-"""Select a DP100 grid path, then solve whole-trajectory IK."""
+"""Select a grid path, then solve whole-trajectory IK."""
 
 import argparse
 import json
@@ -206,7 +206,7 @@ def solve_sequence(model, data, side, targets, grid, smoothness=1.0, camera_fram
     candidates, pose_costs = [], []
     for frame, target in enumerate(targets):
         for radius in (1, 2, 3, 4):
-            found = grid.query(base_from_world @ target, k=100, neighbors=radius)
+            found = grid.query(base_from_world @ target, k=200, neighbors=radius)
             if len(found["rows"]):
                 break
         if not len(found["rows"]):
