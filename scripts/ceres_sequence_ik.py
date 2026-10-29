@@ -12,6 +12,8 @@ from scipy.spatial.transform import Rotation
 
 from scripts.scipy_ik import pose_error, pose_jacobian
 
+ONE_DEGREE_RAD = np.pi / 180
+
 
 class PoseCost(pyceres.CostFunction):
     def __init__(self, model, data, side, target, scale):
@@ -70,21 +72,23 @@ def pose_errors(model, side, targets, q):
 
 def solve_sequence(model, side, targets, initial, reference, half_width,
                    position_scale_mm=.1, rotation_scale_deg=.1,
-                   reference_weight=1., first_order_weight=1., second_order_weight=1., maxiter=500):
+                   reference_weight=1., first_order_weight=1., first_order_window=1,
+                   second_order_weight=1., maxiter=500):
     q = np.array(initial, dtype=np.float64, order='C', copy=True)
     blocks = list(q)
     data = mujoco.MjData(model)
     problem = pyceres.Problem()
     pose_scale = np.r_[np.full(3, 1000 / position_scale_mm),
                        np.full(3, 1 / np.deg2rad(rotation_scale_deg))]
+    first_order_scale = np.sqrt(first_order_weight / first_order_window) / ONE_DEGREE_RAD
     for frame, (block, target) in enumerate(zip(blocks, targets)):
         problem.add_residual_block(PoseCost(model, data, side, target, pose_scale), None, [block])
         problem.add_residual_block(JointCost([1], reference[frame], np.sqrt(reference_weight)), None, [block])
-        if frame:
-            problem.add_residual_block(JointCost([-1, 1], 0., np.sqrt(first_order_weight) / np.deg2rad(1.)),
-                                       None, blocks[frame - 1:frame + 1])
+        for previous in range(max(0, frame - first_order_window), frame):
+            problem.add_residual_block(JointCost([-1, 1], 0., first_order_scale), None,
+                                       [blocks[previous], block])
         if frame > 1:
-            problem.add_residual_block(JointCost([1, -2, 1], 0., np.sqrt(second_order_weight) / np.deg2rad(1.)),
+            problem.add_residual_block(JointCost([1, -2, 1], 0., np.sqrt(second_order_weight) / ONE_DEGREE_RAD),
                                        None, blocks[frame - 2:frame + 1])
         for joint in range(6):
             problem.set_parameter_lower_bound(block, joint, float(initial[frame, joint] - half_width[joint]))
@@ -114,6 +118,7 @@ def main():
     parser.add_argument('--rotation-scale-deg', type=float, default=.1)
     parser.add_argument('--reference-weight', type=float, default=1.)
     parser.add_argument('--first-order-weight', type=float, default=1.)
+    parser.add_argument('--first-order-window', type=int, default=1)
     parser.add_argument('--second-order-weight', type=float, default=1.)
     parser.add_argument('--maxiter', type=int, default=500)
     args = parser.parse_args()
@@ -136,7 +141,8 @@ def main():
         targets = source['targets_world'][:, arm]
         q, summary = solve_sequence(model, side, targets, initial, reference, half_width,
                                     args.position_scale_mm, args.rotation_scale_deg, args.reference_weight,
-                                    args.first_order_weight, args.second_order_weight, args.maxiter)
+                                    args.first_order_weight, args.first_order_window,
+                                    args.second_order_weight, args.maxiter)
         error = pose_errors(model, side, targets, q)
         report = dict(side=side, optimizer_usable=summary.IsSolutionUsable(), summary=summary.BriefReport(),
                       initial_cost=summary.initial_cost, final_cost=summary.final_cost,
@@ -154,7 +160,8 @@ def main():
 
     source.update(q=np.stack(solutions, axis=1), errors=np.stack(errors, axis=1),
                   solver='ceres', optimized_sides=np.array(['left', 'right']),
-                  smoothness=args.first_order_weight, acceleration_smoothness=args.second_order_weight,
+                  smoothness=args.first_order_weight, first_order_window=args.first_order_window,
+                  acceleration_smoothness=args.second_order_weight,
                   reference_weight=args.reference_weight,
                   position_scale_mm=args.position_scale_mm, rotation_scale_deg=args.rotation_scale_deg,
                   joint_radii_rad=np.stack(radii), joint_limits_enabled=True,
@@ -173,6 +180,7 @@ def main():
                   first_joint_radius_rad=args.first_joint_radius_rad,
                   position_scale_mm=args.position_scale_mm, rotation_scale_deg=args.rotation_scale_deg,
                   reference_weight=args.reference_weight, first_order_weight=args.first_order_weight,
+                  first_order_window=args.first_order_window,
                   second_order_weight=args.second_order_weight, arms=reports)
     (args.output / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
     print(f'Saved to {args.output}; {report["seconds"]:.2f}s', flush=True)
