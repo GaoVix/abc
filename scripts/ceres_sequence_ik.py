@@ -91,7 +91,7 @@ def solve_sequence(model, side, targets, initial, reference, half_width,
                    reference_weight=1., first_order_weight=1., first_order_window=1,
                    second_order_weight=1., maxiter=500,
                    position_weight=1., rotation_weight=4., check_gradients=False):
-    q = initial.astype(np.float64, order='C')
+    q = initial.astype(np.float64)
     if half_width is not None:
         lower, upper = q - half_width, q + half_width
     blocks = list(q)
