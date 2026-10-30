@@ -1,8 +1,6 @@
 """Refine a DP joint trajectory with analytic Ceres residuals."""
 
 import argparse
-import json
-import time
 from pathlib import Path
 
 import mujoco
@@ -154,6 +152,10 @@ def main(argv=None):
     parser.add_argument('--maxiter', type=int, default=500)
     parser.add_argument('--check-gradients', action='store_true')
     args = parser.parse_args(argv)
+    weights = dict(position_scale_mm=args.position_scale_mm, rotation_scale_deg=args.rotation_scale_deg,
+                   position_weight=args.position_weight, rotation_weight=args.rotation_weight,
+                   reference_weight=args.reference_weight, first_order_weight=args.first_order_weight,
+                   first_order_window=args.first_order_window, second_order_weight=args.second_order_weight)
 
     with np.load(args.input) as saved:
         source = {key: saved[key] for key in saved.files}
@@ -164,8 +166,7 @@ def main(argv=None):
         body.pos[:] = transform[:3, 3]
         body.quat[:] = Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]
 
-    started = time.perf_counter()
-    solutions, errors, radii, scales, bounds, reports = [], [], [], [], [], []
+    solutions, errors, bounds, usable, success = [], [], [], [], []
     for arm, side in enumerate(('left', 'right')):
         radius = None
         if not args.unlimited:
@@ -179,70 +180,23 @@ def main(argv=None):
             scale = np.sqrt(np.hypot(dp_error[:, 0] / 10., np.deg2rad(dp_error[:, 1]) / .1))
         half_width = None if args.unlimited else scale[:, None] * radius
         q, summary = solve_sequence(model, side, targets, initial, reference, half_width,
-                                    args.position_scale_mm, args.rotation_scale_deg, args.reference_weight,
-                                    args.first_order_weight, args.first_order_window,
-                                    args.second_order_weight, args.maxiter,
-                                    position_weight=args.position_weight, rotation_weight=args.rotation_weight,
-                                    check_gradients=args.check_gradients)
-        error = pose_errors(model, side, targets, q)
-        report = dict(side=side, optimizer_usable=summary.IsSolutionUsable(), summary=summary.BriefReport(),
-                      initial_cost=summary.initial_cost, final_cost=summary.final_cost,
-                      joint_radii_rad=None if half_width is None else radius.tolist(),
-                      bound_scale_min_max=None if half_width is None else [float(scale.min()), float(scale.max())],
-                      base_radius_min_max_rad=(None if half_width is None else
-                                               [float(half_width[:, 0].min()), float(half_width[:, 0].max())]),
-                      position_mean_max_mm=[float(error[:, 0].mean()), float(error[:, 0].max())],
-                      rotation_mean_max_deg=[float(error[:, 1].mean()), float(error[:, 1].max())],
-                      pose_pass_0_1_mm_deg=int(np.all(error <= .1, axis=1).sum()), frames=len(q),
-                      max_joint_step_deg=float(np.rad2deg(np.abs(np.diff(q, axis=0))).max(initial=0.)),
-                      max_bound_violation_rad=(None if half_width is None else
-                                               float(np.maximum(np.abs(q - initial) - half_width, 0.).max())))
+                                    maxiter=args.maxiter, check_gradients=args.check_gradients, **weights)
         solutions.append(q)
-        errors.append(error)
-        radii.append(np.full(6, np.inf) if half_width is None else radius)
-        scales.append(scale)
+        errors.append(pose_errors(model, side, targets, q))
         bounds.append(np.full_like(initial, np.inf) if half_width is None else half_width)
-        reports.append(report)
-        print(f'{side}: usable={report["optimizer_usable"]}, max error={error[:, 0].max():.4g} mm / '
-              f'{error[:, 1].max():.4g} deg, max joint step={report["max_joint_step_deg"]:.2f} deg', flush=True)
+        usable.append(summary.IsSolutionUsable())
+        success.append(summary.termination_type == pyceres.TerminationType.CONVERGENCE)
 
     bounds = np.stack(bounds, axis=1)
     source.update(q=np.stack(solutions, axis=1), errors=np.stack(errors, axis=1),
-                  solver='ceres', model_path=str(args.model.resolve()), optimized_sides=np.array(['left', 'right']),
-                  smoothness=args.first_order_weight, first_order_window=args.first_order_window,
-                  acceleration_smoothness=args.second_order_weight,
-                  reference_weight=args.reference_weight,
-                  position_scale_mm=args.position_scale_mm, rotation_scale_deg=args.rotation_scale_deg,
-                  position_weight=args.position_weight, rotation_weight=args.rotation_weight,
-                  joint_radii_rad=np.stack(radii), joint_limits_enabled=not args.unlimited,
-                  joint_bound_scales=np.stack(scales, axis=1),
-                  joint_base_radii_rad=bounds[..., 0],
-                  scale_bounds_by_dp_error=args.scale_bounds_by_dp_error and not args.unlimited,
-                  model_joint_limits_enabled=False, joint_limit_margin_deg=np.nan,
+                  solver='ceres', model_path=str(args.model.resolve()), **weights,
+                  ceres_usable=np.array(usable), solver_success=np.array(success),
+                  joint_limits_enabled=not args.unlimited,
                   joint_lower_bounds_rad=source['initial'] - bounds,
                   joint_upper_bounds_rad=source['initial'] + bounds)
     args.output.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output / 'trajectory.npz', **source)
-    report = dict(seconds=time.perf_counter() - started, input=str(args.input.resolve()),
-                  check_gradients=args.check_gradients, gradient_check_relative_precision=1e-6,
-                  base_mode=str(source.get('base_mode', 'input')),
-                  joint_bound_rule=('none' if args.unlimited else
-                                    'initial[t, joint] +/- scale[t, arm] * radius[joint]; no MJCF range intersection'),
-                  scale_bounds_by_dp_error=args.scale_bounds_by_dp_error and not args.unlimited,
-                  bound_scale_rule=('sqrt(hypot(position_error_m / 0.01, rotation_error_rad / 0.1))'
-                                    if args.scale_bounds_by_dp_error and not args.unlimited else None),
-                  radius_rule=(None if args.unlimited else 'explicit --joint-radii-rad'
-                               if args.joint_radii_rad is not None else
-                               'first_radius * sqrt(cumulative_link_length[0] / cumulative_link_length[j]); J6 uses J5 length'),
-                  explicit_joint_radii_rad=None if args.unlimited else args.joint_radii_rad,
-                  first_joint_radius_rad=None if args.unlimited else args.first_joint_radius_rad,
-                  position_scale_mm=args.position_scale_mm, rotation_scale_deg=args.rotation_scale_deg,
-                  position_weight=args.position_weight, rotation_weight=args.rotation_weight,
-                  reference_weight=args.reference_weight, first_order_weight=args.first_order_weight,
-                  first_order_window=args.first_order_window,
-                  second_order_weight=args.second_order_weight, arms=reports)
-    (args.output / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(f'Saved to {args.output}; {report["seconds"]:.2f}s', flush=True)
+    print(f'Saved to {args.output / "trajectory.npz"}', flush=True)
 
 
 if __name__ == '__main__':

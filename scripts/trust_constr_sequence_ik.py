@@ -1,8 +1,6 @@
 """Sequence IK with exact EEF constraints and the Ceres joint objective/bounds."""
 
 import argparse
-import json
-import time
 from pathlib import Path
 
 import mujoco
@@ -114,16 +112,15 @@ def main():
     for name, default in weights.items():
         value = getattr(args, name)
         if value is None:
-            value = source.get(saved_names.get(name, name), default)
+            value = source.get(name, source.get(saved_names.get(name, name), default))
         weights[name] = type(default)(value)
-        setattr(args, name, weights[name])
     args.model = args.model or Path(str(source.get('model_path', DEFAULT_MODEL_PATH)))
     from_ceres = str(source.get('solver', '')) == 'ceres'
     if from_ceres:
-        source['dp_initial'] = source['initial'].copy()
-        source['initial'] = source['q'].copy()
-        source['reference'] = source['q'].copy()
-        source['seed_errors'] = source['errors'].copy()
+        source['dp_initial'] = source['initial']
+        source['initial'] = source['q']
+        source['reference'] = source['q']
+        source['seed_errors'] = source['errors']
     limited = not args.unlimited and (not from_ceres or bool(source['joint_limits_enabled']))
     model = mujoco.MjModel.from_xml_path(str(args.model))
     for side, transform in zip(('left', 'right'), source['base_poses_world']):
@@ -132,7 +129,7 @@ def main():
         body.quat[:] = Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]
 
     args.output.mkdir(parents=True, exist_ok=True)
-    solutions, errors, lower_bounds, upper_bounds, reports = [], [], [], [], []
+    solutions, errors, lower_bounds, upper_bounds, success = [], [], [], [], []
     for arm, side in enumerate(('left', 'right')):
         initial, reference = source['initial'][:, arm], source['reference'][:, arm]
         targets = source['targets_world'][:, arm]
@@ -148,42 +145,24 @@ def main():
         problem = SequenceIK(model, side, targets, reference, **weights)
         equality = NonlinearConstraint(problem.constraints, 0., 0., jac=problem.constraint_jacobian,
                                        hess=problem.constraint_hessian)
-        started = time.perf_counter()
         result = minimize(problem.joint_cost, initial.ravel(), method='trust-constr', jac=True, hess=lambda x: problem.hessian,
                           constraints=equality, bounds=Bounds(lower.ravel(), upper.ravel(), keep_feasible=True) if limited else None,
                           options=dict(maxiter=args.maxiter, gtol=1e-8, xtol=1e-10, barrier_tol=1e-10, sparse_jacobian=True,
                                        factorization_method='AugmentedSystem'))
-        elapsed = time.perf_counter() - started
         q = result.x.reshape(-1, 6)
-        error = pose_errors(model, side, targets, q)
-        steps = np.rad2deg(np.abs(np.diff(q, axis=0))).max(axis=1)
-        report = dict(side=side, solver_success=bool(result.success), message=str(result.message), seconds=elapsed,
-                      position_mean_max_mm=[float(error[:, 0].mean()), float(error[:, 0].max())],
-                      rotation_mean_max_deg=[float(error[:, 1].mean()), float(error[:, 1].max())],
-                      pose_pass_0_1_mm_deg=int(np.all(error <= .1, axis=1).sum()), frames=len(q),
-                      max_joint_step_deg=float(steps.max(initial=0.)))
         solutions.append(q)
-        errors.append(error)
+        errors.append(pose_errors(model, side, targets, q))
         lower_bounds.append(lower)
         upper_bounds.append(upper)
-        reports.append(report)
-        print(f'{side}: success={result.success}, max error={error[:, 0].max():.4g} mm / '
-              f'{error[:, 1].max():.4g} deg, max joint step={steps.max(initial=0.):.2f} deg, {elapsed:.2f}s', flush=True)
+        success.append(result.success)
 
     lower_bounds, upper_bounds = np.stack(lower_bounds, axis=1), np.stack(upper_bounds, axis=1)
     source.update(q=np.stack(solutions, axis=1), errors=np.stack(errors, axis=1), solver='trust-constr',
-                  model_path=str(args.model.resolve()),
-                  eef_equality_constraints=True, smoothness=args.first_order_weight, **weights,
-                  acceleration_smoothness=args.second_order_weight,
-                  joint_limits_enabled=limited, model_joint_limits_enabled=False,
-                  scale_bounds_by_dp_error=limited and (not from_ceres or bool(source['scale_bounds_by_dp_error'])),
-                  joint_base_radii_rad=(upper_bounds - lower_bounds)[..., 0] / 2,
-                  joint_lower_bounds_rad=lower_bounds, joint_upper_bounds_rad=upper_bounds,
-                  initialization='ceres_solution' if from_ceres else 'input_initial',
-                  bounds_source='ceres_output' if from_ceres and limited else 'initial_pose_error' if limited else 'unlimited')
+                  model_path=str(args.model.resolve()), **weights, solver_success=np.array(success),
+                  joint_limits_enabled=limited,
+                  joint_lower_bounds_rad=lower_bounds, joint_upper_bounds_rad=upper_bounds)
     np.savez_compressed(args.output / 'trajectory.npz', **source)
-    settings = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    (args.output / 'summary.json').write_text(json.dumps(dict(settings=settings, arms=reports), indent=2) + '\n')
+    print(f'Saved to {args.output / "trajectory.npz"}', flush=True)
 
 
 if __name__ == '__main__':

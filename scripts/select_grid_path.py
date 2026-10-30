@@ -83,7 +83,7 @@ def main():
     args = parser.parse_args()
 
     with np.load(args.targets, allow_pickle=False) as saved:
-        source = {key: saved[key] for key in saved.files}
+        source = {key: saved[key] for key in ('targets_camera', 'frame_indices', 'actions') if key in saved}
     interval = slice(args.first_frame, None if args.last_frame is None else args.last_frame + 1)
     targets_camera = source['targets_camera'][interval]
     frames = source.get('frame_indices', np.arange(len(source['targets_camera'])))[interval]
@@ -101,13 +101,11 @@ def main():
     world_from_camera = np.eye(4)
     world_from_camera[:3, :3] = camera.xmat.reshape(3, 3) @ np.diag([1., -1., -1.])
     world_from_camera[:3, 3] = camera.xpos
-    result = dict(joints=joints, initial=joints, reference=joints.copy(), solver='dp',
+    result = dict(initial=joints, reference=joints, solver='dp',
                   teleop_distance_rad=distance, targets_camera=targets_camera,
                   targets_world=world_from_camera @ targets_camera, targets_base=targets_base,
                   base_poses_camera=base_poses, base_poses_world=world_from_camera @ base_poses,
-                  base_mode='input', base_pose_path=str(args.bases.resolve()), model_path=str(args.model.resolve()),
-                  frame_indices=frames, dp_candidate_k=args.k,
-                  distance_limit=args.distance_limit, dp_acceleration_weight=args.dp_acceleration_weight)
+                  model_path=str(args.model.resolve()), frame_indices=frames)
     if 'actions' in source:
         result['actions'] = source['actions'][interval]
     args.output.parent.mkdir(parents=True, exist_ok=True)
