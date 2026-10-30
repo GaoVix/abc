@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
+import mujoco
 import numpy as np
 from scipy.spatial.distance import cdist
 
@@ -53,16 +54,14 @@ def query_path(grid, targets, side, k=200, distance_limit=.5, acceleration_weigh
     joints, costs, distances = [], [], []
     for frame, target in enumerate(targets):
         for radius in range(1, 5):
-            found = grid.query(target, k=grid.total_rows, neighbors=radius)
-            distance = grid.teleop_distance(found['rows'], side)
-            keep = np.flatnonzero(distance < distance_limit)[:k]
-            if len(keep):
+            found = grid.query(target, k=k, neighbors=radius, side=side, distance_limit=distance_limit)
+            if len(found['rows']):
                 break
-        if not len(keep):
+        if not len(found['rows']):
             raise ValueError(f'No {side} candidates with distance < {distance_limit:g} at frame {frame}')
-        joints.append(found['joints'][keep])
-        costs.append((found['position_error_m'][keep] / .01) ** 2 + (found['rotation_error_rad'][keep] / .1) ** 2)
-        distances.append(distance[keep])
+        joints.append(found['joints'])
+        costs.append((found['position_error_m'] / .01) ** 2 + (found['rotation_error_rad'] / .1) ** 2)
+        distances.append(found['teleop_distance'])
     choice = select_path(joints, costs, acceleration_weight)
     selected_joints = np.stack([q[index] for q, index in zip(joints, choice)]).astype(np.float64)
     selected_distances = np.array([d[index] for d, index in zip(distances, choice)])
@@ -74,14 +73,20 @@ def main():
     parser.add_argument('--targets', type=Path, required=True, help='NPZ with targets_camera shaped (frames, 2, 4, 4), left then right; OpenCV frame, meters')
     parser.add_argument('--grid', type=Path, required=True)
     parser.add_argument('--bases', type=Path, default=Path(__file__).resolve().parents[1] / 'outputs/base_pose_median_20261026/median_base_poses.json')
+    parser.add_argument('--model', type=Path, default=Path(__file__).resolve().parents[1] / 'abc_sim/models/yam_dishrack_base.xml')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--first-frame', type=int, default=0, help='First input array index, inclusive')
+    parser.add_argument('--last-frame', type=int, help='Last input array index, inclusive; default: final frame')
     parser.add_argument('--k', type=int, default=200)
     parser.add_argument('--distance-limit', type=float, default=.5)
     parser.add_argument('--dp-acceleration-weight', type=float, default=1.)
     args = parser.parse_args()
 
     with np.load(args.targets, allow_pickle=False) as saved:
-        targets_camera = saved['targets_camera']
+        source = {key: saved[key] for key in saved.files}
+    interval = slice(args.first_frame, None if args.last_frame is None else args.last_frame + 1)
+    targets_camera = source['targets_camera'][interval]
+    frames = source.get('frame_indices', np.arange(len(source['targets_camera'])))[interval]
     bases = json.loads(args.bases.read_text())['poses']
     base_poses = np.asarray([bases[side]['T_camera_from_base'] for side in ('left', 'right')])
     targets_base = np.linalg.inv(base_poses)[None] @ targets_camera
@@ -89,8 +94,24 @@ def main():
     paths = [query_path(grid, targets_base[:, arm], side, args.k, args.distance_limit, args.dp_acceleration_weight) for arm, side in enumerate(('left', 'right'))]
     joints = np.stack([path[0] for path in paths], axis=1)
     distance = np.stack([path[1] for path in paths], axis=1)
+    model = mujoco.MjModel.from_xml_path(str(args.model))
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    camera = data.camera('top')
+    world_from_camera = np.eye(4)
+    world_from_camera[:3, :3] = camera.xmat.reshape(3, 3) @ np.diag([1., -1., -1.])
+    world_from_camera[:3, 3] = camera.xpos
+    result = dict(joints=joints, initial=joints, reference=joints.copy(), solver='dp',
+                  teleop_distance_rad=distance, targets_camera=targets_camera,
+                  targets_world=world_from_camera @ targets_camera, targets_base=targets_base,
+                  base_poses_camera=base_poses, base_poses_world=world_from_camera @ base_poses,
+                  base_mode='input', base_pose_path=str(args.bases.resolve()), model_path=str(args.model.resolve()),
+                  frame_indices=frames, dp_candidate_k=args.k,
+                  distance_limit=args.distance_limit, dp_acceleration_weight=args.dp_acceleration_weight)
+    if 'actions' in source:
+        result['actions'] = source['actions'][interval]
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.output, joints=joints, teleop_distance_rad=distance)
+    np.savez_compressed(args.output, **result)
     print(f'Saved {len(joints)} frames for both arms to {args.output}')
 
 
