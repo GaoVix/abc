@@ -113,7 +113,7 @@ class GPUEEFPoseGrid:
             tables.append((start, end, values))
         return tables
 
-    @lru_cache(maxsize=32)
+    @lru_cache(maxsize=256)
     def _bucket(self, bucket):
         base = self.cells_path / f"{bucket:03d}"
         directory = base.with_suffix(".directory.npz")
@@ -127,7 +127,7 @@ class GPUEEFPoseGrid:
         rows._mmap.madvise(mmap.MADV_RANDOM)
         return index, rows
 
-    @lru_cache(maxsize=4096)
+    @lru_cache(maxsize=16384)
     def _block(self, bucket, block):
         index, _ = self._bucket(bucket)
         begin, end = index["byte_offsets"][block:block + 2]
@@ -177,7 +177,7 @@ class GPUEEFPoseGrid:
         row_bytes[:, :5] = packed_rows
         return row_bytes.view("<u8").reshape(-1)
 
-    @lru_cache(maxsize=8192)
+    @lru_cache(maxsize=65536)
     def _filtered_cell(self, bucket, block, position, side, distance_limit):
         rows = self._cell_rows(bucket, block, position)
         scores = self.teleop_distance(rows, side)
