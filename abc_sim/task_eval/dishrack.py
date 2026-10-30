@@ -103,8 +103,14 @@ class DishrackEvaluator:
         self._rack_body_id: int | None = None
         self._rack_geom_ids: set[int] = set()
         self._gripper_geom_ids: set[int] = set()
+        self._arm_base_poses: dict[str, Any] = {}
         self._refresh_model(model)
         self.reset(nworld=1)
+
+    def configure_from_randomization(self, model, state) -> None:
+        if model is not self.model:
+            self._refresh_model(model)
+        self._arm_base_poses = state.metadata.get("arm_base_poses", {})
 
     @staticmethod
     def _resolve_plate_indices(model: mujoco.MjModel) -> list[int]:
@@ -203,8 +209,20 @@ class DishrackEvaluator:
         for world_index, qpos in enumerate(qpos_batch):
             data = mujoco.MjData(self.model)
             data.qpos[:] = qpos
-            mujoco.mj_forward(self.model, data)
-            row = self._evaluate_one(data, world_index=world_index)
+            original_poses = {
+                name: (self.model.body(name).pos.copy(), self.model.body(name).quat.copy())
+                for name in self._arm_base_poses
+            }
+            try:
+                for name, pose in self._arm_base_poses.items():
+                    self.model.body(name).pos[:] = pose["pos"]
+                    self.model.body(name).quat[:] = pose["quat"]
+                mujoco.mj_forward(self.model, data)
+                row = self._evaluate_one(data, world_index=world_index)
+            finally:
+                for name, (pos, quat) in original_poses.items():
+                    self.model.body(name).pos[:] = pos
+                    self.model.body(name).quat[:] = quat
             rewards[world_index] = float(row["reward"])
             successes[world_index] = bool(row["success"])
             metric_rows.append(row)

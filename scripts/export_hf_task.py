@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -88,8 +90,18 @@ def open_hf(url: str, tok: str | None):
 
 
 def read_json(url: str, tok: str | None):
-    with open_hf(url, tok) as r:
-        return json.loads(r.read()), r.headers.get("Link")
+    for attempt in range(5):
+        try:
+            with open_hf(url, tok) as r:
+                return json.loads(r.read()), r.headers.get("Link")
+        except (OSError, http.client.HTTPException) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code < 500 and e.code not in (408, 429):
+                raise
+            if attempt == 4:
+                raise
+            delay = 2 ** attempt
+            print(f"[retry {attempt + 1}/5] HF API: {e}; waiting {delay}s", flush=True)
+            time.sleep(delay)
 
 
 def list_files(cfg: Config, split: str, tok: str | None, suffix: str) -> list[dict]:
