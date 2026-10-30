@@ -65,7 +65,7 @@ class JointCost(pyceres.CostFunction):
         return True
 
 
-def joint_radii(model, side, first_radius=.1):
+def joint_radii(model, side, first_radius=.2):
     data = mujoco.MjData(model)
     mujoco.mj_kinematics(model, data)
     joints = [model.joint(f'{side}_joint{i}').id for i in range(1, 7)]
@@ -89,38 +89,43 @@ def pose_errors(model, side, targets, q):
 def solve_sequence(model, side, targets, initial, reference, half_width,
                    position_scale_mm=.1, rotation_scale_deg=.1,
                    reference_weight=1., first_order_weight=1., first_order_window=1,
-                   second_order_weight=1., maxiter=500):
-    q = np.array(initial, dtype=np.float64, order='C', copy=True)
+                   second_order_weight=1., maxiter=500,
+                   position_weight=1., rotation_weight=4., check_gradients=False):
+    q = initial.astype(np.float64, order='C')
     if half_width is not None:
-        half_width = np.broadcast_to(half_width, q.shape)
+        lower, upper = q - half_width, q + half_width
     blocks = list(q)
     data = mujoco.MjData(model)
     problem = pyceres.Problem()
-    position_scale = 1000 / position_scale_mm
-    rotation_scale = 1 / np.deg2rad(rotation_scale_deg)
-    first_order_scale = np.sqrt(first_order_weight / first_order_window) / ONE_DEGREE_RAD
+    position_scale = np.sqrt(position_weight) * 1000 / position_scale_mm
+    rotation_scale = np.sqrt(rotation_weight) / np.deg2rad(rotation_scale_deg)
+    reference_scale = np.sqrt(reference_weight)
+    first_order_scale = np.sqrt(first_order_weight / max(first_order_window, 1)) / ONE_DEGREE_RAD
+    second_order_scale = np.sqrt(second_order_weight) / ONE_DEGREE_RAD
     for frame, (block, target) in enumerate(zip(blocks, targets)):
         problem.add_residual_block(PositionCost(model, data, side, target, position_scale), None, [block])
         problem.add_residual_block(RotationCost(model, data, side, target, rotation_scale), None, [block])
-        problem.add_residual_block(JointCost([1], reference[frame], np.sqrt(reference_weight)), None, [block])
+        problem.add_residual_block(JointCost([1], reference[frame], reference_scale), None, [block])
         for previous in range(max(0, frame - first_order_window), frame):
             problem.add_residual_block(JointCost([-1, 1], 0., first_order_scale), None,
                                        [blocks[previous], block])
         if frame > 1:
-            problem.add_residual_block(JointCost([1, -2, 1], 0., np.sqrt(second_order_weight) / ONE_DEGREE_RAD),
+            problem.add_residual_block(JointCost([1, -2, 1], 0., second_order_scale),
                                        None, blocks[frame - 2:frame + 1])
         if half_width is not None:
+            fixed = np.flatnonzero(lower[frame] == upper[frame]).tolist()
+            if fixed:
+                problem.set_manifold(block, pyceres.SubsetManifold(6, fixed))
             for joint in range(6):
-                problem.set_parameter_lower_bound(block, joint, float(initial[frame, joint] - half_width[frame, joint]))
-                problem.set_parameter_upper_bound(block, joint, float(initial[frame, joint] + half_width[frame, joint]))
+                if joint not in fixed:
+                    problem.set_parameter_lower_bound(block, joint, lower[frame, joint])
+                    problem.set_parameter_upper_bound(block, joint, upper[frame, joint])
     options = pyceres.SolverOptions()
     options.linear_solver_type = pyceres.LinearSolverType.SPARSE_NORMAL_CHOLESKY
-    options.num_threads = 1
-    options.check_gradients = True
+    options.check_gradients = check_gradients
     options.gradient_check_relative_precision = 1e-6
     options.max_num_iterations = maxiter
     options.function_tolerance = 1e-10
-    options.gradient_tolerance = 1e-10
     options.parameter_tolerance = 1e-10
     summary = pyceres.SolverSummary()
     pyceres.solve(options, problem, summary)
@@ -132,17 +137,21 @@ def main():
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--model', type=Path, default=Path(__file__).resolve().parents[1] / 'abc_sim/models/yam_dishrack_base.xml')
-    parser.add_argument('--first-joint-radius-rad', type=float, default=.1)
+    parser.add_argument('--first-joint-radius-rad', type=float, default=.2)
     parser.add_argument('--joint-radii-rad', type=float, nargs=6)
     parser.add_argument('--unlimited', action='store_true')
-    parser.add_argument('--scale-bounds-by-dp-error', action='store_true')
+    parser.add_argument('--scale-bounds-by-dp-error', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--position-scale-mm', type=float, default=.1)
     parser.add_argument('--rotation-scale-deg', type=float, default=.1)
+    parser.add_argument('--position-weight', type=float, default=1.)
+    parser.add_argument('--rotation-weight', type=float, default=4.)
     parser.add_argument('--reference-weight', type=float, default=1.)
     parser.add_argument('--first-order-weight', type=float, default=1.)
-    parser.add_argument('--first-order-window', type=int, default=1)
+    parser.add_argument('--first-order-window', type=int, default=1,
+                        help='Number of previous frames; 0 disables first-order smoothing')
     parser.add_argument('--second-order-weight', type=float, default=1.)
     parser.add_argument('--maxiter', type=int, default=500)
+    parser.add_argument('--check-gradients', action='store_true')
     args = parser.parse_args()
 
     with np.load(args.input) as saved:
@@ -156,9 +165,10 @@ def main():
     started = time.perf_counter()
     solutions, errors, radii, scales, bounds, reports = [], [], [], [], [], []
     for arm, side in enumerate(('left', 'right')):
-        radius = joint_radii(model, side, args.first_joint_radius_rad)
-        if args.joint_radii_rad is not None:
-            radius = np.asarray(args.joint_radii_rad)
+        radius = None
+        if not args.unlimited:
+            radius = (joint_radii(model, side, args.first_joint_radius_rad) if args.joint_radii_rad is None
+                      else np.asarray(args.joint_radii_rad))
         initial, reference = source['initial'][:, arm], source['reference'][:, arm]
         targets = source['targets_world'][:, arm]
         scale = np.ones(len(initial))
@@ -169,7 +179,9 @@ def main():
         q, summary = solve_sequence(model, side, targets, initial, reference, half_width,
                                     args.position_scale_mm, args.rotation_scale_deg, args.reference_weight,
                                     args.first_order_weight, args.first_order_window,
-                                    args.second_order_weight, args.maxiter)
+                                    args.second_order_weight, args.maxiter,
+                                    position_weight=args.position_weight, rotation_weight=args.rotation_weight,
+                                    check_gradients=args.check_gradients)
         error = pose_errors(model, side, targets, q)
         report = dict(side=side, optimizer_usable=summary.IsSolutionUsable(), summary=summary.BriefReport(),
                       initial_cost=summary.initial_cost, final_cost=summary.final_cost,
@@ -191,24 +203,26 @@ def main():
         reports.append(report)
         print(json.dumps(report, indent=2), flush=True)
 
+    bounds = np.stack(bounds, axis=1)
     source.update(q=np.stack(solutions, axis=1), errors=np.stack(errors, axis=1),
                   solver='ceres', optimized_sides=np.array(['left', 'right']),
                   smoothness=args.first_order_weight, first_order_window=args.first_order_window,
                   acceleration_smoothness=args.second_order_weight,
                   reference_weight=args.reference_weight,
                   position_scale_mm=args.position_scale_mm, rotation_scale_deg=args.rotation_scale_deg,
+                  position_weight=args.position_weight, rotation_weight=args.rotation_weight,
                   joint_radii_rad=np.stack(radii), joint_limits_enabled=not args.unlimited,
                   joint_bound_scales=np.stack(scales, axis=1),
-                  joint_base_radii_rad=np.stack(bounds, axis=1)[..., 0],
+                  joint_base_radii_rad=bounds[..., 0],
                   scale_bounds_by_dp_error=args.scale_bounds_by_dp_error and not args.unlimited,
                   model_joint_limits_enabled=False, joint_limit_margin_deg=np.nan,
-                  joint_lower_bounds_rad=source['initial'] - np.stack(bounds, axis=1),
-                  joint_upper_bounds_rad=source['initial'] + np.stack(bounds, axis=1))
+                  joint_lower_bounds_rad=source['initial'] - bounds,
+                  joint_upper_bounds_rad=source['initial'] + bounds)
     args.output.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output / 'trajectory.npz', **source)
     report = dict(seconds=time.perf_counter() - started, input=str(args.input.resolve()),
-                  check_gradients=True, gradient_check_relative_precision=1e-6,
-                  base_mode=str(source['base_mode']),
+                  check_gradients=args.check_gradients, gradient_check_relative_precision=1e-6,
+                  base_mode=str(source.get('base_mode', 'input')),
                   joint_bound_rule=('none' if args.unlimited else
                                     'initial[t, joint] +/- scale[t, arm] * radius[joint]; no MJCF range intersection'),
                   scale_bounds_by_dp_error=args.scale_bounds_by_dp_error and not args.unlimited,
@@ -216,10 +230,11 @@ def main():
                                     if args.scale_bounds_by_dp_error and not args.unlimited else None),
                   radius_rule=(None if args.unlimited else 'explicit --joint-radii-rad'
                                if args.joint_radii_rad is not None else
-                               'first_radius * sqrt(link_length[0] / cumulative_link_length[j]); J6 uses J5 length'),
+                               'first_radius * sqrt(cumulative_link_length[0] / cumulative_link_length[j]); J6 uses J5 length'),
                   explicit_joint_radii_rad=None if args.unlimited else args.joint_radii_rad,
                   first_joint_radius_rad=None if args.unlimited else args.first_joint_radius_rad,
                   position_scale_mm=args.position_scale_mm, rotation_scale_deg=args.rotation_scale_deg,
+                  position_weight=args.position_weight, rotation_weight=args.rotation_weight,
                   reference_weight=args.reference_weight, first_order_weight=args.first_order_weight,
                   first_order_window=args.first_order_window,
                   second_order_weight=args.second_order_weight, arms=reports)
