@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation
 from scripts.scipy_ik import pose_error, pose_jacobian
 
 ONE_DEGREE_RAD = np.pi / 180
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[1] / 'abc_sim/models/yam_dishrack_base.xml'
 
 
 class PositionCost(pyceres.CostFunction):
@@ -132,11 +133,11 @@ def solve_sequence(model, side, targets, initial, reference, half_width,
     return q, summary
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--model', type=Path, default=Path(__file__).resolve().parents[1] / 'abc_sim/models/yam_dishrack_base.xml')
+    parser.add_argument('--model', type=Path, help='Defaults to the input model, otherwise yam_dishrack_base.xml')
     parser.add_argument('--first-joint-radius-rad', type=float, default=.2)
     parser.add_argument('--joint-radii-rad', type=float, nargs=6)
     parser.add_argument('--unlimited', action='store_true')
@@ -152,10 +153,11 @@ def main():
     parser.add_argument('--second-order-weight', type=float, default=1.)
     parser.add_argument('--maxiter', type=int, default=500)
     parser.add_argument('--check-gradients', action='store_true')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     with np.load(args.input) as saved:
         source = {key: saved[key] for key in saved.files}
+    args.model = args.model or Path(str(source.get('model_path', DEFAULT_MODEL_PATH)))
     model = mujoco.MjModel.from_xml_path(str(args.model))
     for side, transform in zip(('left', 'right'), source['base_poses_world']):
         body = model.body(f'{side}_arm')
@@ -201,11 +203,12 @@ def main():
         scales.append(scale)
         bounds.append(np.full_like(initial, np.inf) if half_width is None else half_width)
         reports.append(report)
-        print(json.dumps(report, indent=2), flush=True)
+        print(f'{side}: usable={report["optimizer_usable"]}, max error={error[:, 0].max():.4g} mm / '
+              f'{error[:, 1].max():.4g} deg, max joint step={report["max_joint_step_deg"]:.2f} deg', flush=True)
 
     bounds = np.stack(bounds, axis=1)
     source.update(q=np.stack(solutions, axis=1), errors=np.stack(errors, axis=1),
-                  solver='ceres', optimized_sides=np.array(['left', 'right']),
+                  solver='ceres', model_path=str(args.model.resolve()), optimized_sides=np.array(['left', 'right']),
                   smoothness=args.first_order_weight, first_order_window=args.first_order_window,
                   acceleration_smoothness=args.second_order_weight,
                   reference_weight=args.reference_weight,
