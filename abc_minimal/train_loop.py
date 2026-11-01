@@ -494,7 +494,8 @@ def main(config: TrainConfig):
             model.train()
             t_last = time.monotonic()
 
-        if global_step % config.ckpt_every == 0 and (fsdp or data_scope.checkpoint_writer):
+        save_due = global_step % config.ckpt_every == 0 or global_step == config.train_steps
+        if save_due and (fsdp or data_scope.checkpoint_writer):
             # Gathering sharded state is a collective, so every FSDP rank takes part.
             model_state, optimizer_state = fsdp_state_dicts(model, optimizer) if fsdp else (None, None)
             if data_scope.checkpoint_writer:
