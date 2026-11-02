@@ -74,7 +74,7 @@ def _pinocchio_model(source, target_link):
 
 
 class PinocchioArmController:
-    """Five Pink/DAQP steps with task costs tuned for YAM base compensation.
+    """Five Pink/DAQP steps with the task parameters from robot(1).py.
 
     The physical state is the smoothness target; IK starts from its bounded projection.
     The fixed YAM home posture replaces the humanoid's default_joint_positions.json. Position
@@ -93,8 +93,8 @@ class PinocchioArmController:
         if not np.isfinite(self.home).all():
             raise ValueError("YAM home posture must contain finite joint angles")
         self.frame_task = FrameTask(
-            frame=target_link, position_cost=100.0, orientation_cost=8.0,
-            lm_damping=0.0, gain=1.0,
+            frame=target_link, position_cost=50.0, orientation_cost=1.0,
+            lm_damping=0.0, gain=0.2,
         )
         self.smoothness_task = PostureTask(cost=0.2, lm_damping=0.0, gain=0.2)
         self.regularization_task = PostureTask(cost=0.05, lm_damping=0.0, gain=0.2)

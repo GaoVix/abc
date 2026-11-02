@@ -80,9 +80,10 @@ class BaseCompensation:
                     home, model=spec.compile(), target_link=f"{side}_link_6",
                 )
             else:
-                # Keep the original inference position, velocity and step limits.
+                # Use XML position limits without an extra inward margin.
                 controller = MinkArmController(
                     np.zeros(6), model=spec.compile(), target_link=f"{side}_link_6",
+                    limit_margin=0.0,
                 )
             self.controllers.append(controller)
         self.stats = {
