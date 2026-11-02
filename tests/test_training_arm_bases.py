@@ -134,11 +134,13 @@ class TrainingArmBasesTest(unittest.TestCase):
                 self.assertEqual(record.metadata["arm_collision_mode"], "eef_only")
                 np.testing.assert_array_equal(pose(env.data.camera("top")), camera)
                 for side in ("left", "right"):
-                    for name in (f"{side}_arm", *(f"{side}_link_{i}" for i in range(1, 6))):
+                    for name in (f"{side}_arm", *(f"{side}_link_{i}" for i in range(1, 6)),
+                                 f"{side}_camera_d405"):
                         geoms = env.model.geom_bodyid == env.model.body(name).id
                         np.testing.assert_array_equal(env.model.geom_contype[geoms], 0)
                         np.testing.assert_array_equal(env.model.geom_conaffinity[geoms], 0)
-                    for name in (f"{side}_link_6", f"{side}_lf_down", f"{side}_rf_down"):
+                    for name in (f"{side}_link_6", f"{side}_lf_rot", f"{side}_lf_down",
+                                 f"{side}_rf_rot", f"{side}_rf_down"):
                         geoms = env.model.geom_bodyid == env.model.body(name).id
                         self.assertTrue(np.any(env.model.geom_contype[geoms]))
                         self.assertTrue(np.any(env.model.geom_conaffinity[geoms]))
@@ -176,9 +178,10 @@ class TrainingArmBasesTest(unittest.TestCase):
         signature = model_signature(self.model)
         disable_arm_collisions_except_eef(self.model)
         self.assertNotEqual(model_signature(self.model), signature)
-        # Only the base and the first five links lose their contact masks.
+        # The wrist (link_6) stays active, but its camera subtree must be disabled.
         bodies = {self.model.body(name).id for side in ("left", "right")
-                  for name in (f"{side}_arm", *(f"{side}_link_{i}" for i in range(1, 6)))}
+                  for name in (f"{side}_arm", *(f"{side}_link_{i}" for i in range(1, 6)),
+                               f"{side}_camera_d405")}
         disabled = np.isin(self.model.geom_bodyid, list(bodies))
         for actual, before in zip((self.model.geom_contype, self.model.geom_conaffinity), original):
             np.testing.assert_array_equal(actual[disabled], 0)

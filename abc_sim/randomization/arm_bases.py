@@ -80,12 +80,13 @@ def _set_arm_bases(model, data, camera_from_base, *, full_pose):
 
 
 def disable_arm_collisions_except_eef(model):
-    """Disable base/link collisions, retaining each link_6 assembly and fingers."""
+    """Keep link_6 and the fingers, but disable the arm bases, links 1-5 and cameras."""
     roots = {model.body(f"{side}_arm").id for side in ("left", "right")}
     eef = {model.body(f"{side}_link_6").id for side in ("left", "right")}
+    cameras = {model.body(f"{side}_camera_d405").id for side in ("left", "right")}
     disabled = np.zeros(model.nbody, dtype=bool)
     for body in range(1, model.nbody):
-        disabled[body] = (body in roots or disabled[model.body_parentid[body]]) and body not in eef
+        disabled[body] = (body in roots or body in cameras or disabled[model.body_parentid[body]]) and body not in eef
     geoms = disabled[model.geom_bodyid]
     model.geom_contype[geoms] = 0
     model.geom_conaffinity[geoms] = 0
