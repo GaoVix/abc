@@ -19,7 +19,7 @@ def _pose(entity):
 
 
 class BaseCompensation:
-    """Retarget physical joints through TCP poses in the fixed top camera frame."""
+    """Retarget physical joints through TCP poses in each world's top camera frame."""
 
     def __init__(self, ik_backend="pink", reference="xml"):
         if ik_backend not in ("pink", "mink"):
@@ -80,9 +80,9 @@ class BaseCompensation:
                     home, model=spec.compile(), target_link=f"{side}_link_6",
                 )
             else:
+                # Keep the original inference position, velocity and step limits.
                 controller = MinkArmController(
                     np.zeros(6), model=spec.compile(), target_link=f"{side}_link_6",
-                    joint_limits=False, max_velocity=0, max_joint_delta=np.inf,
                 )
             self.controllers.append(controller)
         self.stats = {
@@ -96,7 +96,13 @@ class BaseCompensation:
         self.action_seed = self.state_seed.copy()
         transforms = []
         for record in randomizations:
-            poses = record.metadata.get("arm_base_poses", {}) if record is not None else {}
+            metadata = record.metadata if record is not None else {}
+            poses = metadata.get("arm_base_poses", {})
+            camera = metadata.get("top_camera_pose")
+            # FK/IK retain the canonical XML camera. Only physical observations
+            # use the applied per-world camera, which can move independently.
+            actual_camera_from_world = (self.camera_from_world if camera is None else
+                                        np.linalg.inv(camera["world_from_camera"]))
             arms = []
             for arm, side in enumerate(self.sides):
                 actual = self.nominal_bases[arm].copy()
@@ -106,7 +112,7 @@ class BaseCompensation:
                     rotation = np.empty(9)
                     mujoco.mju_quat2Mat(rotation, np.asarray(pose["quat"]))
                     actual[:3, :3] = rotation.reshape(3, 3)
-                camera_from_actual = self.camera_from_world @ actual
+                camera_from_actual = actual_camera_from_world @ actual
                 camera_from_nominal = self.camera_from_world @ self.nominal_bases[arm]
                 # The FK/IK model stays at XML base N. Represent the reference
                 # base M in its coordinates: N M^-1 A FK_base(q_physical).
