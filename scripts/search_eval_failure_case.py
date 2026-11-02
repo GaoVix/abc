@@ -8,7 +8,6 @@ import os
 
 # Set before importing PyTorch or MuJoCo.
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-os.environ.setdefault("MUJOCO_GL", "egl")
 for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(variable, "1")
 
@@ -16,7 +15,6 @@ import argparse
 import fcntl
 import hashlib
 import json
-import random
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +26,7 @@ import torch
 
 import abc_sim
 from abc_minimal.config import SimEvalConfig
+from abc_minimal.determinism import configure_determinism
 from abc_minimal.eval_policy import (
     _make_env, build_summary, jsonable, resolve_prefix_length, resolve_prompt,
     resolved_physics, rollout_worlds,
@@ -43,7 +42,7 @@ SERVER_OUTPUT = Path("/mnt/afs/L202500703/abc_storage/output")
 SOURCES = (
     "scripts/search_eval_failure_case.py", "scripts/replay_eval_failure_case.py",
     "scripts/find_eval_failure_case.py", "abc_minimal/eval_policy.py",
-    "abc_minimal/config.py", "abc_minimal/policy.py", "abc_minimal/dit.py",
+    "abc_minimal/config.py", "abc_minimal/determinism.py", "abc_minimal/policy.py", "abc_minimal/dit.py",
     "abc_minimal/preprocess.py", "abc_minimal/sim_env.py", "abc_sim/env.py",
     "abc_sim/randomization/arm_bases.py", "abc_sim/randomization/tasks/dishrack.py",
     "abc_minimal/dishrack_median_base_poses.json",
@@ -70,24 +69,10 @@ def array_hashes(arrays):
 
 
 def deterministic_inference(seed, gpu_id):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.set_num_threads(1)
+    configure_determinism(seed)
     if not 0 <= gpu_id < torch.cuda.device_count():
         raise ValueError(f"GPU {gpu_id} is unavailable; visible GPUs: {torch.cuda.device_count()}")
     torch.cuda.set_device(gpu_id)
-    torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
-    torch.backends.cuda.enable_flash_sdp(False)
-    torch.backends.cuda.enable_mem_efficient_sdp(False)
-    torch.backends.cuda.enable_math_sdp(True)
-    torch.backends.cuda.enable_cudnn_sdp(False)
 
 
 class TraceScene(RecordedScene):
@@ -165,7 +150,8 @@ def eval_config(args, side, seed):
                   policy_seed=args.policy_seed, gpu_id=args.gpu_id, num_chunks=args.num_chunks,
                   diffusion_steps=10, execute_chunk_dim=15, rtc=True, rtc_prefix_length=4,
                   rtc_inference_lead_steps=4, camera_height=168, camera_width=224,
-                  camera_backend=args.camera_backend, fast_inference=False, compensate_arm_bases=False,
+                  camera_backend=args.camera_backend, deterministic_inference=True,
+                  fast_inference=False, compensate_arm_bases=False,
                   randomization=json.dumps(request), prompt=args.prompt, log_every_chunk=args.log_every_chunk)
     config["prompt"] = resolve_prompt(SimEvalConfig(**config))
     return config
@@ -220,7 +206,7 @@ def search(args):
     checkpoints = {str(path): dict(size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
                    for path in (args.baseline_checkpoint, args.median_checkpoint)}
     manifest = dict(config=config, checkpoints=checkpoints, source_hashes=source_hashes(),
-                    gl_backend=os.environ["MUJOCO_GL"], physics="CPU MuJoCo",
+                    gl_backend=os.environ.get("MUJOCO_GL"), physics="CPU MuJoCo",
                     inference="FP32 eager; TF32 off; math attention; deterministic algorithms",
                     runs_per_model_world=1, noise="[policy_seed, world_index]")
     manifest_path = root / "manifest.json"

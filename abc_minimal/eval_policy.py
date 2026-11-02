@@ -499,9 +499,19 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     config_errors = (
         model_errors + validate_rtc_config(config) + validate_batched_config(config)
     )
+    if config.deterministic_inference:
+        if config.fast_inference:
+            config_errors.append("--deterministic-inference requires --no-fast-inference")
+        if config.parallel_worlds:
+            config_errors.append("--deterministic-inference requires --parallel-worlds 0 (CPU MuJoCo physics)")
     if config_errors:
         raise ValueError("Invalid sim eval config:\n  - " + "\n  - ".join(config_errors))
 
+    if config.deterministic_inference:
+        from abc_minimal.determinism import configure_determinism
+
+        configure_determinism(config.policy_seed)
+        print("[determinism] PyTorch deterministic algorithms enabled; TF32 off; math attention", flush=True)
     require_mjwarp()
     options = reset_options(config)
     config = replace(
