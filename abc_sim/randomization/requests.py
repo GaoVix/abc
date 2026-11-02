@@ -18,12 +18,12 @@ class DishRackResetRequest:
     randomize_variants: bool | None = None
     randomize_scales: bool | None = None
     randomize_arm_bases: bool = False
-    # training: planar bases; training_camera: fixed left base and calibrated camera.
-    arm_base_source: Literal["stats", "training", "training_camera"] = "stats"
+    # Camera modes keep the left mount fixed and move right x/y/yaw.
+    arm_base_source: Literal["stats", "training", "training_camera", "median_camera"] = "stats"
 
     def __post_init__(self):
-        if self.arm_base_source not in ("stats", "training", "training_camera"):
-            raise ValueError("arm_base_source must be 'stats', 'training' or 'training_camera'")
+        if self.arm_base_source not in ("stats", "training", "training_camera", "median_camera"):
+            raise ValueError("arm_base_source must be 'stats', 'training', 'training_camera' or 'median_camera'")
 
     @classmethod
     def from_value(cls, value: Any | None) -> "DishRackResetRequest":

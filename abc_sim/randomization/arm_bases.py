@@ -85,14 +85,34 @@ def sample_training_camera_arm_bases(model, data, seed):
     records = training_base_pool()
     rng = np.random.default_rng(None if seed is None else [seed, 1])
     record = records[int(rng.integers(len(records)))]
+    poses = _align_camera_arm_bases(model, data, record["camera_from_base"])
+    for pose in poses.values():
+        pose["source_episode"] = record["episode"]
+    return poses
+
+
+def set_median_camera_arm_bases(model, data):
+    """Use the training median, with an exact left pose and planar right mount."""
+    path = Path(__file__).resolve().parents[2] / "abc_minimal/dishrack_median_base_poses.json"
+    with path.open() as stream:
+        median = json.load(stream)["poses"]
+    targets = {side: median[side]["T_camera_from_base"] for side in ("left", "right")}
+    poses = _align_camera_arm_bases(model, data, targets)
+    for pose in poses.values():
+        pose["source"] = "median"
+    return poses
+
+
+def _align_camera_arm_bases(model, data, camera_from_base):
+    """Move the top camera and right x/y/yaw, retaining both physical mounts."""
     for side in ("left", "right"):
         if model.body_parentid[model.body(f"{side}_arm").id] != 0:
             raise ValueError("Expected arm bases attached to the world body")
     mujoco.mj_forward(model, data)
     left_world = _pose(data.body("left_arm"))
     nominal_relative = np.linalg.inv(left_world) @ _pose(data.body("right_arm"))
-    camera_left = np.asarray(record["camera_from_base"]["left"])
-    calibrated_relative = np.linalg.inv(camera_left) @ record["camera_from_base"]["right"]
+    camera_left = np.asarray(camera_from_base["left"])
+    calibrated_relative = np.linalg.inv(camera_left) @ camera_from_base["right"]
     relative = nominal_relative.copy()
     relative[:2, 3] = calibrated_relative[:2, 3]
     yaw = np.arctan2(calibrated_relative[1, 0], calibrated_relative[0, 0])
@@ -118,6 +138,5 @@ def sample_training_camera_arm_bases(model, data, seed):
     return {f"{side}_arm": {
         "pos": model.body(f"{side}_arm").pos.tolist(),
         "quat": model.body(f"{side}_arm").quat.tolist(),
-        "source_episode": record["episode"],
         "projection": "left_camera_right_xy_yaw",
     } for side in ("left", "right")}

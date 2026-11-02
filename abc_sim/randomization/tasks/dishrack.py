@@ -8,7 +8,8 @@ import mujoco
 import numpy as np
 
 from ..arm_bases import (
-    sample_training_arm_bases, sample_training_camera_arm_bases, top_camera_pose,
+    sample_training_arm_bases, sample_training_camera_arm_bases,
+    set_median_camera_arm_bases, top_camera_pose,
 )
 from ..assets.dishrack import (
     _DISHRACK_BASE_SCENE_XML,
@@ -145,7 +146,7 @@ class DishRackRandomizer(SceneRandomizer):
                     **({"arm_base_poses": arm_base_poses,
                         "arm_base_source": reset_request.arm_base_source} if arm_base_poses else {}),
                     **({"top_camera_pose": top_camera_pose(model, data)}
-                       if reset_request.arm_base_source == "training_camera"
+                       if reset_request.arm_base_source in ("training_camera", "median_camera")
                        and reset_request.randomize_arm_bases else {}),
                 },
             )
@@ -156,6 +157,8 @@ class DishRackRandomizer(SceneRandomizer):
     def _randomize_arm_bases(model, data, request, seed):
         if not request.randomize_arm_bases:
             return {}
+        if request.arm_base_source == "median_camera":
+            return set_median_camera_arm_bases(model, data)
         if request.arm_base_source == "training_camera":
             return sample_training_camera_arm_bases(model, data, seed)
         if request.arm_base_source == "training":
