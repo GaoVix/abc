@@ -21,7 +21,20 @@ def _pose(entity):
 class BaseCompensation:
     """Retarget physical joints through TCP poses in the fixed top camera frame."""
 
-    def __init__(self):
+    def __init__(self, ik_backend="pink", reference="xml"):
+        if ik_backend not in ("pink", "mink"):
+            raise ValueError(f"Unknown base compensation IK backend: {ik_backend}")
+        if reference not in ("xml", "median"):
+            raise ValueError(f"Unknown base compensation reference: {reference}")
+        self.ik_backend = ik_backend
+        self.reference = reference
+        if ik_backend == "pink":
+            try:
+                from deploy.robot.control.pinocchio_ik import PinocchioArmController
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Pinocchio/Pink testing IK requires `uv sync --extra inference-ik`"
+                ) from exc
         path = Path(__file__).resolve().parents[1] / "abc_sim/models/yam_dishrack_base.xml"
         self.model = mujoco.MjModel.from_xml_path(str(path))
         self.data = mujoco.MjData(self.model)
@@ -35,13 +48,25 @@ class BaseCompensation:
         self.world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
         self.camera_from_world = np.linalg.inv(self.world_from_camera)
         self.nominal_bases = [_pose(self.data.body(f"{side}_arm")) for side in self.sides]
+        if reference == "median":
+            poses = json.loads(Path(__file__).with_name(
+                "dishrack_median_base_poses.json"
+            ).read_text())["poses"]
+            self.camera_from_reference = [
+                np.asarray(poses[side]["T_camera_from_base"], dtype=np.float64)
+                for side in self.sides
+            ]
+        else:
+            self.camera_from_reference = [
+                self.camera_from_world @ base for base in self.nominal_bases
+            ]
         self.tcp_from_link = [
             np.linalg.inv(_pose(self.data.site(f"{side}_tcp_site")))
             @ _pose(self.data.body(f"{side}_link_6"))
             for side in self.sides
         ]
         self.controllers = []
-        for side in self.sides:
+        for arm, side in enumerate(self.sides):
             spec = mujoco.MjSpec.from_file(str(path))
             for field in ("sensors", "equalities", "actuators", "tendons", "keys"):
                 for element in list(getattr(spec, field)):
@@ -49,9 +74,17 @@ class BaseCompensation:
             for joint in list(spec.joints):
                 if joint.name not in {f"{side}_joint{i}" for i in range(1, 7)}:
                     spec.delete(joint)
-            self.controllers.append(MinkArmController(
-                np.zeros(6), model=spec.compile(), target_link=f"{side}_link_6",
-            ))
+            if ik_backend == "pink":
+                home = self.model.key("home").qpos[self.qpos[arm]]
+                controller = PinocchioArmController(
+                    home, model=spec.compile(), target_link=f"{side}_link_6",
+                )
+            else:
+                controller = MinkArmController(
+                    np.zeros(6), model=spec.compile(), target_link=f"{side}_link_6",
+                    joint_limits=False, max_velocity=0, max_joint_delta=np.inf,
+                )
+            self.controllers.append(controller)
         self.stats = {
             name: {"arm_solves": 0, "solve_calls": 0, "not_converged": 0,
                    "max_position_error_mm": 0., "max_rotation_error_deg": 0., "seconds": 0.}
@@ -75,7 +108,13 @@ class BaseCompensation:
                     actual[:3, :3] = rotation.reshape(3, 3)
                 camera_from_actual = self.camera_from_world @ actual
                 camera_from_nominal = self.camera_from_world @ self.nominal_bases[arm]
-                arms.append(camera_from_actual @ np.linalg.inv(camera_from_nominal))
+                # The FK/IK model stays at XML base N. Represent the reference
+                # base M in its coordinates: N M^-1 A FK_base(q_physical).
+                # Inverting this transform gives N A^-1 M FK_base(q_policy).
+                arms.append(
+                    camera_from_nominal @ np.linalg.inv(self.camera_from_reference[arm])
+                    @ camera_from_actual @ np.linalg.inv(camera_from_nominal)
+                )
             transforms.append(arms)
         self.input_transform = np.asarray(transforms)
         self.output_transform = np.linalg.inv(self.input_transform)
@@ -91,7 +130,10 @@ class BaseCompensation:
         link_target = target @ self.tcp_from_link[arm]
         quaternion = Rotation.from_matrix(link_target[:3, :3]).as_quat()[[3, 0, 1, 2]]
         joints = seed.copy()
-        for calls in range(1, 11):
+        # Pink owns the five fixed iterations from robot(1).py. Do not wrap
+        # those in the legacy Mink convergence loop (which would run 50 steps).
+        max_calls = 1 if self.ik_backend == "pink" else 10
+        for calls in range(1, max_calls + 1):
             joints = self.controllers[arm].solve(link_target[:3, 3], quaternion, joints)
             self.data.qpos[self.qpos[arm]] = joints
             mujoco.mj_kinematics(self.model, self.data)
@@ -103,12 +145,25 @@ class BaseCompensation:
                 break
         return joints, position_error, rotation_error, calls
 
-    def convert(self, joints, *, state=False):
+    def convert(self, joints, *, state=False, physical_state=None):
+        """Convert joints; Pink init/smoothness use the supplied physical state.
+
+        Observations already contain that state. Action conversion requires the
+        current measured state separately from the policy's target joints.
+        """
         started = time.perf_counter()
         values = np.asarray(joints, dtype=np.float64)
         result = values.reshape(-1, 14).copy()
         transforms = self.input_transform if state else self.output_transform
         seeds = self.state_seed if state else self.action_seed
+        if self.ik_backend == "pink":
+            if physical_state is None:
+                if not state:
+                    raise ValueError("Pink action IK requires the current physical_state")
+                physical_state = values
+            seeds = np.asarray(physical_state, dtype=np.float64).reshape(-1, 14).copy()
+            if seeds.shape != result.shape:
+                raise ValueError("physical_state must match the action/state batch shape")
         stats = self.stats["state" if state else "action"]
         if np.allclose(transforms, np.eye(4), atol=1e-12):
             seeds[:] = result
@@ -131,11 +186,11 @@ class BaseCompensation:
 
 
 class BaseCompensatedEnv:
-    def __init__(self, env, output_dir):
+    def __init__(self, env, output_dir, *, ik_backend="pink", reference="xml"):
         self._env = env
         self._output_dir = Path(output_dir)
-        self._conversion = BaseCompensation()
-        print("base compensation: noisy joints -> camera TCP -> nominal joints; inverse for control", flush=True)
+        self._conversion = BaseCompensation(ik_backend=ik_backend, reference=reference)
+        print(f"base compensation ({ik_backend} IK, {reference} reference): physical joints -> camera TCP -> reference joints; inverse for control", flush=True)
 
     def __getattr__(self, name):
         return getattr(self._env, name)
@@ -156,11 +211,22 @@ class BaseCompensatedEnv:
     obs = get_obs
     obs_vanilla_state = get_obs
 
+    def _physical_state(self):
+        # Read at every control step, including inside a chunk. These accessors
+        # read joints only and do not render cameras or convert observations.
+        if hasattr(self._env, "base_env"):
+            return self._env.state()
+        return self._env.env.get_state()
+
     def step(self, actions):
-        return self._env.step(self._conversion.convert(actions))
+        return self._env.step(self._conversion.convert(
+            actions, physical_state=self._physical_state(),
+        ))
 
     def step_one(self, action):
-        return self._env.step_one(self._conversion.convert(action))
+        return self._env.step_one(self._conversion.convert(
+            action, physical_state=self._physical_state(),
+        ))
 
     step_one_vanilla = step_one
 
