@@ -284,6 +284,8 @@ class SimEvalConfig:
     parallel_worlds: int = 0  # >0: step this many worlds together in MJWarp physics; 0: one CPU MuJoCo world at a time
     randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
     compensate_arm_bases: bool = False
+    # Testing-time compensation IK only; independent of training/data conversion.
+    base_compensation_ik: Literal["pink", "mink"] = "pink"
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"
     vanilla_physics: bool = False
