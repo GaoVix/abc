@@ -1,4 +1,4 @@
-"""Find a recorded XML-retargeted success paired with a median-model failure.
+"""Find a recorded XML-base model success paired with a median-model failure.
 
 Standard library only. Reads completed eval summaries; never launches evaluation.
 """
@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-OLD = 'dit_joint_retargeted_official_timing_20261022_125331'
+OLD = 'dit_joint_baseline_20261022_070036'
 NEW = 'dit_median_sequence_ik_20261101_183529'
 SETTINGS = dict(policy_seed=0, num_chunks=236, diffusion_steps=10,
                 execute_chunk_dim=15, rtc=True, rtc_prefix_length=4,
@@ -36,13 +36,13 @@ def scene(world):
                         count=count, plates=variants, rack=meta.get('dish_rack_variant')))
 
 
-def read_run(path):
+def read_run(path, old_model=OLD):
     try:
         data = json.loads(path.read_text())
         config = data.get('config', {})
         checkpoint = Path(data.get('checkpoint') or config.get('checkpoint', ''))
         model = checkpoint.parent.name
-        if model not in (OLD, NEW) or not checkpoint.stem.isdigit():
+        if model not in (old_model, NEW) or not checkpoint.stem.isdigit():
             return None
         worlds = data.get('worlds', [])
         if not worlds or len(worlds) != config.get('num_worlds', len(worlds)):
@@ -55,7 +55,7 @@ def read_run(path):
             (w.get('randomization') or {}).get('metadata', {}).get(
                 'arm_base_source', request.get('arm_base_source', 'xml')) for w in worlds
         }
-        required = 'xml' if model == OLD else 'median'
+        required = 'xml' if model == old_model else 'median'
         if sources != {required}:
             return None
         # Keep horizon, inference, batching and noise settings aligned.
@@ -81,18 +81,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path('/mnt/afs/L202500703/abc_storage/output'))
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--old-model', default=OLD, help='Training run directory name of the XML-base model')
+    parser.add_argument('--step', type=int, help='Require this checkpoint step for both models')
     parser.add_argument('--allow-step-mismatch', action='store_true')
     args = parser.parse_args()
     if not args.root.is_dir():
         raise SystemExit(f'Eval results directory not found: {args.root}')
     paths = set(args.root.glob('eval*/summary.json')) | set(args.root.glob('eval*/*/summary.json'))
-    runs = [run for path in sorted(paths) if (run := read_run(path)) is not None]
+    runs = [run for path in sorted(paths)
+            if (run := read_run(path, args.old_model)) is not None
+            and (args.step is None or run['step'] == args.step)]
     inventory = [dict(summary=r['path'], checkpoint=r['checkpoint'], step=r['step'],
-                      base='xml' if r['model'] == OLD else 'median',
+                      base='xml' if r['model'] == args.old_model else 'median',
                       successes=r['success'], worlds=len(r['worlds'])) for r in runs]
     candidates = []
     different_scenes = 0
-    for old in (r for r in runs if r['model'] == OLD):
+    for old in (r for r in runs if r['model'] == args.old_model):
         for new in (r for r in runs if r['model'] == NEW):
             if old['protocol'] != new['protocol']:
                 continue
@@ -113,7 +117,7 @@ def main():
                                   x['world_seed'], x['old']['path'], x['new']['path']))
     result = dict(status='found' if candidates else 'no_matching_pair', eligible_runs=inventory,
                   matching_pairs=len(candidates), rejected_scene_mismatches=different_scenes,
-                  criteria='XML-retargeted success vs fixed-camera median-model failure; no compensation, no random bases, no physics divergence; same actual world seed, initial object poses and rollout protocol; same checkpoint step unless explicitly allowed.')
+                  criteria=f'{args.old_model} at XML bases succeeds vs fixed-camera median-model failure; no compensation, no random bases, no physics divergence; same actual world seed, initial object poses and rollout protocol; same checkpoint step unless explicitly allowed.')
     if candidates:
         choice = candidates[0]
         result['selected'] = dict(world_seed=choice['world_seed'], initial_objects_verified_equal=True)
@@ -129,7 +133,7 @@ def main():
         result['selected_configs'] = {side: choice[side]['config'] for side in ('old', 'new')}
         if any(result['selected'][side]['video'] is None for side in ('old', 'new')):
             result['video_note'] = 'A saved historical video is missing. The original eval does not save qpos/actions by default; an exact historical video cannot be reconstructed from summary.json alone. A diagnostic rerun must verify its actual outcome before labeling success/failure.'
-    output = args.output or args.root/'retargeted_vs_median_case_20261103'/'selection.json'
+    output = args.output or args.root/f'{args.old_model}_vs_median_case_20261103'/'selection.json'
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(json.dumps({key: value for key, value in result.items()

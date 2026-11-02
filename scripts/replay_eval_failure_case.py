@@ -38,9 +38,10 @@ def digest(value):
 
 class RecordedScene:
     """Restore one historical placement and record CPU states at each action."""
-    def __init__(self, env, record, base, collision_mode):
+    def __init__(self, env, record, base, collision_mode, render_samples=None):
         self.env, self.record = env, record
         self.base, self.collision_mode = base, collision_mode
+        self.render_samples = render_samples
         self.qpos, self.qvel, self.times, self.actions = [], [], [], []
 
     def __getattr__(self, name):
@@ -89,6 +90,12 @@ class RecordedScene:
         native._last_randomization = state
         native._task_evaluator.reset(nworld=1)
         native._task_evaluator.configure_from_randomization(native.model, state)
+        if native._camera_backend == 'mujoco' and self.render_samples is not None:
+            # Set framebuffer sampling before creating the renderer. The local
+            # NVIDIA/EGL tests found 1-level RGB differences with 16x MSAA.
+            native.renderer.close()
+            native.model.vis.quality.offsamples = self.render_samples
+            native.renderer = mujoco.Renderer(native.model, height=self.env.height, width=self.env.width)
         native._reset_camera_backend()
         self.env.randomization = state
         self.initial_arrays = {name: np.array(getattr(native.model, name)) for name in
@@ -188,19 +195,21 @@ def run_one(side, report, args, root):
         rtc_inference_lead_steps=saved.get('rtc_inference_lead_steps', 4),
         prefix_length=saved.get('prefix_length') or 0,
         camera_height=saved.get('camera_height', 168), camera_width=saved.get('camera_width', 224),
-        camera_backend='mjwarp', fast_inference=False, compensate_arm_bases=False,
+        camera_backend=args.camera_backend, fast_inference=False, compensate_arm_bases=False,
         norm_stats_path=saved.get('norm_stats_path'), prompt=saved.get('prompt'),
         randomization=json.dumps(dict(arm_base_source=base, arm_collision_mode=collision_mode,
                                       randomize_arm_bases=False)),
         log_every_chunk=True, save_video=False, output_dir=str(folder))
     config.prompt = resolve_prompt(config)
     start = time.perf_counter()
-    print(f'{side}: {config.checkpoint}; base={base}; collisions={collision_mode}; CPU MuJoCo; FP32 eager', flush=True)
+    print(f'{side}: {config.checkpoint}; base={base}; collisions={collision_mode}; '
+          f'CPU MuJoCo; renderer={args.camera_backend}; FP32 eager', flush=True)
     policy = DiTInferencePolicy(Path(config.checkpoint), config, f'cuda:{args.gpu_id}')
     noise_policy = WorldNoise(policy, config.policy_seed, selected['world_index'])
     prefix = resolve_prefix_length(config, policy.trained_max_prefix, config.model)
     config.prefix_length = prefix
-    env = RecordedScene(_make_env(config, tuple(model.camera_keys)), record, base, collision_mode)
+    render_samples = args.mujoco_render_samples if args.camera_backend == 'mujoco' else None
+    env = RecordedScene(_make_env(config, tuple(model.camera_keys)), record, base, collision_mode, render_samples)
     try:
         worlds = rollout_worlds(config, noise_policy, env, prefix, None, folder, config.model)
         np.savez_compressed(folder/'trajectory.npz', qpos=np.array(env.qpos), qvel=np.array(env.qvel),
@@ -215,6 +224,7 @@ def run_one(side, report, args, root):
                       worlds=worlds, out_dir=folder, physics=resolved_physics(env.env))
         return dict(success=worlds[0]['success'], max_reward=worlds[0]['max_reward'], steps=worlds[0]['steps'],
                     historical_success=selected['success'], base=base, collision_mode=collision_mode,
+                    camera_backend=args.camera_backend, mujoco_render_samples=render_samples,
                     video=str(video), fps=fps, seconds=time.perf_counter()-start,
                     summary=str(folder/'summary.json'), initial_hash=digest(env.initial_arrays['qpos']))
     finally:
@@ -256,10 +266,15 @@ def main():
     parser.add_argument('--gpu-id', type=int, default=0)
     parser.add_argument('--chunks', type=int)
     parser.add_argument('--render-stride', type=int, default=2)
+    parser.add_argument('--camera-backend', choices=('mjwarp', 'mujoco'), default='mjwarp')
+    parser.add_argument('--mujoco-render-samples', type=int, default=0,
+                        help='Native MuJoCo framebuffer samples; 0 disables MSAA for repeatability tests.')
     parser.add_argument('--collision-mode', choices=('historical', 'full', 'eef_only'), default='historical')
     args = parser.parse_args()
     if args.render_stride < 1 or (args.chunks is not None and args.chunks < 1):
         parser.error('render-stride and chunks must be positive')
+    if args.mujoco_render_samples < 0:
+        parser.error('mujoco-render-samples must be nonnegative')
     report = json.loads(args.selection.read_text())
     if report.get('status') != 'found':
         raise ValueError('Selection does not contain a matched case')
@@ -288,6 +303,7 @@ def main():
     widths = {side: report['selected_configs'][side].get('camera_width', 224) for side in results}
     top = {side: report['selected_configs'][side].get('model', {}).get('camera_keys', ['top','left','right']).index('top') for side in results}
     result = dict(world_seed=seed, source_world_index=index, physics='CPU MuJoCo', fast_inference=False,
+                  camera_backend=args.camera_backend,
                   smoke_test_only=report.get('smoke_test_only', False),
                   noise_stream=[report['selected_configs']['old'].get('policy_seed', 0), index],
                   historical_outcomes_reproduced=all(row['success']==row['historical_success'] for row in results.values()),
