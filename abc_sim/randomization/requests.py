@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,11 @@ class DishRackResetRequest:
     randomize_variants: bool | None = None
     randomize_scales: bool | None = None
     randomize_arm_bases: bool = False
+    arm_base_source: Literal["stats", "training"] = "stats"
+
+    def __post_init__(self):
+        if self.arm_base_source not in ("stats", "training"):
+            raise ValueError("arm_base_source must be 'stats' or 'training'")
 
     @classmethod
     def from_value(cls, value: Any | None) -> "DishRackResetRequest":
@@ -60,6 +65,7 @@ class DishRackResetRequest:
             randomize_variants=randomize_variants,
             randomize_scales=randomize_scales,
             randomize_arm_bases=bool(value.get("randomize_arm_bases", False)),
+            arm_base_source=str(value.get("arm_base_source", "stats")),
         )
 
 

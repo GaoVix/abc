@@ -7,6 +7,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
+from ..arm_bases import sample_training_arm_bases
 from ..assets.dishrack import (
     _DISHRACK_BASE_SCENE_XML,
     _DISHRACK_DEFAULT_VARIANTS,
@@ -139,7 +140,8 @@ class DishRackRandomizer(SceneRandomizer):
                     "plate_variant": plate_variants[0],
                     "plate_variants": list(plate_variants),
                     "plate_count": len(plate_variants),
-                    **({"arm_base_poses": arm_base_poses} if arm_base_poses else {}),
+                    **({"arm_base_poses": arm_base_poses,
+                        "arm_base_source": reset_request.arm_base_source} if arm_base_poses else {}),
                 },
             )
 
@@ -149,6 +151,8 @@ class DishRackRandomizer(SceneRandomizer):
     def _randomize_arm_bases(model, data, request, seed):
         if not request.randomize_arm_bases:
             return {}
+        if request.arm_base_source == "training":
+            return sample_training_arm_bases(model, data, seed)
         rng = np.random.default_rng(None if seed is None else [seed, 1])
         poses = {}
         for name, (mean, covariance, p95) in _ARM_BASE_STATS_MM_DEG.items():
