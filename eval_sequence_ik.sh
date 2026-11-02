@@ -43,7 +43,7 @@ print(f'Checkpoint: {path}', flush=True)
 print(f'Step: {checkpoint.get("global_step")}; data: {cache_root}', flush=True)
 PY
 
-# Paired training x/y/yaw, XML z/roll/pitch, and no additional base noise.
+# Keep the original planar mode by default; training_camera is an opt-in experiment.
 exec "$REPO/.venv/bin/python" eval_policy.py \
   --checkpoint "$CHECKPOINT" \
   --policy dit --task dishrack \
@@ -55,6 +55,6 @@ exec "$REPO/.venv/bin/python" eval_policy.py \
   --compensate-arm-bases \
   --base-compensation-ik pink \
   --base-compensation-reference median \
-  --randomization '{"plate_count":3,"plate_variant":"plate_0","dish_rack_variant":"dish_rack_0","randomize_variants":false,"randomize_scales":false,"randomize_arm_bases":true,"arm_base_source":"training"}' \
+  --randomization "{\"plate_count\":3,\"plate_variant\":\"plate_0\",\"dish_rack_variant\":\"dish_rack_0\",\"randomize_variants\":false,\"randomize_scales\":false,\"randomize_arm_bases\":true,\"arm_base_source\":\"${ARM_BASE_SOURCE:-training}\"}" \
   --log-every-chunk \
   --output-dir "${EVAL_OUTPUT_DIR:-/mnt/afs/L202500703/abc_storage/output/eval_median_sequence_ik_pink_60k_training_planar_bases_$(date +%Y%m%d_%H%M%S)}"
