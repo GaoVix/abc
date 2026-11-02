@@ -300,6 +300,8 @@ def validate_batched_config(config: SimEvalConfig) -> list[str]:
     if config.parallel_worlds < 0:
         return ["parallel_worlds must be >= 0"]
     if config.parallel_worlds == 0:
+        if config.render_policy_cameras_only:
+            return ["--render-policy-cameras-only requires --parallel-worlds > 0"]
         return []
     errors = []
     if config.num_worlds % config.parallel_worlds:
@@ -530,7 +532,7 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     if config.parallel_worlds:
         from abc_minimal.batched_eval import make_batched_env, rollout_batched_worlds
 
-        env = make_batched_env(config)
+        env = make_batched_env(config, tuple(model_config.camera_keys))
         rollout = rollout_batched_worlds
     else:
         env = _make_env(config, tuple(model_config.camera_keys))

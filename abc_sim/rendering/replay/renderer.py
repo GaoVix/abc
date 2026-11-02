@@ -367,6 +367,7 @@ class RendererWrapper:
         runtime: WarpReplayRuntime,
         cam_res: tuple[int, int],
         gpu_id: int | None = None,
+        camera_names: tuple[str, ...] | None = None,
     ):
         try:
             import mujoco as mj
@@ -388,7 +389,20 @@ class RendererWrapper:
         self.m_warp = runtime.m_warp
         self.d_warp = runtime.d_warp
         self.nworld = runtime.nworld
-        self.ncam = self.mjm.ncam
+        available_names = tuple(self.mjm.cam(i).name for i in range(self.mjm.ncam))
+        self.camera_names = available_names
+        camera_options = {}
+        if camera_names is not None:
+            if backend != "mjwarp":
+                raise ValueError("Selecting rendered cameras requires the MJWarp backend")
+            missing = set(camera_names) - set(available_names)
+            if missing or not camera_names:
+                raise ValueError(
+                    f"Invalid render camera selection: {camera_names}; missing: {sorted(missing)}"
+                )
+            self.camera_names = tuple(name for name in available_names if name in camera_names)
+            camera_options["cam_active"] = [name in camera_names for name in available_names]
+        self.ncam = len(self.camera_names)
         self.width, self.height = cam_res
         self._render_width, self._render_height = cam_res
         self._madrona_crop: tuple[slice, slice] | None = None
@@ -438,6 +452,7 @@ class RendererWrapper:
                 render_depth=[False] * self.ncam,
                 use_textures=True,
                 use_shadows=True,
+                **camera_options,
             )
             self._bg = None
         else:

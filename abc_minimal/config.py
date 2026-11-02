@@ -282,6 +282,7 @@ class SimEvalConfig:
     gpu_id: int | None = None
     camera_backend: Literal["mjwarp", "mujoco", "blender"] = "mjwarp"  # "mujoco" is the CPU/macOS fallback
     parallel_worlds: int = 0  # >0: step this many worlds together in MJWarp physics; 0: one CPU MuJoCo world at a time
+    render_policy_cameras_only: bool = False  # Parallel eval: skip cameras absent from model.camera_keys.
     randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
     compensate_arm_bases: bool = False
     # Testing-time compensation IK only; independent of training/data conversion.
