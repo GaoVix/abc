@@ -536,7 +536,10 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
         env = _make_env(config, tuple(model_config.camera_keys))
         rollout = rollout_worlds
     if config.compensate_arm_bases:
-        env = BaseCompensatedEnv(env, out_dir, ik_backend=config.base_compensation_ik)
+        env = BaseCompensatedEnv(
+            env, out_dir, ik_backend=config.base_compensation_ik,
+            reference=config.base_compensation_reference,
+        )
     physics = resolved_physics(env)
     if physics is not None:
         print(

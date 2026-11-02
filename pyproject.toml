@@ -67,6 +67,7 @@ override-dependencies = [
 include = ["abc_minimal*", "abc_sim*", "deploy*"]
 
 [tool.setuptools.package-data]
+abc_minimal = ["dishrack_median_base_poses.json"]
 abc_sim = ["models/*.xml", "models/assets_manifest.json"]
 
 [tool.uv.sources]
