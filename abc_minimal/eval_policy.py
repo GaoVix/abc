@@ -570,8 +570,7 @@ def rollout_worlds(
     out_dir: Path,
     model_config: Any,
 ) -> list[dict[str, Any]]:
-    """Roll out the worlds one at a time in CPU MuJoCo; returns their records."""
-    rng = np.random.default_rng(config.policy_seed)
+    """Roll out independent worlds one at a time in CPU MuJoCo."""
     worlds = []
     fast_inference_ready = False
     rtc_warmup_ready = False
@@ -582,6 +581,10 @@ def rollout_worlds(
 
     try:
         for world_index in range(config.num_worlds):
+            # Match batched eval: previous episodes must not affect this
+            # world's initial arm pose or diffusion-noise stream.
+            rng = np.random.default_rng([config.policy_seed, world_index])
+            env.forget_arm_state()
             video = None
             video_path = None
             t0 = time.perf_counter()
@@ -589,18 +592,11 @@ def rollout_worlds(
             try:
                 obs = env.reset(seed=seed, options=options)
             except RandomizationSamplingError:
-                # The carried arm pose from the previous episode can block a
-                # seed that places fine from init_q; retry from init_q before
-                # resampling so the run keeps its world count.
+                seed = int(config.seed + world_index + 100_000)
+                print(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
+                # A failed reset may already have initialized the arm state.
                 env.forget_arm_state()
-                try:
-                    obs = env.reset(seed=seed, options=options)
-                    print(f"world={world_index:03d} unplaceable from the carried "
-                          "arm pose, placed from init_q")
-                except RandomizationSamplingError:
-                    seed = int(config.seed + world_index + 100_000)
-                    print(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
-                    obs = env.reset(seed=seed, options=options)
+                obs = env.reset(seed=seed, options=options)
             if config.fast_inference and not fast_inference_ready:
                 warmup_rng = np.random.default_rng(config.policy_seed)
                 warmup_noise = sample_noise(warmup_rng)
