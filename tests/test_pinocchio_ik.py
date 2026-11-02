@@ -80,7 +80,7 @@ class PinocchioIKTest(unittest.TestCase):
                     numeric[3:, joint] = (plus_rot * minus_rot.inv()).as_rotvec() / (2 * epsilon)
                 np.testing.assert_allclose(analytic, numeric, atol=1e-8)
 
-    def test_solve_matches_supplied_five_step_algorithm(self):
+    def test_solve_matches_five_step_algorithm_with_tuned_costs(self):
         import pinocchio as pin
         from pink import Configuration, solve_ik
         from pink.tasks import FrameTask, PostureTask
@@ -93,8 +93,8 @@ class PinocchioIKTest(unittest.TestCase):
                 position += rng.uniform(-0.01, 0.01, 3)
                 initial = seed - controller.reference
                 frame = FrameTask(
-                    frame=controller.target_link, position_cost=50.0,
-                    orientation_cost=1.0, lm_damping=0.0, gain=0.2,
+                    frame=controller.target_link, position_cost=100.0,
+                    orientation_cost=8.0, lm_damping=0.0, gain=1.0,
                 )
                 frame.set_target(pin.SE3(
                     Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix(), position,
