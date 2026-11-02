@@ -18,12 +18,14 @@ class DishRackResetRequest:
     randomize_variants: bool | None = None
     randomize_scales: bool | None = None
     randomize_arm_bases: bool = False
-    # Camera modes keep the left mount fixed and move right x/y/yaw.
-    arm_base_source: Literal["stats", "training", "training_camera", "median_camera"] = "stats"
+    arm_base_source: Literal["stats", "training", "training_6d"] = "stats"
+    arm_collision_mode: Literal["full", "eef_only"] = "full"
 
     def __post_init__(self):
-        if self.arm_base_source not in ("stats", "training", "training_camera", "median_camera"):
-            raise ValueError("arm_base_source must be 'stats', 'training', 'training_camera' or 'median_camera'")
+        if self.arm_base_source not in ("stats", "training", "training_6d"):
+            raise ValueError("arm_base_source must be 'stats', 'training' or 'training_6d'")
+        if self.arm_collision_mode not in ("full", "eef_only"):
+            raise ValueError("arm_collision_mode must be 'full' or 'eef_only'")
 
     @classmethod
     def from_value(cls, value: Any | None) -> "DishRackResetRequest":
@@ -67,6 +69,7 @@ class DishRackResetRequest:
             randomize_scales=randomize_scales,
             randomize_arm_bases=bool(value.get("randomize_arm_bases", False)),
             arm_base_source=str(value.get("arm_base_source", "stats")),
+            arm_collision_mode=str(value.get("arm_collision_mode", "full")),
         )
 
 

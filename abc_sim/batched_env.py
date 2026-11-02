@@ -21,6 +21,7 @@ from abc_sim.task_eval import TaskEvalResult, make_task_evaluator
 SHARED_MODEL_FIELDS = (
     "geom_size", "geom_pos", "geom_quat", "geom_dataid", "geom_type",
     "body_mass", "body_inertia", "mesh_vert", "jnt_qposadr",
+    "geom_contype", "geom_conaffinity", "body_contype", "body_conaffinity",
 )
 
 

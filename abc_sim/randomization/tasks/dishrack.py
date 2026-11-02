@@ -7,10 +7,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from ..arm_bases import (
-    sample_training_arm_bases, sample_training_camera_arm_bases,
-    set_median_camera_arm_bases, top_camera_pose,
-)
+from ..arm_bases import disable_arm_collisions_except_eef, sample_training_arm_bases
 from ..assets.dishrack import (
     _DISHRACK_BASE_SCENE_XML,
     _DISHRACK_DEFAULT_VARIANTS,
@@ -122,6 +119,8 @@ class DishRackRandomizer(SceneRandomizer):
             model = self._env_ref.model
             data = self._env_ref.data
 
+        if reset_request.arm_collision_mode == "eef_only":
+            disable_arm_collisions_except_eef(model)
         arm_base_poses = self._randomize_arm_bases(model, data, reset_request, seed)
         nominals = self._read_nominals(model, data)
         for _ in range(self.max_tries):
@@ -145,9 +144,8 @@ class DishRackRandomizer(SceneRandomizer):
                     "plate_count": len(plate_variants),
                     **({"arm_base_poses": arm_base_poses,
                         "arm_base_source": reset_request.arm_base_source} if arm_base_poses else {}),
-                    **({"top_camera_pose": top_camera_pose(model, data)}
-                       if reset_request.arm_base_source in ("training_camera", "median_camera")
-                       and reset_request.randomize_arm_bases else {}),
+                    **({"arm_collision_mode": "eef_only"}
+                       if reset_request.arm_collision_mode == "eef_only" else {}),
                 },
             )
 
@@ -157,12 +155,10 @@ class DishRackRandomizer(SceneRandomizer):
     def _randomize_arm_bases(model, data, request, seed):
         if not request.randomize_arm_bases:
             return {}
-        if request.arm_base_source == "median_camera":
-            return set_median_camera_arm_bases(model, data)
-        if request.arm_base_source == "training_camera":
-            return sample_training_camera_arm_bases(model, data, seed)
-        if request.arm_base_source == "training":
-            return sample_training_arm_bases(model, data, seed)
+        if request.arm_base_source in ("training", "training_6d"):
+            return sample_training_arm_bases(
+                model, data, seed, full_pose=request.arm_base_source == "training_6d",
+            )
         rng = np.random.default_rng(None if seed is None else [seed, 1])
         poses = {}
         for name, (mean, covariance, p95) in _ARM_BASE_STATS_MM_DEG.items():
@@ -210,15 +206,12 @@ class DishRackRandomizer(SceneRandomizer):
         if self._env_ref is not None:
             model = self._env_ref.model
             data = self._env_ref.data
+        if state.metadata.get("arm_collision_mode") == "eef_only":
+            disable_arm_collisions_except_eef(model)
         self._apply_states(model, data, state.object_states)
         for name, pose in state.metadata.get("arm_base_poses", {}).items():
             model.body(name).pos[:] = pose["pos"]
             model.body(name).quat[:] = pose["quat"]
-        camera = state.metadata.get("top_camera_pose")
-        if camera is not None:
-            body = model.body(camera["body_name"])
-            body.pos[:] = camera["body_pos"]
-            body.quat[:] = camera["body_quat"]
         mujoco.mj_forward(model, data)
 
     def _refresh_collision_metadata(self) -> None:
