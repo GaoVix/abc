@@ -22,13 +22,14 @@ class BaseCompensation:
     """Retarget physical joints through TCP poses in each world's top camera frame."""
 
     def __init__(self, ik_backend="pink", reference="xml"):
-        if ik_backend not in ("pink", "mink"):
+        if ik_backend not in ("pink", "pink-debug", "mink"):
             raise ValueError(f"Unknown base compensation IK backend: {ik_backend}")
         if reference not in ("xml", "median"):
             raise ValueError(f"Unknown base compensation reference: {reference}")
         self.ik_backend = ik_backend
+        self._uses_pink = ik_backend in ("pink", "pink-debug")
         self.reference = reference
-        if ik_backend == "pink":
+        if self._uses_pink:
             try:
                 from deploy.robot.control.pinocchio_ik import PinocchioArmController
             except ImportError as exc:
@@ -74,10 +75,11 @@ class BaseCompensation:
             for joint in list(spec.joints):
                 if joint.name not in {f"{side}_joint{i}" for i in range(1, 7)}:
                     spec.delete(joint)
-            if ik_backend == "pink":
+            if self._uses_pink:
                 home = self.model.key("home").qpos[self.qpos[arm]]
                 controller = PinocchioArmController(
                     home, model=spec.compile(), target_link=f"{side}_link_6",
+                    debug=ik_backend == "pink-debug",
                 )
             else:
                 # Use XML position limits without an extra inward margin.
@@ -134,7 +136,7 @@ class BaseCompensation:
         joints = seed.copy()
         # Pink owns the five fixed iterations from robot(1).py. Do not wrap
         # those in the legacy Mink convergence loop (which would run 50 steps).
-        max_calls = 1 if self.ik_backend == "pink" else 10
+        max_calls = 1 if self._uses_pink else 10
         for calls in range(1, max_calls + 1):
             joints = self.controllers[arm].solve(link_target[:3, 3], quaternion, joints)
             self.data.qpos[self.qpos[arm]] = joints
@@ -158,7 +160,7 @@ class BaseCompensation:
         result = values.reshape(-1, 14).copy()
         transforms = self.input_transform if state else self.output_transform
         seeds = self.state_seed if state else self.action_seed
-        if self.ik_backend == "pink":
+        if self._uses_pink:
             if physical_state is None:
                 if not state:
                     raise ValueError("Pink action IK requires the current physical_state")

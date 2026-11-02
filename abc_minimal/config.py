@@ -286,7 +286,7 @@ class SimEvalConfig:
     randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
     compensate_arm_bases: bool = False
     # Testing-time compensation IK only; independent of training/data conversion.
-    base_compensation_ik: Literal["pink", "mink"] = "pink"
+    base_compensation_ik: Literal["pink", "pink-debug", "mink"] = "pink"
     base_compensation_reference: Literal["xml", "median"] = "xml"
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"
