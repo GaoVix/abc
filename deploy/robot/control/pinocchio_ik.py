@@ -76,7 +76,7 @@ def _pinocchio_model(source, target_link):
 class PinocchioArmController:
     """Five Pink/DAQP steps with task costs tuned for YAM base compensation.
 
-    The passed physical state is both the initial joints and smoothness target.
+    The physical state is the smoothness target; IK starts from its bounded projection.
     The fixed YAM home posture replaces the humanoid's default_joint_positions.json. Position
     limits come directly from the MJCF, without an additional safety margin.
     """
@@ -127,8 +127,11 @@ class PinocchioArmController:
             position,
         ))
         self.smoothness_task.set_target(initial)
+        # MuJoCo's soft joint limits can allow a measured overshoot. Project
+        # only the IK seed; FK and the smoothness target keep the actual state.
         configuration = Configuration(
-            self.model, self.data, initial,
+            self.model, self.data,
+            np.clip(initial, self.model.lowerPositionLimit, self.model.upperPositionLimit),
             copy_data=True, forward_kinematics=True,
         )
         for _ in range(self.iterations):

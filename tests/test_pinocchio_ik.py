@@ -129,6 +129,27 @@ class PinocchioIKTest(unittest.TestCase):
             self.assertTrue(np.all(joints - controller.reference >= controller.model.lowerPositionLimit))
             self.assertTrue(np.all(joints - controller.reference <= controller.model.upperPositionLimit))
 
+    def test_measured_limit_overshoot_does_not_crash_or_change_state_reference(self):
+        overshoot = 0.0145960514068604  # Exact magnitude from the failed rollout.
+        for controller in self.conversion.controllers:
+            lower = controller.model.lowerPositionLimit + controller.reference
+            upper = controller.model.upperPositionLimit + controller.reference
+            for joint in range(6):
+                for value in (lower[joint] - overshoot, upper[joint] + overshoot):
+                    with self.subTest(arm=controller.target_link, joint=joint, value=value):
+                        measured = controller.home.copy()
+                        measured[joint] = value
+                        before = measured.copy()
+                        position, quaternion = controller.fk(measured)
+                        result = controller.solve(position, quaternion, measured)
+                        self.assertTrue(np.isfinite(result).all())
+                        self.assertTrue(np.all(result >= lower))
+                        self.assertTrue(np.all(result <= upper))
+                        np.testing.assert_array_equal(measured, before)
+                        np.testing.assert_array_equal(
+                            controller.smoothness_task.target_q, before - controller.reference,
+                        )
+
     def test_conversion_preserves_grippers_and_uses_one_five_step_solve(self):
         state = self._reset_conversion()
         for is_state in (True, False):
