@@ -18,12 +18,13 @@ class DishRackResetRequest:
     randomize_variants: bool | None = None
     randomize_scales: bool | None = None
     randomize_arm_bases: bool = False
-    arm_base_source: Literal["stats", "training", "training_6d"] = "stats"
-    arm_collision_mode: Literal["full", "eef_only"] = "full"
+    # Fixed median poses are applied even when randomize_arm_bases is false.
+    arm_base_source: Literal["median", "xml", "stats", "training", "training_6d"] = "median"
+    arm_collision_mode: Literal["full", "eef_only"] = "eef_only"
 
     def __post_init__(self):
-        if self.arm_base_source not in ("stats", "training", "training_6d"):
-            raise ValueError("arm_base_source must be 'stats', 'training' or 'training_6d'")
+        if self.arm_base_source not in ("median", "xml", "stats", "training", "training_6d"):
+            raise ValueError("arm_base_source must be 'median', 'xml', 'stats', 'training' or 'training_6d'")
         if self.arm_collision_mode not in ("full", "eef_only"):
             raise ValueError("arm_collision_mode must be 'full' or 'eef_only'")
 
@@ -68,8 +69,8 @@ class DishRackResetRequest:
             randomize_variants=randomize_variants,
             randomize_scales=randomize_scales,
             randomize_arm_bases=bool(value.get("randomize_arm_bases", False)),
-            arm_base_source=str(value.get("arm_base_source", "stats")),
-            arm_collision_mode=str(value.get("arm_collision_mode", "full")),
+            arm_base_source=str(value.get("arm_base_source", "median")),
+            arm_collision_mode=str(value.get("arm_collision_mode", "eef_only")),
         )
 
 

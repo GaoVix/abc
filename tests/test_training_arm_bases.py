@@ -4,6 +4,7 @@ import gzip
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import mujoco
 import numpy as np
@@ -116,6 +117,59 @@ class TrainingArmBasesTest(unittest.TestCase):
                 )
                 self.assertEqual(result[f"{side}_arm"]["projection"], "full_pose")
 
+    def test_default_median_is_exact_with_fixed_camera_and_identity_compensation(self):
+        env = abc_sim.make_env("dishrack", render_cameras=False)
+        conversion = BaseCompensation(ik_backend="mink", reference="median")
+        camera = pose(env.data.camera("top"))
+        world_from_camera = camera.copy()
+        world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
+        request = dict(plate_count=3, plate_variant="plate_0", dish_rack_variant="dish_rack_0",
+                       randomize_variants=False, randomize_scales=False)
+        try:
+            for seed in range(20260511, 20260516):
+                env.forget_arm_state()
+                obs, info = env.reset(seed=seed, options={"randomization": request})
+                record = info["randomization"]
+                self.assertEqual(record.metadata["arm_base_source"], "median")
+                self.assertEqual(record.metadata["arm_collision_mode"], "eef_only")
+                np.testing.assert_array_equal(pose(env.data.camera("top")), camera)
+                for side in ("left", "right"):
+                    for name in (f"{side}_arm", *(f"{side}_link_{i}" for i in range(1, 6))):
+                        geoms = env.model.geom_bodyid == env.model.body(name).id
+                        np.testing.assert_array_equal(env.model.geom_contype[geoms], 0)
+                        np.testing.assert_array_equal(env.model.geom_conaffinity[geoms], 0)
+                    for name in (f"{side}_link_6", f"{side}_lf_down", f"{side}_rf_down"):
+                        geoms = env.model.geom_bodyid == env.model.body(name).id
+                        self.assertTrue(np.any(env.model.geom_contype[geoms]))
+                        self.assertTrue(np.any(env.model.geom_conaffinity[geoms]))
+                for arm, side in enumerate(("left", "right")):
+                    actual = pose(env.data.body(f"{side}_arm"))
+                    np.testing.assert_allclose(np.linalg.inv(world_from_camera) @ actual,
+                                               conversion.camera_from_reference[arm], atol=1e-12, rtol=0)
+                relative = np.linalg.inv(pose(env.data.body("left_arm"))) @ pose(env.data.body("right_arm"))
+                expected_relative = (np.linalg.inv(conversion.camera_from_reference[0])
+                                     @ conversion.camera_from_reference[1])
+                np.testing.assert_allclose(relative, expected_relative, atol=1e-12, rtol=0)
+                conversion.reset([record], obs["state"])
+                np.testing.assert_allclose(conversion.input_transform[0], [np.eye(4)] * 2, atol=1e-12)
+                with patch.object(conversion, "_solve", side_effect=AssertionError("Unexpected IK")):
+                    np.testing.assert_array_equal(conversion.convert(obs["state"], state=True), obs["state"])
+                    np.testing.assert_array_equal(conversion.convert(obs["state"]), obs["state"])
+            # Explicit XML selection restores both original bases without moving the camera.
+            env.forget_arm_state()
+            env.reset(seed=20260511, options={"randomization": dict(request, arm_base_source="xml")})
+            np.testing.assert_array_equal(pose(env.data.camera("top")), camera)
+            for arm, side in enumerate(("left", "right")):
+                np.testing.assert_allclose(pose(env.data.body(f"{side}_arm")),
+                                           conversion.nominal_bases[arm], atol=1e-12)
+            env._task_randomizer.apply(env.model, env.data, record)
+            np.testing.assert_array_equal(pose(env.data.camera("top")), camera)
+            for arm, side in enumerate(("left", "right")):
+                actual = np.linalg.inv(world_from_camera) @ pose(env.data.body(f"{side}_arm"))
+                np.testing.assert_allclose(actual, conversion.camera_from_reference[arm], atol=1e-12, rtol=0)
+        finally:
+            env.close()
+
     def test_collision_mask_retains_eef_and_scene(self):
         original = self.model.geom_contype.copy(), self.model.geom_conaffinity.copy()
         mass, inertia = self.model.body_mass.copy(), self.model.body_inertia.copy()
@@ -197,7 +251,12 @@ class TrainingArmBasesTest(unittest.TestCase):
         self.assertEqual(DishRackRandomizer._randomize_arm_bases(self.model, self.data, disabled, 1), {})
         np.testing.assert_array_equal(self.model.body_pos, before[0])
         np.testing.assert_array_equal(self.model.body_quat, before[1])
-        self.assertEqual(DishRackResetRequest().arm_base_source, "stats")
+        self.assertEqual(DishRackResetRequest().arm_base_source, "median")
+        self.assertEqual(DishRackResetRequest.from_value({}).arm_base_source, "median")
+        self.assertEqual(DishRackResetRequest.from_value(None).arm_base_source, "median")
+        self.assertEqual(DishRackResetRequest().arm_collision_mode, "eef_only")
+        self.assertEqual(DishRackResetRequest.from_value({}).arm_collision_mode, "eef_only")
+        self.assertEqual(DishRackResetRequest.from_value(None).arm_collision_mode, "eef_only")
         for source in ("unknown", "training_camera", "median_camera"):
             with self.assertRaises(ValueError):
                 DishRackResetRequest.from_value({"arm_base_source": source})

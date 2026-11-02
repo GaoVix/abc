@@ -32,6 +32,24 @@ def sample_training_arm_bases(model, data, seed, *, full_pose=False):
     records = training_base_pool()
     rng = np.random.default_rng(None if seed is None else [seed, 1])
     record = records[int(rng.integers(len(records)))]
+    poses = _set_arm_bases(model, data, record["camera_from_base"], full_pose=full_pose)
+    for pose in poses.values():
+        pose["source_episode"] = record["episode"]
+    return poses
+
+
+def set_median_arm_bases(model, data):
+    """Place both arms at the training median's full 6D poses; keep the camera fixed."""
+    path = Path(__file__).resolve().parents[2] / "abc_minimal/dishrack_median_base_poses.json"
+    median = json.loads(path.read_text())["poses"]
+    targets = {side: median[side]["T_camera_from_base"] for side in ("left", "right")}
+    poses = _set_arm_bases(model, data, targets, full_pose=True)
+    for pose in poses.values():
+        pose["source"] = "median"
+    return poses
+
+
+def _set_arm_bases(model, data, camera_from_base, *, full_pose):
     mujoco.mj_kinematics(model, data)
     camera = data.camera("top")
     world_from_camera = np.eye(4)
@@ -43,7 +61,7 @@ def sample_training_arm_bases(model, data, seed, *, full_pose=False):
         body = model.body(name)
         if model.body_parentid[body.id] != 0:
             raise ValueError(f"Expected {name} to be attached to the world body")
-        world_from_base = world_from_camera @ np.asarray(record["camera_from_base"][side])
+        world_from_base = world_from_camera @ np.asarray(camera_from_base[side])
         if full_pose:
             body.pos[:] = world_from_base[:3, 3]
             mujoco.mju_mat2Quat(body.quat, world_from_base[:3, :3].ravel())
@@ -55,7 +73,6 @@ def sample_training_arm_bases(model, data, seed, *, full_pose=False):
             )
         poses[name] = {
             "pos": body.pos.tolist(), "quat": body.quat.tolist(),
-            "source_episode": record["episode"],
             "projection": "full_pose" if full_pose else "xy_yaw",
         }
     mujoco.mj_forward(model, data)

@@ -7,7 +7,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from ..arm_bases import disable_arm_collisions_except_eef, sample_training_arm_bases
+from ..arm_bases import disable_arm_collisions_except_eef, sample_training_arm_bases, set_median_arm_bases
 from ..assets.dishrack import (
     _DISHRACK_BASE_SCENE_XML,
     _DISHRACK_DEFAULT_VARIANTS,
@@ -153,7 +153,9 @@ class DishRackRandomizer(SceneRandomizer):
 
     @staticmethod
     def _randomize_arm_bases(model, data, request, seed):
-        if not request.randomize_arm_bases:
+        if request.arm_base_source == "median":
+            return set_median_arm_bases(model, data)
+        if not request.randomize_arm_bases or request.arm_base_source == "xml":
             return {}
         if request.arm_base_source in ("training", "training_6d"):
             return sample_training_arm_bases(
