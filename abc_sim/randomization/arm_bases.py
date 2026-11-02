@@ -1,4 +1,4 @@
-"""Sample complete, paired YAM base poses from accepted real training episodes."""
+"""Sample paired training-base x/y/yaw while retaining XML height and tilt."""
 
 from functools import lru_cache
 import gzip
@@ -7,6 +7,8 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+
+from .core import _quat_from_yaw, _quat_mul, _yaw_from_quat
 
 
 @lru_cache(maxsize=1)
@@ -22,7 +24,12 @@ def training_base_pool():
 
 
 def sample_training_arm_bases(model, data, seed):
-    """Set both bases to one training pair, with no additional perturbation."""
+    """Project one training pair onto the existing mounts, without added noise.
+
+    The randomizer reloads the XML model before sampling. Only world x/y/yaw
+    change; XML z/roll/pitch stay intact. Metadata stores the applied poses so
+    replay and base compensation use the physical placements.
+    """
     records = training_base_pool()
     rng = np.random.default_rng(None if seed is None else [seed, 1])
     record = records[int(rng.integers(len(records)))]
@@ -38,11 +45,15 @@ def sample_training_arm_bases(model, data, seed):
         if model.body_parentid[body.id] != 0:
             raise ValueError(f"Expected {name} to be attached to the world body")
         world_from_base = world_from_camera @ np.asarray(record["camera_from_base"][side])
-        body.pos[:] = world_from_base[:3, 3]
-        mujoco.mju_mat2Quat(body.quat, world_from_base[:3, :3].ravel())
+        yaw = np.arctan2(world_from_base[1, 0], world_from_base[0, 0])
+        body.pos[:2] = world_from_base[:2, 3]
+        body.quat[:] = _quat_mul(
+            _quat_from_yaw(yaw - _yaw_from_quat(body.quat)), body.quat,
+        )
         poses[name] = {
             "pos": body.pos.tolist(), "quat": body.quat.tolist(),
             "source_episode": record["episode"],
+            "projection": "xy_yaw",
         }
     mujoco.mj_forward(model, data)
     return poses

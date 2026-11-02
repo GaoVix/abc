@@ -18,6 +18,7 @@ class DishRackResetRequest:
     randomize_variants: bool | None = None
     randomize_scales: bool | None = None
     randomize_arm_bases: bool = False
+    # training samples paired x/y/yaw; XML height and tilt remain unchanged.
     arm_base_source: Literal["stats", "training"] = "stats"
 
     def __post_init__(self):
