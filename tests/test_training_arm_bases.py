@@ -52,12 +52,11 @@ class TrainingArmBasesTest(unittest.TestCase):
                 target = np.asarray(calibration["left_base_to_camera"]) @ calibration["base_poses"][side]
                 np.testing.assert_array_equal(record["camera_from_base"][side], target)
 
-    def test_each_world_samples_paired_planar_poses_reproducibly(self):
+    def test_each_world_samples_paired_full_poses_reproducibly(self):
         records = {record["episode"]: record for record in training_base_pool()}
-        nominal = {
-            side: self.model.body(f"{side}_arm").pos.copy()
-            for side in ("left", "right")
-        }
+        camera = pose(self.data.camera("top"))
+        world_from_camera = camera.copy()
+        world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
         selected = []
         for world in range(100):
             seed = 20260511 + world
@@ -66,37 +65,36 @@ class TrainingArmBasesTest(unittest.TestCase):
             episode = result["left_arm"]["source_episode"]
             self.assertEqual(episode, result["right_arm"]["source_episode"])
             selected.append(episode)
-            world_from_camera = pose(self.data.camera("top"))
-            world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
+            np.testing.assert_array_equal(pose(self.data.camera("top")), camera)
             for side in ("left", "right"):
                 name = f"{side}_arm"
                 expected = world_from_camera @ records[episode]["camera_from_base"][side]
-                yaw = np.arctan2(expected[1, 0], expected[0, 0])
                 actual = pose(self.data.body(name))
-                np.testing.assert_allclose(actual[:2, 3], expected[:2, 3], atol=1e-12)
-                self.assertEqual(actual[2, 3], nominal[side][2])
-                np.testing.assert_allclose(
-                    actual[:3, :3], Rotation.from_euler("z", yaw).as_matrix(), atol=1e-12,
-                )
-                self.assertEqual(result[name]["projection"], "xy_yaw")
+                np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
+                self.assertEqual(result[name]["projection"], "full_pose")
                 self.assertEqual(repeated[name]["source_episode"], episode)
                 np.testing.assert_allclose(result[name]["pos"], actual[:3, 3], atol=1e-12)
                 np.testing.assert_allclose(result[name]["quat"], repeated[name]["quat"], atol=1e-12)
         self.assertGreater(len(set(selected)), 1)
 
-    def test_sampling_retains_mount_height_and_tilt(self):
+    def test_sampling_overwrites_xml_mount_height_and_tilt(self):
+        records = {record["episode"]: record for record in training_base_pool()}
+        camera = pose(self.data.camera("top"))
+        world_from_camera = camera.copy()
+        world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
         for side in ("left", "right"):
             body = self.model.body(f"{side}_arm")
             body.pos[2] = 0.81
             body.quat[:] = Rotation.from_euler("xyz", [0.07, -0.09, 0.4]).as_quat()[[3, 0, 1, 2]]
         for seed in (20260511, 20260512, 20260511):
-            sample_training_arm_bases(self.model, self.data, seed)
+            result = sample_training_arm_bases(self.model, self.data, seed)
+            record = records[result["left_arm"]["source_episode"]]
+            np.testing.assert_array_equal(pose(self.data.camera("top")), camera)
             for side in ("left", "right"):
                 actual = pose(self.data.body(f"{side}_arm"))
-                self.assertEqual(actual[2, 3], 0.81)
                 np.testing.assert_allclose(
-                    Rotation.from_matrix(actual[:3, :3]).as_euler("xyz")[:2],
-                    [0.07, -0.09], atol=1e-12,
+                    actual, world_from_camera @ record["camera_from_base"][side],
+                    atol=1e-12, rtol=0,
                 )
 
     def test_full_pose_matches_both_calibrated_bases_with_fixed_camera(self):
@@ -105,7 +103,7 @@ class TrainingArmBasesTest(unittest.TestCase):
         world_from_camera = camera.copy()
         world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
         for world in range(100):
-            result = sample_training_arm_bases(self.model, self.data, 20260511 + world, full_pose=True)
+            result = sample_training_arm_bases(self.model, self.data, 20260511 + world)
             episode = result["left_arm"]["source_episode"]
             self.assertEqual(result["right_arm"]["source_episode"], episode)
             np.testing.assert_array_equal(pose(self.data.camera("top")), camera)
@@ -116,6 +114,10 @@ class TrainingArmBasesTest(unittest.TestCase):
                     records[episode]["camera_from_base"][side], atol=1e-12, rtol=0,
                 )
                 self.assertEqual(result[f"{side}_arm"]["projection"], "full_pose")
+            relative = np.linalg.inv(pose(self.data.body("left_arm"))) @ pose(self.data.body("right_arm"))
+            expected_relative = (np.linalg.inv(records[episode]["camera_from_base"]["left"])
+                                 @ records[episode]["camera_from_base"]["right"])
+            np.testing.assert_allclose(relative, expected_relative, atol=1e-12, rtol=0)
 
     def test_default_median_is_exact_with_fixed_camera_and_identity_compensation(self):
         env = abc_sim.make_env("dishrack", render_cameras=False)
@@ -260,7 +262,7 @@ class TrainingArmBasesTest(unittest.TestCase):
         self.assertEqual(DishRackResetRequest().arm_collision_mode, "eef_only")
         self.assertEqual(DishRackResetRequest.from_value({}).arm_collision_mode, "eef_only")
         self.assertEqual(DishRackResetRequest.from_value(None).arm_collision_mode, "eef_only")
-        for source in ("unknown", "training_camera", "median_camera"):
+        for source in ("unknown", "stats", "training_camera", "median_camera"):
             with self.assertRaises(ValueError):
                 DishRackResetRequest.from_value({"arm_base_source": source})
         request = DishRackResetRequest.from_value({
@@ -270,6 +272,16 @@ class TrainingArmBasesTest(unittest.TestCase):
         self.assertEqual(result["left_arm"]["projection"], "full_pose")
         with self.assertRaises(ValueError):
             DishRackResetRequest.from_value({"arm_collision_mode": "unknown"})
+
+    def test_training_aliases_select_the_same_full_poses(self):
+        for seed in range(20260511, 20260611):
+            results = [DishRackRandomizer._randomize_arm_bases(
+                self.model, self.data,
+                DishRackResetRequest(randomize_arm_bases=True, arm_base_source=source), seed,
+            ) for source in ("training", "training_6d")]
+            self.assertEqual(results[0], results[1])
+            self.assertEqual(results[0]["left_arm"]["projection"], "full_pose")
+            self.assertEqual(results[0]["right_arm"]["projection"], "full_pose")
 
 
 if __name__ == "__main__":

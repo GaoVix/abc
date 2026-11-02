@@ -31,32 +31,6 @@ from ..core import (
 )
 from ..requests import DishRackResetRequest
 
-# World-frame [dx mm, dy mm, yaw deg] from 1239 training episodes.
-_ARM_BASE_STATS_MM_DEG = {
-    "left_arm": (
-        [20.090777, -25.850766, -0.308589],
-        [
-            [140.354628, -122.732350, -2.807340],
-            [-122.732350, 442.281744, -9.292575],
-            [-2.807340, -9.292575, 1.775417],
-        ],
-        (61.007573727, 2.212487484),
-    ),
-    "right_arm": (
-        [24.275754, -14.639903, 1.515973],
-        [
-            [101.036659, -108.047273, 0.362798],
-            [-108.047273, 513.822078, 4.252998],
-            [0.362798, 4.252998, 0.911754],
-        ],
-        (54.960767602, 2.940367934),
-    ),
-}
-# The mounting plate can bridge the 5 mm seam between the platform and table.
-_ARM_BASE_SUPPORT_CENTER_M = np.array([0.30, 0.0])
-_ARM_BASE_SUPPORT_HALF_SIZE_M = np.array([0.5975, 0.65])
-_ARM_BASE_PLATE_HALF_SIZE_M = np.array([0.035, 0.10])
-
 
 class DishRackRandomizer(SceneRandomizer):
     min_clearance_m = 0.1
@@ -157,30 +131,7 @@ class DishRackRandomizer(SceneRandomizer):
             return set_median_arm_bases(model, data)
         if not request.randomize_arm_bases or request.arm_base_source == "xml":
             return {}
-        if request.arm_base_source in ("training", "training_6d"):
-            return sample_training_arm_bases(
-                model, data, seed, full_pose=request.arm_base_source == "training_6d",
-            )
-        rng = np.random.default_rng(None if seed is None else [seed, 1])
-        poses = {}
-        for name, (mean, covariance, p95) in _ARM_BASE_STATS_MM_DEG.items():
-            body = model.body(name)
-            while True:
-                offset = rng.multivariate_normal(mean, covariance)
-                if np.linalg.norm(offset[:2]) > p95[0] or abs(offset[2]) > p95[1]:
-                    continue
-                position = body.pos[:2] + offset[:2] / 1000
-                yaw = np.deg2rad(offset[2])
-                angle = _yaw_from_quat(body.quat) + yaw
-                c, s = np.abs([np.cos(angle), np.sin(angle)])
-                half_size = np.array([[c, s], [s, c]]) @ _ARM_BASE_PLATE_HALF_SIZE_M
-                if np.all(np.abs(position - _ARM_BASE_SUPPORT_CENTER_M) + half_size <= _ARM_BASE_SUPPORT_HALF_SIZE_M):
-                    break
-            body.pos[:2] = position
-            body.quat[:] = _quat_mul(_quat_from_yaw(yaw), body.quat)
-            poses[name] = {"pos": body.pos.tolist(), "quat": body.quat.tolist()}
-        mujoco.mj_forward(model, data)
-        return poses
+        return sample_training_arm_bases(model, data, seed)
 
     def apply(self, model: Any, data: Any, state: RandomizationState) -> None:
         dish_rack_variant = _dishrack_canonical_variant_name(

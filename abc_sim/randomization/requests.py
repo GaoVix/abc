@@ -19,12 +19,13 @@ class DishRackResetRequest:
     randomize_scales: bool | None = None
     randomize_arm_bases: bool = False
     # Fixed median poses are applied even when randomize_arm_bases is false.
-    arm_base_source: Literal["median", "xml", "stats", "training", "training_6d"] = "median"
+    # Both training names select paired, complete calibrated 6D poses.
+    arm_base_source: Literal["median", "xml", "training", "training_6d"] = "median"
     arm_collision_mode: Literal["full", "eef_only"] = "eef_only"
 
     def __post_init__(self):
-        if self.arm_base_source not in ("median", "xml", "stats", "training", "training_6d"):
-            raise ValueError("arm_base_source must be 'median', 'xml', 'stats', 'training' or 'training_6d'")
+        if self.arm_base_source not in ("median", "xml", "training", "training_6d"):
+            raise ValueError("arm_base_source must be 'median', 'xml', 'training' or 'training_6d'")
         if self.arm_collision_mode not in ("full", "eef_only"):
             raise ValueError("arm_collision_mode must be 'full' or 'eef_only'")
 

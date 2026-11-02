@@ -8,8 +8,6 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from .core import _quat_from_yaw, _quat_mul, _yaw_from_quat
-
 
 @lru_cache(maxsize=1)
 def training_base_pool():
@@ -23,16 +21,12 @@ def training_base_pool():
     return pool["records"]
 
 
-def sample_training_arm_bases(model, data, seed, *, full_pose=False):
-    """Sample one training pair without added noise or camera movement.
-
-    By default only world x/y/yaw change, retaining XML z/roll/pitch.
-    full_pose applies the complete calibrated 6D transforms instead.
-    """
+def sample_training_arm_bases(model, data, seed):
+    """Apply one training sequence's paired full 6D poses; keep the camera fixed."""
     records = training_base_pool()
     rng = np.random.default_rng(None if seed is None else [seed, 1])
     record = records[int(rng.integers(len(records)))]
-    poses = _set_arm_bases(model, data, record["camera_from_base"], full_pose=full_pose)
+    poses = _set_arm_bases(model, data, record["camera_from_base"])
     for pose in poses.values():
         pose["source_episode"] = record["episode"]
     return poses
@@ -43,13 +37,13 @@ def set_median_arm_bases(model, data):
     path = Path(__file__).resolve().parents[2] / "abc_minimal/dishrack_median_base_poses.json"
     median = json.loads(path.read_text())["poses"]
     targets = {side: median[side]["T_camera_from_base"] for side in ("left", "right")}
-    poses = _set_arm_bases(model, data, targets, full_pose=True)
+    poses = _set_arm_bases(model, data, targets)
     for pose in poses.values():
         pose["source"] = "median"
     return poses
 
 
-def _set_arm_bases(model, data, camera_from_base, *, full_pose):
+def _set_arm_bases(model, data, camera_from_base):
     mujoco.mj_kinematics(model, data)
     camera = data.camera("top")
     world_from_camera = np.eye(4)
@@ -62,18 +56,11 @@ def _set_arm_bases(model, data, camera_from_base, *, full_pose):
         if model.body_parentid[body.id] != 0:
             raise ValueError(f"Expected {name} to be attached to the world body")
         world_from_base = world_from_camera @ np.asarray(camera_from_base[side])
-        if full_pose:
-            body.pos[:] = world_from_base[:3, 3]
-            mujoco.mju_mat2Quat(body.quat, world_from_base[:3, :3].ravel())
-        else:
-            yaw = np.arctan2(world_from_base[1, 0], world_from_base[0, 0])
-            body.pos[:2] = world_from_base[:2, 3]
-            body.quat[:] = _quat_mul(
-                _quat_from_yaw(yaw - _yaw_from_quat(body.quat)), body.quat,
-            )
+        body.pos[:] = world_from_base[:3, 3]
+        mujoco.mju_mat2Quat(body.quat, world_from_base[:3, :3].ravel())
         poses[name] = {
             "pos": body.pos.tolist(), "quat": body.quat.tolist(),
-            "projection": "full_pose" if full_pose else "xy_yaw",
+            "projection": "full_pose",
         }
     mujoco.mj_forward(model, data)
     return poses
