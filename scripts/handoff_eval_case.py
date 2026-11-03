@@ -290,8 +290,10 @@ def run(args, initial, report, scene, old_summary, new_summary):
         build_summary(config=config, ckpt_path=Path(config.checkpoint), device=f"cuda:{args.gpu_id}",
                       worlds=worlds, out_dir=args.output, physics=resolved_physics(env.env))
         write_json(args.output / "result.json", dict(world=worlds[0], handoff=report, trace_hashes=array_hashes(arrays)))
-        video, fps = render_trajectory(env, args.output, args.render_stride, tuple(config.model.camera_keys))
-        print(f"Handoff result: success={worlds[0]['success']}; video={video}; fps={fps}", flush=True)
+        video, fps = render_trajectory(env, args.output, args.render_stride,
+                                       tuple(config.model.camera_keys), lossless=True)
+        print(f"Handoff result: success={worlds[0]['success']}; video={video}; fps={fps}; "
+              "encoding=lossless RGB H.264, native resolution", flush=True)
     finally:
         env.env.close()
 

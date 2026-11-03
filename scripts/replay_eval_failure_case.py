@@ -150,14 +150,18 @@ class WorldNoise:
         return result
 
 
-def render_trajectory(env, folder, stride, camera_keys):
+def render_trajectory(env, folder, stride, camera_keys, *, lossless=False):
     path = folder/'rollout.mp4'
     dt = env.env.env._physics_dt * env.env.env._control_decimation
     native = env.env.env
     frames = list(range(0, len(env.qpos), stride))
     if frames[-1] != len(env.qpos)-1:
         frames.append(len(env.qpos)-1)
-    with imageio.get_writer(str(path), fps=1/(dt*stride), macro_block_size=1) as writer:
+    writer_options = {}
+    if lossless:
+        writer_options = dict(codec='libx264rgb', pixelformat='rgb24', quality=None,
+                              output_params=['-crf', '0', '-preset', 'fast'])
+    with imageio.get_writer(str(path), fps=1/(dt*stride), macro_block_size=1, **writer_options) as writer:
         for index in frames:
             native.data.qpos[:] = env.qpos[index]
             native.data.qvel[:] = env.qvel[index]
