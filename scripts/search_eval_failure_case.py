@@ -1,4 +1,4 @@
-"""Search independent worlds for baseline success versus median-model failure.
+"""Search for XML-retargeted policy success versus median-retargeted failure.
 
 CPU MuJoCo physics, default MJWarp rendering, and deterministic FP32 inference.
 Each model/world runs once. Model weights are loaded once and reused; every
@@ -143,11 +143,11 @@ def run_model(task, policies):
 
 def eval_config(args, side, seed):
     base = "xml" if side == "old" else "median"
-    collision_mode = args.baseline_collisions if side == "old" else args.median_collisions
+    collision_mode = args.xml_collisions if side == "old" else args.median_collisions
     request = dict(plate_count=3, plate_variant="plate_0", dish_rack_variant="dish_rack_0",
                    randomize_variants=False, randomize_scales=False, randomize_arm_bases=False,
                    arm_base_source=base, arm_collision_mode=collision_mode)
-    config = dict(checkpoint=str(args.baseline_checkpoint if side == "old" else args.median_checkpoint),
+    config = dict(checkpoint=str(args.xml_checkpoint if side == "old" else args.median_checkpoint),
                   policy="dit", task="dishrack", num_worlds=1, parallel_worlds=0, seed=seed,
                   policy_seed=args.policy_seed, gpu_id=args.gpu_id, num_chunks=args.num_chunks,
                   diffusion_steps=10, execute_chunk_dim=15, rtc=True, rtc_prefix_length=4,
@@ -200,14 +200,14 @@ def render_case(tasks, results, folder, stride):
 def search(args):
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    config_keys = ("baseline_checkpoint", "median_checkpoint", "gpu_id", "seed", "policy_seed",
+    config_keys = ("xml_checkpoint", "median_checkpoint", "gpu_id", "seed", "policy_seed",
                    "start_world", "num_worlds", "num_chunks", "max_matches",
-                   "camera_backend", "baseline_collisions", "median_collisions", "prompt", "render_stride",
+                   "camera_backend", "xml_collisions", "median_collisions", "prompt", "render_stride",
                    "recheck_case")
     config = {key: str(getattr(args, key)) if isinstance(getattr(args, key), Path)
               else getattr(args, key) for key in config_keys}
     checkpoints = {str(path): dict(size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
-                   for path in (args.baseline_checkpoint, args.median_checkpoint)}
+                   for path in (args.xml_checkpoint, args.median_checkpoint)}
     manifest = dict(config=config, checkpoints=checkpoints, source_hashes=source_hashes(),
                     gl_backend=os.environ.get("MUJOCO_GL"), physics="CPU MuJoCo",
                     inference="FP32 eager; TF32 off; math attention; deterministic algorithms",
@@ -216,7 +216,7 @@ def search(args):
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
         raise ValueError("Parameters, checkpoints, or source files differ from this output; use a new directory")
     write_json(manifest_path, manifest)
-    summary = dict(status="running", checked_worlds=0, baseline_successes=0, median_evaluated=0,
+    summary = dict(status="running", checked_worlds=0, xml_successes=0, median_evaluated=0,
                    matches=[], skipped_unplaceable=[], worlds=[], manifest=str(manifest_path))
     deterministic_inference(args.policy_seed, args.gpu_id)
     policies = {}
@@ -229,7 +229,7 @@ def search(args):
             if source_hashes() != manifest["source_hashes"]:
                 raise RuntimeError("Source files changed during the search")
             try:
-                prepare_scene(folder / "scene.json", seed, args.baseline_collisions)
+                prepare_scene(folder / "scene.json", seed, args.xml_collisions)
             except RandomizationSamplingError as error:
                 summary["skipped_unplaceable"].append(dict(world_index=index, seed=seed, error=str(error)))
                 print(f"world={index:03d} seed={seed}: placement failed; skipped without changing seed", flush=True)
@@ -240,7 +240,7 @@ def search(args):
                 config = eval_config(args, side, seed)
                 tasks[side] = dict(side=side, world_index=index,
                                    base="xml" if side == "old" else "median", config=config,
-                                   collision_mode=args.baseline_collisions if side == "old" else args.median_collisions,
+                                   collision_mode=args.xml_collisions if side == "old" else args.median_collisions,
                                    scene=str(folder / "scene.json"), folder=str(folder / side),
                                    source_hashes=manifest["source_hashes"])
             if tasks["old"]["config"]["prompt"] != tasks["new"]["config"]["prompt"]:
@@ -249,7 +249,7 @@ def search(args):
             results = {"old": run_model(tasks["old"], policies)}
             summary["checked_worlds"] += 1
             if results["old"]["success"]:
-                summary["baseline_successes"] += 1
+                summary["xml_successes"] += 1
             if results["old"]["success"] or args.recheck_case:
                 results["new"] = run_model(tasks["new"], policies)
                 summary["median_evaluated"] += 1
@@ -259,15 +259,16 @@ def search(args):
                 world["videos"] = render_case(tasks, results, folder, args.render_stride)
             if match:
                 summary["matches"].append(dict(world_index=index, seed=seed, **world["videos"]))
-                print(f"FOUND: baseline succeeds, median fails; video={world['videos']['video']}", flush=True)
+                print(f"FOUND: XML-retargeted policy succeeds, median policy fails; "
+                      f"video={world['videos']['video']}", flush=True)
             if args.recheck_case:
-                print(f"RECHECK: baseline_success={results['old']['success']} "
+                print(f"RECHECK: xml_success={results['old']['success']} "
                       f"median_success={results['new']['success']} original_pattern_holds={match}; "
                       f"video={world['videos']['video']}", flush=True)
             write_json(folder / "result.json", world)
             summary["worlds"].append(world)
             summary["seconds_this_invocation"] = time.perf_counter() - started
-            print(f"progress: checked={summary['checked_worlds']} baseline_success={summary['baseline_successes']} "
+            print(f"progress: checked={summary['checked_worlds']} xml_success={summary['xml_successes']} "
                   f"median_tested={summary['median_evaluated']} matches={len(summary['matches'])}", flush=True)
             if match and args.max_matches and len(summary["matches"]) >= args.max_matches:
                 summary["status"] = "found"
@@ -286,8 +287,9 @@ def search(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline-checkpoint", type=Path,
-                        default=SERVER_OUTPUT / "dit_joint_baseline_20261022_070036/100000.pt")
+    parser.add_argument("--xml-checkpoint", "--baseline-checkpoint", dest="xml_checkpoint", type=Path,
+                        default=SERVER_OUTPUT / "dit_joint_retargeted_official_timing_20261022_125331/100000.pt",
+                        help="Policy trained on XML-base-retargeted data; baseline policies are rejected")
     parser.add_argument("--median-checkpoint", type=Path,
                         default=SERVER_OUTPUT / "dit_median_sequence_ik_20261101_183529/100000.pt")
     parser.add_argument("--output", type=Path)
@@ -301,7 +303,8 @@ def main():
     parser.add_argument("--recheck-case", action="store_true",
                         help="Run both models and render one selected world regardless of success/failure")
     parser.add_argument("--camera-backend", choices=("mujoco", "mjwarp"), default="mjwarp")
-    parser.add_argument("--baseline-collisions", choices=("full", "eef_only"), default="eef_only")
+    parser.add_argument("--xml-collisions", "--baseline-collisions", dest="xml_collisions",
+                        choices=("full", "eef_only"), default="eef_only")
     parser.add_argument("--median-collisions", choices=("full", "eef_only"), default="eef_only")
     parser.add_argument("--prompt")
     parser.add_argument("--render-stride", type=int, default=2)
@@ -313,13 +316,19 @@ def main():
         parser.error("world index, seeds, and max-matches must be nonnegative")
     if args.recheck_case and args.num_worlds != 1:
         parser.error("--recheck-case requires --num-worlds 1")
-    for name in ("baseline_checkpoint", "median_checkpoint"):
+    for name in ("xml_checkpoint", "median_checkpoint"):
         path = getattr(args, name).expanduser().resolve()
         if not path.is_file():
             parser.error(f"Checkpoint not found: {path}")
         setattr(args, name, path)
+    if args.xml_checkpoint.parent.name.startswith("dit_joint_baseline_"):
+        parser.error("Use the XML-retargeted policy, not dit_joint_baseline, for this comparison")
+    if args.xml_checkpoint.stem != args.median_checkpoint.stem:
+        parser.error("XML and median checkpoints must use the same training step")
     stamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d_%H%M%S")
-    args.output = args.output or ROOT / "outputs" / f"search_baseline_vs_median_100k_{stamp}"
+    args.output = args.output or ROOT / "outputs" / f"search_xml_retargeted_vs_median_{args.xml_checkpoint.stem}_{stamp}"
+    print(f"XML-retargeted policy: {args.xml_checkpoint}; base=xml", flush=True)
+    print(f"Median-retargeted policy: {args.median_checkpoint}; base=median", flush=True)
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / ".lock").open("w") as lock:
         try:

@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-OLD = 'dit_joint_baseline_20261022_070036'
+OLD = 'dit_joint_retargeted_official_timing_20261022_125331'
 NEW = 'dit_median_sequence_ik_20261101_183529'
 SETTINGS = dict(policy_seed=0, num_chunks=236, diffusion_steps=10,
                 execute_chunk_dim=15, rtc=True, rtc_prefix_length=4,
