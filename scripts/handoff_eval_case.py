@@ -14,12 +14,14 @@ for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
 import argparse
 import copy
 import json
+import subprocess
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import imageio.v2 as imageio
+import imageio_ffmpeg
 import mujoco
 import numpy as np
 from scipy.optimize import least_squares
@@ -263,6 +265,22 @@ class HandoffScene(TraceScene):
         return self.env.obs()
 
 
+def export_playback_video(video):
+    """Keep the lossless master and add a conventional H.264 playback copy."""
+    with imageio.get_reader(str(video)) as reader:
+        imageio.imwrite(video.parent / "initial_frame.png", reader.get_data(0))
+    playback = video.with_stem(video.stem + "_compatible")
+    subprocess.run([
+        imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-n",
+        "-i", str(video), "-vf",
+        "scale=in_range=full:out_range=tv:out_color_matrix=bt709,format=yuv420p",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "10",
+        "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-movflags", "+faststart", "-an", str(playback),
+    ], check=True)
+    return playback
+
+
 def run(args, initial, report, scene, old_summary, new_summary):
     values = new_summary["config"].copy()
     values["model"] = DiTConfig(**values["model"])
@@ -292,8 +310,9 @@ def run(args, initial, report, scene, old_summary, new_summary):
         write_json(args.output / "result.json", dict(world=worlds[0], handoff=report, trace_hashes=array_hashes(arrays)))
         video, fps = render_trajectory(env, args.output, args.render_stride,
                                        tuple(config.model.camera_keys), lossless=True)
-        print(f"Handoff result: success={worlds[0]['success']}; video={video}; fps={fps}; "
-              "encoding=lossless RGB H.264, native resolution", flush=True)
+        playback = export_playback_video(video)
+        print(f"Handoff result: success={worlds[0]['success']}; video={playback}; fps={fps}; "
+              f"lossless_master={video}; initial_frame={args.output / 'initial_frame.png'}", flush=True)
     finally:
         env.env.close()
 
