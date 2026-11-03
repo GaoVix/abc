@@ -44,7 +44,7 @@ SOURCES = (
     "scripts/find_eval_failure_case.py", "abc_minimal/eval_policy.py",
     "abc_minimal/config.py", "abc_minimal/determinism.py", "abc_minimal/policy.py", "abc_minimal/dit.py",
     "abc_minimal/preprocess.py", "abc_minimal/sim_env.py", "abc_sim/env.py",
-    "abc_sim/rendering/replay/renderer.py", "abc_sim/rendering/replay/static_geoms.py",
+    "abc_sim/rendering/replay/renderer.py", "abc_sim/batched_env.py",
     "abc_sim/rendering/replay/camera_providers.py",
     "abc_sim/randomization/arm_bases.py", "abc_sim/randomization/tasks/dishrack.py",
     "abc_minimal/dishrack_median_base_poses.json",

@@ -153,6 +153,7 @@ class BatchedWarpYAMEnv:
         }
         self._runtime.reset_from_mujoco()
         self._runtime.sync_model_from_mujoco(stacked)
+        self._runtime.refresh_geom_poses(stacked)
         self._runtime.load_state_batch(
             qpos=stacked["qpos"],
             qvel=stacked["qvel"],
@@ -197,6 +198,8 @@ class BatchedWarpYAMEnv:
             "mocap_pos": np.asarray(data.mocap_pos, dtype=np.float32),
             "mocap_quat": np.asarray(data.mocap_quat, dtype=np.float32),
             "time": np.float32(data.time),
+            "geom_xpos": np.asarray(data.geom_xpos, dtype=np.float32),
+            "geom_xmat": np.asarray(data.geom_xmat, dtype=np.float32),
         }
         for name in PER_EPISODE_MODEL_FIELDS:
             snapshot[name] = np.asarray(getattr(model, name), dtype=np.float32)
