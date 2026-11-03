@@ -201,7 +201,7 @@ def search(args):
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
     config_keys = ("xml_checkpoint", "median_checkpoint", "gpu_id", "seed", "policy_seed",
-                   "start_world", "num_worlds", "num_chunks", "max_matches",
+                   "start_world", "world_step", "num_worlds", "num_chunks", "max_matches",
                    "camera_backend", "xml_collisions", "median_collisions", "prompt", "render_stride",
                    "recheck_case")
     config = {key: str(getattr(args, key)) if isinstance(getattr(args, key), Path)
@@ -221,7 +221,8 @@ def search(args):
     deterministic_inference(args.policy_seed, args.gpu_id)
     policies = {}
     started = time.perf_counter()
-    for index in range(args.start_world, args.start_world + args.num_worlds):
+    for index in range(args.start_world, args.start_world + args.num_worlds * args.world_step,
+                       args.world_step):
         seed = args.seed + index
         folder = root / f"world_{index:03d}_seed_{seed}"
         folder.mkdir(exist_ok=True)
@@ -297,6 +298,8 @@ def main():
     parser.add_argument("--seed", type=int, default=20260511)
     parser.add_argument("--policy-seed", type=int, default=0)
     parser.add_argument("--start-world", type=int, default=0)
+    parser.add_argument("--world-step", type=int, choices=(-1, 1), default=1,
+                        help="1 searches forward; -1 searches backward from start-world")
     parser.add_argument("--num-worlds", type=int, default=100)
     parser.add_argument("--num-chunks", type=int, default=236)
     parser.add_argument("--max-matches", type=int, default=1, help="Stop after this many cases; 0 scans all")
@@ -314,6 +317,9 @@ def main():
         parser.error("num-worlds, num-chunks, and render-stride must be positive")
     if min(args.start_world, args.max_matches, args.policy_seed, args.seed) < 0:
         parser.error("world index, seeds, and max-matches must be nonnegative")
+    last_world = args.start_world + (args.num_worlds - 1) * args.world_step
+    if last_world < 0:
+        parser.error("Search would reach a negative world index; reduce num-worlds")
     if args.recheck_case and args.num_worlds != 1:
         parser.error("--recheck-case requires --num-worlds 1")
     for name in ("xml_checkpoint", "median_checkpoint"):
@@ -329,6 +335,8 @@ def main():
     args.output = args.output or ROOT / "outputs" / f"search_xml_retargeted_vs_median_{args.xml_checkpoint.stem}_{stamp}"
     print(f"XML-retargeted policy: {args.xml_checkpoint}; base=xml", flush=True)
     print(f"Median-retargeted policy: {args.median_checkpoint}; base=median", flush=True)
+    print(f"Search order: world {args.start_world:03d} -> {last_world:03d}; "
+          f"{args.num_worlds} worlds; seed = {args.seed} + world index", flush=True)
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / ".lock").open("w") as lock:
         try:
