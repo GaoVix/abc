@@ -42,6 +42,10 @@ STATE = mujoco.mjtState.mjSTATE_INTEGRATION
 MODEL_FIELDS = ("body_pos", "body_quat", "cam_pos", "cam_quat", "geom_contype", "geom_conaffinity")
 
 
+class HandoffError(ValueError):
+    """The selected pose or EEF velocity could not be transferred accurately."""
+
+
 def load_json(path):
     return json.loads(path.read_text())
 
@@ -114,21 +118,31 @@ def bounded_ik(model, data, side, target, seed, attempts):
             best = (np.linalg.norm(error * scale), record)
         if position <= .1 and rotation <= .1:
             return result.x.copy(), record
-    raise ValueError(f"{side}: no accepted initial IK after {attempts} attempts; best={best[1]}")
+    raise HandoffError(f"{side}: no accepted initial IK after {attempts} attempts; best={best[1]}")
 
 
-def prepare(args):
-    case = args.case_dir.resolve()
+def load_case(case):
     scene = load_json(case / "scene.json")
     old_summary = load_json(case / "old/summary.json")
     new_summary = load_json(case / "new/summary.json")
     with np.load(case / "old/trajectory.npz") as archive:
-        trace = {key: archive[key] for key in archive.files}
+        trace = {key: archive[key] for key in ("qpos", "time", "integration")}
     with np.load(case / "old/initial.npz") as archive:
         initial = {key: archive[key] for key in archive.files}
+    with np.load(case / "new/initial.npz") as archive:
+        median_initial = {key: archive[key] for key in MODEL_FIELDS}
     manifest_path = case.parent / "manifest.json"
     stride = load_json(manifest_path)["config"]["render_stride"] if manifest_path.exists() else 2
-    step, selection = select_frame(case, trace, args.physics_step, args.video_time, stride)
+    return dict(scene=scene, old_summary=old_summary, new_summary=new_summary,
+                trace=trace, initial=initial, median_initial=median_initial, stride=stride)
+
+
+def prepare(args, case_data=None):
+    case = args.case_dir.resolve()
+    case_data = load_case(case) if case_data is None else case_data
+    scene, initial, trace = case_data["scene"], case_data["initial"], case_data["trace"]
+    old_summary, new_summary = case_data["old_summary"], case_data["new_summary"]
+    step, selection = select_frame(case, trace, args.physics_step, args.video_time, case_data["stride"])
     env = abc_sim.make_env(task="dishrack", render_cameras=False)
     try:
         state = RandomizationState.from_dict(copy.deepcopy(scene["randomization"]))
@@ -151,10 +165,9 @@ def prepare(args):
         mujoco.mj_forward(model, data)
         bases = set_median_arm_bases(model, data)
         np.testing.assert_allclose(camera_pose(data), world_from_camera, atol=1e-12, rtol=0)
-        with np.load(case / "new/initial.npz") as median_initial:
-            for name in MODEL_FIELDS:
-                np.testing.assert_allclose(getattr(model, name), median_initial[name], atol=1e-12, rtol=0,
-                                           err_msg=f"Current median model differs from the evaluated model: {name}")
+        for name in MODEL_FIELDS:
+            np.testing.assert_allclose(getattr(model, name), case_data["median_initial"][name], atol=1e-12, rtol=0,
+                                       err_msg=f"Current median model differs from the evaluated model: {name}")
         report = dict(selection=selection, arm_velocity=args.arm_velocity,
                       policy_history="New episode: reset noise stream and RTC; no old action prefix.",
                       ik="TRF with analytic Jacobian; intersection of XML joint and actuator control bounds",
@@ -182,9 +195,9 @@ def prepare(args):
                 actual_twist = jacobians[1] @ joint_velocity
                 velocity_error = float(np.linalg.norm(actual_twist - twist))
                 if not np.isfinite(joint_velocity).all():
-                    raise ValueError(f"{arm}: nonfinite mapped joint velocity")
+                    raise HandoffError(f"{arm}: nonfinite mapped joint velocity")
                 if velocity_error > 1e-7:
-                    raise ValueError(f"{arm}: cannot match the source EEF twist, residual={velocity_error}")
+                    raise HandoffError(f"{arm}: cannot match the source EEF twist, residual={velocity_error}")
                 rotation = world_from_camera[:3, :3].T
                 velocity_report = dict(
                     mode="match-twist", jacobian_rank=int(rank),
@@ -218,10 +231,12 @@ def prepare(args):
             position_mm = float(np.linalg.norm(error[:3, 3]) * 1000)
             rotation_deg = float(np.degrees(np.arccos(np.clip((np.trace(error[:3, :3]) - 1) / 2, -1, 1))))
             if position_mm > .1 or rotation_deg > .1:
-                raise ValueError(f"Final paired IK check failed: {arm}, {position_mm}mm, {rotation_deg}deg")
+                raise HandoffError(f"Final paired IK check failed: {arm}, {position_mm}mm, {rotation_deg}deg")
         evaluator = env._task_evaluator
         evaluator.configure_from_randomization(source_model, state)
         report["source_task_eval"] = evaluator.evaluate_model_data(source_model, source).to_info(squeeze=True)
+        evaluator.reset(nworld=1)
+        report["target_task_eval"] = evaluator.evaluate_model_data(model, data).to_info(squeeze=True)
         report["objects_and_gripper_qpos_preserved"] = True
         report["objects_and_gripper_qvel_preserved"] = True
         integration = np.empty(mujoco.mj_stateSize(model, STATE))
@@ -281,18 +296,25 @@ def export_playback_video(video):
     return playback
 
 
-def run(args, initial, report, scene, old_summary, new_summary):
+def handoff_config(new_summary, gpu_id, output, log_every_chunk=True):
     values = new_summary["config"].copy()
     values["model"] = DiTConfig(**values["model"])
     values["clip"] = ClipConfig(**values["clip"])
     allowed = {field.name for field in fields(SimEvalConfig)}
     config = SimEvalConfig(**{key: value for key, value in values.items() if key in allowed})
-    config.gpu_id, config.num_worlds, config.parallel_worlds = args.gpu_id, 1, 0
+    config.gpu_id, config.num_worlds, config.parallel_worlds = gpu_id, 1, 0
     config.fast_inference, config.deterministic_inference, config.compensate_arm_bases = False, True, False
-    config.output_dir, config.log_every_chunk = str(args.output), True
+    config.output_dir, config.log_every_chunk = str(output), log_every_chunk
+    return config
+
+
+def run(args, initial, report, scene, old_summary, new_summary, *, policy=None,
+        save_video=True, log_every_chunk=True):
+    config = handoff_config(new_summary, args.gpu_id, args.output, log_every_chunk)
     world_index = old_summary["worlds"][0]["world_index"]
     configure_determinism(config.policy_seed)
-    policy = DiTInferencePolicy(Path(config.checkpoint), config, f"cuda:{args.gpu_id}")
+    if policy is None:
+        policy = DiTInferencePolicy(Path(config.checkpoint), config, f"cuda:{args.gpu_id}")
     policy = WorldNoise(policy, config.policy_seed, world_index)
     prefix = resolve_prefix_length(config, policy.trained_max_prefix, config.model)
     config.prefix_length = prefix
@@ -304,15 +326,19 @@ def run(args, initial, report, scene, old_summary, new_summary):
                       integration=np.array(env.integration), actions=np.array(env.actions),
                       predictions=np.array(policy.predictions), diffusion_noise=np.array(policy.noise))
         np.savez_compressed(args.output / "trajectory.npz", **arrays)
+        np.savez(args.output / "initial.npz", **env.initial_arrays)
         write_json(args.output / "observations.json", policy.observations)
         build_summary(config=config, ckpt_path=Path(config.checkpoint), device=f"cuda:{args.gpu_id}",
                       worlds=worlds, out_dir=args.output, physics=resolved_physics(env.env))
-        write_json(args.output / "result.json", dict(world=worlds[0], handoff=report, trace_hashes=array_hashes(arrays)))
-        video, fps = render_trajectory(env, args.output, args.render_stride,
-                                       tuple(config.model.camera_keys), lossless=True)
-        playback = export_playback_video(video)
-        print(f"Handoff result: success={worlds[0]['success']}; video={playback}; fps={fps}; "
-              f"lossless_master={video}; initial_frame={args.output / 'initial_frame.png'}", flush=True)
+        result = dict(world=worlds[0], handoff=report, trace_hashes=array_hashes(arrays))
+        write_json(args.output / "result.json", result)
+        if save_video:
+            video, fps = render_trajectory(env, args.output, args.render_stride,
+                                           tuple(config.model.camera_keys), lossless=True)
+            playback = export_playback_video(video)
+            print(f"Handoff result: success={worlds[0]['success']}; video={playback}; fps={fps}; "
+                  f"lossless_master={video}; initial_frame={args.output / 'initial_frame.png'}", flush=True)
+        return result
     finally:
         env.env.close()
 
