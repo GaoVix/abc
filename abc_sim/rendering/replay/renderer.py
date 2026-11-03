@@ -580,6 +580,17 @@ class RendererWrapper:
 
     def close(self) -> None:
         """Release renderer-owned state so another renderer can be created later."""
+        try:
+            self._wp.synchronize()
+        except Exception:
+            pass
+        if self._rc is not None:
+            # Cached Warp kernels can retain the RenderContext through a
+            # closure. Release its GPU resources even if that object survives.
+            for field in dataclasses.fields(self._rc):
+                resource = getattr(self._rc, field.name)
+                if isinstance(resource, (self._wp.array, self._wp.Bvh, dict, list)):
+                    setattr(self._rc, field.name, None)
         if self._madrona is not None:
             self._madrona = None
             RendererWrapper._madrona_created = False
