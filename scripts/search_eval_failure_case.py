@@ -44,6 +44,8 @@ SOURCES = (
     "scripts/find_eval_failure_case.py", "abc_minimal/eval_policy.py",
     "abc_minimal/config.py", "abc_minimal/determinism.py", "abc_minimal/policy.py", "abc_minimal/dit.py",
     "abc_minimal/preprocess.py", "abc_minimal/sim_env.py", "abc_sim/env.py",
+    "abc_sim/rendering/replay/renderer.py", "abc_sim/rendering/replay/static_geoms.py",
+    "abc_sim/rendering/replay/camera_providers.py",
     "abc_sim/randomization/arm_bases.py", "abc_sim/randomization/tasks/dishrack.py",
     "abc_minimal/dishrack_median_base_poses.json",
 )
@@ -200,7 +202,8 @@ def search(args):
     root.mkdir(parents=True, exist_ok=True)
     config_keys = ("baseline_checkpoint", "median_checkpoint", "gpu_id", "seed", "policy_seed",
                    "start_world", "num_worlds", "num_chunks", "max_matches",
-                   "camera_backend", "baseline_collisions", "median_collisions", "prompt", "render_stride")
+                   "camera_backend", "baseline_collisions", "median_collisions", "prompt", "render_stride",
+                   "recheck_case")
     config = {key: str(getattr(args, key)) if isinstance(getattr(args, key), Path)
               else getattr(args, key) for key in config_keys}
     checkpoints = {str(path): dict(size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
@@ -247,14 +250,20 @@ def search(args):
             summary["checked_worlds"] += 1
             if results["old"]["success"]:
                 summary["baseline_successes"] += 1
+            if results["old"]["success"] or args.recheck_case:
                 results["new"] = run_model(tasks["new"], policies)
                 summary["median_evaluated"] += 1
-            match = "new" in results and not results["new"]["success"]
+            match = results["old"]["success"] and "new" in results and not results["new"]["success"]
             world = dict(world_index=index, world_seed=seed, matched=match, results=results)
-            if match:
+            if match or args.recheck_case:
                 world["videos"] = render_case(tasks, results, folder, args.render_stride)
+            if match:
                 summary["matches"].append(dict(world_index=index, seed=seed, **world["videos"]))
                 print(f"FOUND: baseline succeeds, median fails; video={world['videos']['video']}", flush=True)
+            if args.recheck_case:
+                print(f"RECHECK: baseline_success={results['old']['success']} "
+                      f"median_success={results['new']['success']} original_pattern_holds={match}; "
+                      f"video={world['videos']['video']}", flush=True)
             write_json(folder / "result.json", world)
             summary["worlds"].append(world)
             summary["seconds_this_invocation"] = time.perf_counter() - started
@@ -289,6 +298,8 @@ def main():
     parser.add_argument("--num-worlds", type=int, default=100)
     parser.add_argument("--num-chunks", type=int, default=236)
     parser.add_argument("--max-matches", type=int, default=1, help="Stop after this many cases; 0 scans all")
+    parser.add_argument("--recheck-case", action="store_true",
+                        help="Run both models and render one selected world regardless of success/failure")
     parser.add_argument("--camera-backend", choices=("mujoco", "mjwarp"), default="mjwarp")
     parser.add_argument("--baseline-collisions", choices=("full", "eef_only"), default="eef_only")
     parser.add_argument("--median-collisions", choices=("full", "eef_only"), default="eef_only")
@@ -300,6 +311,8 @@ def main():
         parser.error("num-worlds, num-chunks, and render-stride must be positive")
     if min(args.start_world, args.max_matches, args.policy_seed, args.seed) < 0:
         parser.error("world index, seeds, and max-matches must be nonnegative")
+    if args.recheck_case and args.num_worlds != 1:
+        parser.error("--recheck-case requires --num-worlds 1")
     for name in ("baseline_checkpoint", "median_checkpoint"):
         path = getattr(args, name).expanduser().resolve()
         if not path.is_file():
