@@ -106,6 +106,9 @@ class WarpReplayRuntime:
             if field.size:
                 expanded = np.repeat(field.numpy(), nworld, axis=0)
                 setattr(self.m_warp, name, wp.array(expanded, dtype=field.dtype))
+        bodies = mjm.geom_bodyid
+        static = (mjm.body_weldid[bodies] == 0) & (mjm.body_mocapid[mjm.body_rootid[bodies]] < 0)
+        self._static_geom_ids = wp.array(np.flatnonzero(static).astype(np.int32), dtype=wp.int32)
         self._step_graphs: dict[int, object] = {}
         self._closed = False
 
@@ -120,6 +123,7 @@ class WarpReplayRuntime:
         self._step_graphs = {}
         self.m_warp = None
         self.d_warp = None
+        self._static_geom_ids = None
         self.mjm = None
         self.mjd = None
         try:
@@ -158,6 +162,20 @@ class WarpReplayRuntime:
             if values is None:
                 values = np.repeat(np.asarray(getattr(self.mjm, name))[None], self.nworld, axis=0)
             self._copy_field(target, np.ascontiguousarray(values, dtype=np.float32), dtype=target.dtype)
+        # Fixed base meshes are cached in Data when MJWarp is initialized.
+        # Updating body_pos/body_quat alone leaves them at the previous pose.
+        if self._static_geom_ids.size:
+            from abc_sim.rendering.replay.static_geoms import sync_static_geom_poses
+
+            self._wp.launch(
+                sync_static_geom_poses,
+                dim=(self.nworld, self._static_geom_ids.size),
+                inputs=[self._static_geom_ids, self.m_warp.body_parentid,
+                        self.m_warp.body_pos, self.m_warp.body_quat,
+                        self.m_warp.geom_bodyid, self.m_warp.geom_pos, self.m_warp.geom_quat],
+                outputs=[self.d_warp.geom_xpos, self.d_warp.geom_xmat],
+                device=self.device,
+            )
 
     def sync_from_mujoco(self) -> None:
         """Copy the current MuJoCo state into the persistent Warp data."""
