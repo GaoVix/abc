@@ -22,19 +22,19 @@ class BaseCompensation:
     """Retarget physical joints through TCP poses in each world's top camera frame."""
 
     def __init__(self, ik_backend="pink", reference="xml"):
-        if ik_backend not in ("pink", "pink-debug", "mink"):
+        if ik_backend not in ("pink", "pink-debug", "mink", "slsqp"):
             raise ValueError(f"Unknown base compensation IK backend: {ik_backend}")
         if reference not in ("xml", "median"):
             raise ValueError(f"Unknown base compensation reference: {reference}")
         self.ik_backend = ik_backend
         self._uses_pink = ik_backend in ("pink", "pink-debug")
         self.reference = reference
-        if self._uses_pink:
+        if self._uses_pink or ik_backend == "slsqp":
             try:
                 from deploy.robot.control.pinocchio_ik import PinocchioArmController
             except ImportError as exc:
                 raise RuntimeError(
-                    "Pinocchio/Pink testing IK requires `uv sync --extra inference-ik`"
+                    "Pink/SLSQP testing IK requires `uv sync --extra inference-ik`"
                 ) from exc
         path = Path(__file__).resolve().parents[1] / "abc_sim/models/yam_dishrack_base.xml"
         self.model = mujoco.MjModel.from_xml_path(str(path))
@@ -81,6 +81,13 @@ class BaseCompensation:
                     home, model=spec.compile(), target_link=f"{side}_link_6",
                     debug=ik_backend == "pink-debug",
                 )
+            elif ik_backend == "slsqp":
+                from deploy.robot.control.slsqp_ik import SLSQPArmController
+
+                controller = SLSQPArmController(
+                    self.model.key("home").qpos[self.qpos[arm]],
+                    model=spec.compile(), target_link=f"{side}_link_6",
+                )
             else:
                 # Use XML position limits without an extra inward margin.
                 controller = MinkArmController(
@@ -93,6 +100,9 @@ class BaseCompensation:
                    "max_position_error_mm": 0., "max_rotation_error_deg": 0., "seconds": 0.}
             for name in ("state", "action")
         }
+        if ik_backend == "slsqp":
+            for stats in self.stats.values():
+                stats.update(optimizer_failures=0, optimizer_iterations=0)
 
     def reset(self, randomizations, state):
         self.state_seed = np.asarray(state, dtype=np.float64).reshape(-1, 14).copy()
@@ -134,9 +144,8 @@ class BaseCompensation:
         link_target = target @ self.tcp_from_link[arm]
         quaternion = Rotation.from_matrix(link_target[:3, :3]).as_quat()[[3, 0, 1, 2]]
         joints = seed.copy()
-        # Pink owns the five fixed iterations from robot(1).py. Do not wrap
-        # those in the legacy Mink convergence loop (which would run 50 steps).
-        max_calls = 1 if self._uses_pink else 10
+        # Pink and SLSQP own their iterations; only Mink uses the outer loop.
+        max_calls = 10 if self.ik_backend == "mink" else 1
         for calls in range(1, max_calls + 1):
             joints = self.controllers[arm].solve(link_target[:3, 3], quaternion, joints)
             self.data.qpos[self.qpos[arm]] = joints
@@ -150,20 +159,21 @@ class BaseCompensation:
         return joints, position_error, rotation_error, calls
 
     def convert(self, joints, *, state=False, physical_state=None):
-        """Convert joints; Pink init/smoothness use the supplied physical state.
+        """Convert joints using physical state as the posture reference.
 
         Observations already contain that state. Action conversion requires the
         current measured state separately from the policy's target joints.
+        SLSQP starts from a Pink debug solve seeded by that physical state.
         """
         started = time.perf_counter()
         values = np.asarray(joints, dtype=np.float64)
         result = values.reshape(-1, 14).copy()
         transforms = self.input_transform if state else self.output_transform
         seeds = self.state_seed if state else self.action_seed
-        if self._uses_pink:
+        if self._uses_pink or self.ik_backend == "slsqp":
             if physical_state is None:
                 if not state:
-                    raise ValueError("Pink action IK requires the current physical_state")
+                    raise ValueError("Pink/SLSQP action IK requires the current physical_state")
                 physical_state = values
             seeds = np.asarray(physical_state, dtype=np.float64).reshape(-1, 14).copy()
             if seeds.shape != result.shape:
@@ -182,6 +192,10 @@ class BaseCompensation:
                 seeds[world, segment] = solution
                 stats["arm_solves"] += 1
                 stats["solve_calls"] += calls
+                if self.ik_backend == "slsqp":
+                    optimization = self.controllers[arm].last_result
+                    stats["optimizer_failures"] += int(not optimization.success)
+                    stats["optimizer_iterations"] += int(optimization.nit)
                 stats["not_converged"] += int(position > 0.1 or rotation > 0.1)
                 stats["max_position_error_mm"] = max(stats["max_position_error_mm"], position)
                 stats["max_rotation_error_deg"] = max(stats["max_rotation_error_deg"], rotation)
