@@ -1,4 +1,4 @@
-"""Plot only overlap distributions from already saved IK derivative NPZ files.
+"""Plot overlap derivative magnitude distributions from saved IK results.
 
 Reads summary.json and its derivative manifest; never reads training datasets
 or recomputes derivatives. All overlap samples contribute to the histograms.
@@ -153,8 +153,46 @@ def read_distributions(input_dir):
     return summary, raw_dir, distributions
 
 
-def draw_panel(ax, distributions, order, stream, arm, tail=False, joint=None):
+@dataclass
+class SavedDistribution:
+    signed_edges: np.ndarray
+    absolute_edges: np.ndarray
+    signed_counts: np.ndarray
+    absolute_counts: np.ndarray
+    statistics: dict
+
+    def report(self):
+        return self.statistics
+
+
+def read_histograms(directory):
+    report = read_json(directory / "distribution_summary.json")
+    if report.get("status") != "complete" or report.get("view") != VIEW:
+        raise ValueError("Expected completed overlap histogram results")
+    distributions = {}
+    with np.load(directory / "histograms.npz", allow_pickle=False) as saved:
+        for order in ORDERS:
+            for stream in STREAMS:
+                for arm in ARMS:
+                    for version in VERSIONS:
+                        key = f"{order}__{stream}__{arm}__{version}"
+                        stats = report["distributions"][key]
+                        distribution = SavedDistribution(
+                            saved[key + "__signed_edges"], saved[key + "__absolute_edges"],
+                            saved[key + "__signed_counts"], saved[key + "__absolute_counts"], stats,
+                        )
+                        for counts in (distribution.signed_counts, distribution.absolute_counts):
+                            if counts.ndim != 2 or counts.shape[0] != 6 or np.any(counts < 0):
+                                raise ValueError("Invalid cached histogram counts")
+                            if np.any(counts.sum(axis=1) != stats["samples_per_joint"]):
+                                raise ValueError("Cached histogram counts differ from their summary")
+                        distributions[order, stream, arm, version] = distribution
+    return report, distributions
+
+
+def draw_panel(ax, distributions, order, stream, arm, tail=False, joint=None, versions=VERSIONS):
     unit, threshold = ORDERS[order][3:]
+    positive_heights = []
     for version in VERSIONS:
         distribution = distributions[order, stream, arm, version]
         if tail:
@@ -163,32 +201,44 @@ def draw_panel(ax, distributions, order, stream, arm, tail=False, joint=None):
             if counts.sum():
                 survival = np.cumsum(counts[::-1])[::-1] / counts.sum()
                 included = survival > 0
-                ax.plot(distribution.absolute_edges[:-1][included], survival[included],
-                        color=COLORS[version], label=LABELS[version], linewidth=1.7)
+                positive_heights.append(survival[included])
+                if version in versions:
+                    ax.plot(distribution.absolute_edges[:-1][included], survival[included],
+                            color=COLORS[version], label=LABELS[version], linewidth=1.7)
         else:
-            counts = distribution.signed_counts
+            counts = distribution.absolute_counts
             counts = counts.sum(axis=0) if joint is None else counts[joint]
             if counts.sum():
-                density = counts / (counts.sum() * np.diff(distribution.signed_edges))
-                density = np.where(density > 0, density, np.nan)
-                ax.stairs(density, distribution.signed_edges,
-                          color=COLORS[version], label=LABELS[version], linewidth=1.4)
+                density = counts / (counts.sum() * np.diff(distribution.absolute_edges))
+                positive_heights.append(density[density > 0])
+                if version in versions:
+                    density = np.where(density > 0, density, np.nan)
+                    ax.stairs(density, distribution.absolute_edges,
+                              color=COLORS[version], label=LABELS[version], linewidth=1.4)
     ax.set_xscale("symlog", linthresh=threshold)
     ax.set_yscale("log")
-    ax.set_xlabel(f"|{order.capitalize()}| threshold ({unit})" if tail else f"{order.capitalize()} ({unit})")
+    ax.set_xlabel(f"|{order.capitalize()}| threshold ({unit})" if tail else f"|{order.capitalize()}| ({unit})")
     ax.set_ylabel("Fraction at or above threshold" if tail else "Probability density")
     ax.grid(alpha=0.2, which="major")
     ax.set_axisbelow(True)
     ax.set_title(f"{stream.capitalize()} / {arm} arm" if joint is None else f"Joint {joint + 1}")
+    # Both versions determine the limits even when only one is displayed.
+    pair = [distributions[order, stream, arm, version] for version in VERSIONS]
     if tail:
-        ax.set_xlim(left=0)
-        ax.set_ylim(top=1.25)
+        ax.set_xlim(0, max(item.absolute_edges[-1] for item in pair))
     else:
-        a, b = (distributions[order, stream, arm, version] for version in VERSIONS)
-        ra = a.report()["rms"] if joint is None else a.report()["per_joint_rms"][joint]
-        rb = b.report()["rms"] if joint is None else b.report()["per_joint_rms"][joint]
-        ax.text(0.02, 0.98, f"RMS: {ra:.2f} -> {rb:.2f}", transform=ax.transAxes,
+        ax.set_xlim(0, max(item.absolute_edges[-1] for item in pair))
+        rms = []
+        for version in versions:
+            stats = distributions[order, stream, arm, version].report()
+            value = stats.get("rms", 0) if joint is None else stats.get("per_joint_rms", [0] * 6)[joint]
+            rms.append(f"{value:.2f}")
+        ax.text(0.02, 0.98, "RMS: " + " -> ".join(rms), transform=ax.transAxes,
                 va="top", fontsize=8, bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none"})
+    if positive_heights:
+        lower = min(values.min() for values in positive_heights) * 0.65
+        upper = 1.25 if tail else max(values.max() for values in positive_heights) * 1.8
+        ax.set_ylim(lower, upper)
 
 
 def save_figure(fig, output, stem):
@@ -196,7 +246,7 @@ def save_figure(fig, output, stem):
         fig.savefig(output / f"{stem}.{extension}", dpi=180, facecolor="white")
 
 
-def make_figures(distributions, output, per_joint):
+def make_figures(distributions, output, per_joint, separate=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -204,47 +254,67 @@ def make_figures(distributions, output, per_joint):
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
                          "axes.spines.top": False, "axes.spines.right": False})
     generated = []
-    for order in ORDERS:
-        for tail in (False, True):
-            stem = f"{order}_{'absolute_tail' if tail else 'signed_distribution'}"
-            fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
-            fig.suptitle(f"{order.capitalize()}: Mink vs three-stage / identical overlap intervals", fontsize=14)
-            for stream_id, stream in enumerate(STREAMS):
-                for arm_id, arm in enumerate(ARMS):
-                    draw_panel(axes[stream_id, arm_id], distributions, order, stream, arm, tail)
-            axes[0, 0].legend(loc="upper right", fontsize=9)
-            save_figure(fig, output, stem)
-            plt.close(fig)
-            generated.extend([stem + ".png", stem + ".pdf"])
-        if per_joint:
-            for stream in STREAMS:
-                for arm in ARMS:
-                    stem = f"{order}_{stream}_{arm}_per_joint"
-                    fig, axes = plt.subplots(3, 2, figsize=(12, 10), layout="constrained")
-                    fig.suptitle(f"{order.capitalize()} / {stream} / {arm}: identical overlap intervals", fontsize=14)
-                    for joint, ax in enumerate(axes.flat):
-                        draw_panel(ax, distributions, order, stream, arm, joint=joint)
-                    axes[0, 0].legend(loc="upper right", fontsize=9)
-                    save_figure(fig, output, stem)
-                    plt.close(fig)
-                    generated.extend([stem + ".png", stem + ".pdf"])
+    groups = [(version, (version,)) for version in VERSIONS] if separate else [(None, VERSIONS)]
+    for group, versions in groups:
+        destination = output / group if group else output
+        destination.mkdir(parents=True, exist_ok=True)
+        label = LABELS[group] if group else "Mink vs three-stage"
+        for order in ORDERS:
+            for tail in (False, True):
+                stem = f"{order}_{'absolute_tail' if tail else 'absolute_distribution'}"
+                fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
+                fig.suptitle(f"|{order.capitalize()}|: {label} / identical overlap intervals", fontsize=14)
+                for stream_id, stream in enumerate(STREAMS):
+                    for arm_id, arm in enumerate(ARMS):
+                        draw_panel(axes[stream_id, arm_id], distributions, order, stream, arm,
+                                   tail, versions=versions)
+                axes[0, 0].legend(loc="upper right", fontsize=9)
+                save_figure(fig, destination, stem)
+                plt.close(fig)
+                generated.extend(str((destination / (stem + ext)).relative_to(output))
+                                 for ext in (".png", ".pdf"))
+            if per_joint:
+                for stream in STREAMS:
+                    for arm in ARMS:
+                        stem = f"{order}_{stream}_{arm}_per_joint"
+                        fig, axes = plt.subplots(3, 2, figsize=(12, 10), layout="constrained")
+                        fig.suptitle(f"{label} / |{order}| / {stream} / {arm}: identical overlap intervals", fontsize=14)
+                        for joint, ax in enumerate(axes.flat):
+                            draw_panel(ax, distributions, order, stream, arm, joint=joint, versions=versions)
+                        axes[0, 0].legend(loc="upper right", fontsize=9)
+                        save_figure(fig, destination, stem)
+                        plt.close(fig)
+                        generated.extend(str((destination / (stem + ext)).relative_to(output))
+                                         for ext in (".png", ".pdf"))
     return generated
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-dir", type=Path, required=True, help="Completed statistics directory")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input-dir", type=Path, help="Completed statistics directory")
+    source.add_argument("--from-histograms", type=Path, help="Reuse an existing plots directory without rereading derivative arrays")
     parser.add_argument("--output-dir", type=Path, help="Defaults to <input-dir>/plots_overlap")
     parser.add_argument("--per-joint", action="store_true", help="Also plot six separate joints per stream/arm")
+    parser.add_argument("--separate", action="store_true", help="Draw Mink and three-stage in separate directories with identical axes")
     args = parser.parse_args()
     # Check the plotting dependency before reading the large derivative archives.
     import matplotlib  # noqa: F401
 
-    input_dir = args.input_dir.expanduser().resolve()
-    output = (args.output_dir or input_dir / "plots_overlap").expanduser().resolve()
+    source_dir = (args.input_dir or args.from_histograms).expanduser().resolve()
+    default_output = source_dir / ("separate" if args.from_histograms else
+                                   "plots_overlap_separate" if args.separate else "plots_overlap")
+    output = (args.output_dir or default_output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    summary, raw_dir, distributions = read_distributions(input_dir)
+    if args.from_histograms:
+        summary, distributions = read_histograms(source_dir)
+        raw_dir = Path(summary["derivatives_directory"])
+        input_summary = summary["input_summary"]
+        print("Reusing saved overlap histograms", flush=True)
+    else:
+        summary, raw_dir, distributions = read_distributions(source_dir)
+        input_summary = str(source_dir / "summary.json")
     arrays, reports = {}, {}
     for (order, stream, arm, version), distribution in distributions.items():
         key = f"{order}__{stream}__{arm}__{version}"
@@ -254,12 +324,15 @@ def main():
         arrays[key + "__absolute_counts"] = distribution.absolute_counts
         reports[key] = distribution.report()
     np.savez_compressed(output / "histograms.npz", **arrays)
-    figures = make_figures(distributions, output, args.per_joint)
+    figures = make_figures(distributions, output, args.per_joint, args.separate)
     report = {
         "status": "complete", "view": VIEW, "sequences": summary["sequences"],
-        "input_summary": str(input_dir / "summary.json"), "derivatives_directory": str(raw_dir),
+        "input_summary": input_summary, "derivatives_directory": str(raw_dir),
+        "separate_versions": args.separate, "shared_axes_between_versions": True,
+        "histograms_source": str(source_dir) if args.from_histograms else None,
         "all_samples_used": True, "sampling": False, "derivatives_recomputed": False,
-        "histogram_axes": "Full signed range, symlog x-axis and logarithmic probability density",
+        "distribution_values": "Absolute derivative magnitudes; direction signs are ignored in plots",
+        "histogram_axes": "Full absolute range, symlog x-axis and logarithmic probability density",
         "tail_definition": "Fraction of absolute samples >= each bin lower edge; exact at these thresholds",
         "histogram_rows": "Six rows, one per joint; pooled arm counts are their sum",
         "summary_checks": "Sample counts, RMS, mean absolute, maximum and per-joint RMS match saved summary",
