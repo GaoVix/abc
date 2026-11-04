@@ -1,8 +1,8 @@
 """Compare official-timing Mink and three-stage real-data joint trajectories.
 
-Reads only the two exported training datasets and saves all signed, float64
-derivative samples plus summary statistics. No IK, video decoding, angle
-unwrapping, or data modifications occur.
+Compares only identical retained training intervals from the two exported
+datasets. Saves all signed, float64 derivative samples plus summary statistics.
+No IK, video decoding, angle unwrapping, or data modifications occur.
 Only NumPy and the Python standard library are required.
 """
 
@@ -12,13 +12,14 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import time
+import zipfile
 
 import numpy as np
 
 
 ARMS = {"left": np.arange(6), "right": np.arange(7, 13)}
 STREAMS = {"state": 0, "action": 14}
-VIEWS = ("as_trained", "matched_training_intervals")
+VIEWS = ("matched_training_intervals",)
 VERSIONS = ("mink", "three_stage")
 JOINT_COLUMNS = np.array([offset + column for offset in STREAMS.values()
                           for columns in ARMS.values() for column in columns])
@@ -214,18 +215,18 @@ def save_json(path, value):
     temporary.replace(path)
 
 
-def save_derivatives(directory, episode, split, rows, valid, arrays):
-    """One lossless NPZ per source episode, containing both views and versions."""
+def save_derivatives(directory, episode, split, rows, valid, arrays, compression="fast"):
+    """One lossless NPZ per source episode, containing the two overlap versions."""
+    frame_indices = np.flatnonzero(valid["matched"])
     arrays.update(
-        format_version=np.int64(1), episode=np.asarray(episode), split=np.asarray(split),
+        format_version=np.int64(2), episode=np.asarray(episode), split=np.asarray(split),
         stream_labels=np.array(list(STREAMS)), arm_labels=np.array(list(ARMS)),
         joint_numbers=np.arange(1, 7, dtype=np.int64),
-        source_frame_indices=np.arange(len(rows["mink"]), dtype=np.int64),
+        source_frame_indices=frame_indices,
+        source_frame_count=np.int64(len(rows["mink"])),
     )
     for version in VERSIONS:
-        arrays[version + "__state_action_rows"] = rows[version]
-        arrays[version + "__valid_frames"] = valid[version]
-    arrays["matched_valid_frames"] = valid["matched"]
+        arrays[version + "__state_action_rows"] = rows[version][frame_indices]
     paired = "matched_training_intervals__"
     for suffix in ("velocity_frame_indices", "acceleration_frame_indices"):
         np.testing.assert_array_equal(arrays[paired + "mink__" + suffix],
@@ -254,10 +255,18 @@ def save_derivatives(directory, episode, split, rows, valid, arrays):
     path = directory / (episode + ".npz")
     temporary = path.with_suffix(".npz.tmp")
     with temporary.open("wb") as stream:
-        np.savez_compressed(stream, **arrays)
+        if compression == "none":
+            np.savez(stream, **arrays)
+        else:
+            with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED,
+                                 compresslevel=1, allowZip64=True) as archive:
+                for name, value in arrays.items():
+                    with archive.open(name + ".npy", "w", force_zip64=True) as member:
+                        np.lib.format.write_array(member, np.asanyarray(value), allow_pickle=False)
     temporary.replace(path)
     return {"episode": episode, "split": split, "file": path.name,
-            "source_frames": len(rows["mink"]), "bytes": path.stat().st_size,
+            "source_frames": len(rows["mink"]), "overlap_frames": len(frame_indices),
+            "bytes": path.stat().st_size,
             "samples": counts}
 
 
@@ -270,6 +279,8 @@ def main():
                         help="Summary JSON; also writes CSV and <stem>.derivatives/ with full per-episode NPZs")
     parser.add_argument("--derivatives-dir", type=Path,
                         help="Optional alternative directory for the full derivative NPZs")
+    parser.add_argument("--compression", choices=("none", "fast"), default="fast",
+                        help="none: uncompressed NPZ; fast: lossless ZIP deflate level 1 (default)")
     parser.add_argument("--expected-sequences", type=int, default=1261)
     parser.add_argument("--fps", type=float, default=30.0)
     args = parser.parse_args()
@@ -330,19 +341,14 @@ def main():
                 intervals.append((begin, end))
             new_valid = np.isfinite(new_rows).all(axis=1)
             common = old_valid & new_valid
-            whole = [(0, len(old_rows))]
             raw_arrays = {"fps": np.float64(args.fps), "tick_ns": np.int64(old_meta["tick_ns"]),
                           "metadata_t0_ns": np.int64(old_meta["t0_ns"])}
             for version, rows in (("mink", old_rows), ("three_stage", new_rows)):
-                add_intervals(stats, "as_trained", version, rows,
-                              old_valid if version == "mink" else new_valid,
-                              whole if version == "mink" else intervals,
-                              args.fps, writer, episode, split, raw_arrays)
                 add_intervals(stats, "matched_training_intervals", version, rows, common, intervals,
                               args.fps, writer, episode, split, raw_arrays)
             raw_files.append(save_derivatives(raw_dir, episode, split,
                 {"mink": old_rows, "three_stage": new_rows},
-                {"mink": old_valid, "three_stage": new_valid, "matched": common}, raw_arrays))
+                {"matched": common}, raw_arrays, args.compression))
             segments += len(intervals)
             if number % 100 == 0 or number == len(mink):
                 print(f"Compared {number}/{len(mink)} real sequences", flush=True)
@@ -359,12 +365,13 @@ def main():
                         if total != getattr(stats[view, version, stream, arm], field_name).count:
                             raise ValueError("Saved sample count differs from summary statistics")
     manifest = {
-        "status": "complete", "format_version": 1, "sequences": len(raw_files),
+        "status": "complete", "format_version": 2, "sequences": len(raw_files),
         "bytes": sum(row["bytes"] for row in raw_files),
         "fps": args.fps, "precision": "float64", "signed": True, "sampled": False,
         "grippers_in_derivatives": False, "angle_unwrap": False,
+        "views": list(VIEWS), "compression": args.compression,
         "derivative_axes": ["sample", "stream: state/action", "arm: left/right", "joint: 1..6"],
-        "position_rows": "<version>__state_action_rows: (source_frames,28), original float64 radians/gripper values; three-stage excluded frames are NaN",
+        "position_rows": "<version>__state_action_rows: (overlap_frames,28), indexed by source_frame_indices; only common retained frames, original float64 radians/gripper values",
         "frame_indices": "Source episode row indices, zero-based; velocity uses pairs, acceleration uses triples",
         "time_s": "Relative to source row 0; velocity at the pair midpoint, acceleration at the triple center",
         "arrays_per_view_version": {
@@ -391,14 +398,14 @@ def main():
         "rms_definition": "sqrt(mean across included times and six joint components of derivative**2)",
         "view_definitions": {
             "matched_training_intervals": "Both versions on the exact intervals retained in the new training data; no differences across interval boundaries",
-            "as_trained": "Each version's own exported real training sequences; retained frames/intervals can differ",
         },
         "inputs": {name: str(getattr(args, name)) for name in
                    ("mink_root", "three_stage_root")},
         "views": views, "per_episode_csv": str(csv_path),
         "derivatives": {"directory": str(raw_dir), "manifest": str(manifest_path),
                         "files": len(raw_files), "bytes": manifest["bytes"],
-                        "precision": "float64", "signed": True, "sampled": False},
+                        "precision": "float64", "signed": True, "sampled": False,
+                        "format_version": 2, "compression": args.compression},
         "seconds": time.monotonic() - started,
     }
     temporary = args.output.with_suffix(".json.tmp")
