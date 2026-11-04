@@ -1,6 +1,7 @@
 """Compare official-timing Mink and three-stage real-data joint trajectories.
 
-Reads only the two exported training datasets. No IK, video decoding, angle
+Reads only the two exported training datasets and saves all signed, float64
+derivative samples plus summary statistics. No IK, video decoding, angle
 unwrapping, or data modifications occur.
 Only NumPy and the Python standard library are required.
 """
@@ -19,6 +20,8 @@ ARMS = {"left": np.arange(6), "right": np.arange(7, 13)}
 STREAMS = {"state": 0, "action": 14}
 VIEWS = ("as_trained", "matched_training_intervals")
 VERSIONS = ("mink", "three_stage")
+JOINT_COLUMNS = np.array([offset + column for offset in STREAMS.values()
+                          for columns in ARMS.values() for column in columns])
 
 
 @dataclass
@@ -73,6 +76,9 @@ class Motion:
         triples = valid[:-2] & valid[1:-1] & valid[2:]
         first = np.diff(q, axis=0)[edges]
         second = np.diff(q, n=2, axis=0)[triples]
+        self.add_differences(first, second)
+
+    def add_differences(self, first, second):
         self.first.add(first)
         self.second.add(second)
         if len(first):
@@ -144,15 +150,48 @@ def discover_three_stage(root):
     return episodes
 
 
-def add_intervals(global_stats, view, version, rows, valid, intervals, fps, writer, episode, split):
+def add_intervals(global_stats, view, version, rows, valid, intervals, fps, writer, episode, split,
+                  raw_arrays=None):
     local = {(stream, arm): Motion() for stream in STREAMS for arm in ARMS}
-    for begin, end in intervals:
-        for stream, offset in STREAMS.items():
-            for arm, columns in ARMS.items():
-                q = rows[begin:end, offset + columns]
-                mask = valid[begin:end]
-                global_stats[view, version, stream, arm].add(q, mask)
-                local[stream, arm].add(q, mask)
+    chunks = {key: [] for key in ("velocity_deg_s", "acceleration_deg_s2",
+                                 "velocity_frame_indices", "acceleration_frame_indices",
+                                 "velocity_segment_ids", "acceleration_segment_ids")}
+    for segment_id, (begin, end) in enumerate(intervals):
+        q = rows[begin:end, JOINT_COLUMNS].reshape(-1, 2, 2, 6)
+        mask = valid[begin:end]
+        edges = mask[:-1] & mask[1:]
+        triples = mask[:-2] & mask[1:-1] & mask[2:]
+        first = np.diff(q, axis=0)[edges]
+        second = np.diff(q, n=2, axis=0)[triples]
+        for stream_id, stream in enumerate(STREAMS):
+            for arm_id, arm in enumerate(ARMS):
+                a, b = first[:, stream_id, arm_id], second[:, stream_id, arm_id]
+                global_stats[view, version, stream, arm].add_differences(a, b)
+                local[stream, arm].add_differences(a, b)
+        if raw_arrays is not None:
+            first_start = begin + np.flatnonzero(edges)
+            second_start = begin + np.flatnonzero(triples)
+            chunks["velocity_deg_s"].append(np.rad2deg(first) * fps)
+            chunks["acceleration_deg_s2"].append(np.rad2deg(second) * fps ** 2)
+            chunks["velocity_frame_indices"].append(first_start[:, None] + np.arange(2))
+            chunks["acceleration_frame_indices"].append(second_start[:, None] + np.arange(3))
+            chunks["velocity_segment_ids"].append(np.full(len(first), segment_id, dtype=np.int32))
+            chunks["acceleration_segment_ids"].append(np.full(len(second), segment_id, dtype=np.int32))
+    if raw_arrays is not None:
+        prefix = f"{view}__{version}__"
+        raw_arrays[prefix + "intervals"] = np.asarray(intervals, dtype=np.int64).reshape(-1, 2)
+        for key, parts in chunks.items():
+            if parts:
+                raw_arrays[prefix + key] = np.concatenate(parts)
+            else:
+                shape = (0, 2, 2, 6) if key in ("velocity_deg_s", "acceleration_deg_s2") else (
+                    (0, 2 if key == "velocity_frame_indices" else 3) if key.endswith("frame_indices") else (0,))
+                dtype = np.float64 if "deg_s" in key else np.int64 if key.endswith("frame_indices") else np.int32
+                raw_arrays[prefix + key] = np.empty(shape, dtype=dtype)
+        raw_arrays[prefix + "velocity_time_s"] = (
+            raw_arrays[prefix + "velocity_frame_indices"][:, 0] + 0.5) / fps
+        raw_arrays[prefix + "acceleration_time_s"] = (
+            raw_arrays[prefix + "acceleration_frame_indices"][:, 1] / fps)
     for (stream, arm), motion in local.items():
         report = motion.report(fps)
         first, second = report["first_derivative"], report["second_derivative"]
@@ -169,12 +208,68 @@ def add_intervals(global_stats, view, version, rows, valid, intervals, fps, writ
         })
 
 
+def save_json(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    temporary.replace(path)
+
+
+def save_derivatives(directory, episode, split, rows, valid, arrays):
+    """One lossless NPZ per source episode, containing both views and versions."""
+    arrays.update(
+        format_version=np.int64(1), episode=np.asarray(episode), split=np.asarray(split),
+        stream_labels=np.array(list(STREAMS)), arm_labels=np.array(list(ARMS)),
+        joint_numbers=np.arange(1, 7, dtype=np.int64),
+        source_frame_indices=np.arange(len(rows["mink"]), dtype=np.int64),
+    )
+    for version in VERSIONS:
+        arrays[version + "__state_action_rows"] = rows[version]
+        arrays[version + "__valid_frames"] = valid[version]
+    arrays["matched_valid_frames"] = valid["matched"]
+    paired = "matched_training_intervals__"
+    for suffix in ("velocity_frame_indices", "acceleration_frame_indices"):
+        np.testing.assert_array_equal(arrays[paired + "mink__" + suffix],
+                                      arrays[paired + "three_stage__" + suffix])
+    counts = {}
+    for view in VIEWS:
+        counts[view] = {}
+        for version in VERSIONS:
+            prefix = f"{view}__{version}__"
+            counts[view][version] = {}
+            for label, data_key, index_key, segment_key in (
+                ("velocity", "velocity_deg_s", "velocity_frame_indices", "velocity_segment_ids"),
+                ("acceleration", "acceleration_deg_s2", "acceleration_frame_indices", "acceleration_segment_ids"),
+            ):
+                data = arrays[prefix + data_key]
+                if data.dtype != np.float64 or data.shape[1:] != (2, 2, 6) or not np.isfinite(data).all():
+                    raise ValueError(f"Invalid full derivative array: {episode}/{prefix + data_key}")
+                indices, ids = arrays[prefix + index_key], arrays[prefix + segment_key]
+                bounds = arrays[prefix + "intervals"]
+                if len(indices) != len(data) or len(ids) != len(data) or not (np.diff(indices, axis=1) == 1).all():
+                    raise ValueError(f"Derivative samples/frame indices mismatch: {episode}")
+                if len(indices) and not ((indices[:, 0] >= bounds[ids, 0])
+                                         & (indices[:, -1] < bounds[ids, 1])).all():
+                    raise ValueError(f"Derivative crosses a segment boundary: {episode}")
+                counts[view][version][label + "_samples"] = len(data)
+    path = directory / (episode + ".npz")
+    temporary = path.with_suffix(".npz.tmp")
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, **arrays)
+    temporary.replace(path)
+    return {"episode": episode, "split": split, "file": path.name,
+            "source_frames": len(rows["mink"]), "bytes": path.stat().st_size,
+            "samples": counts}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mink-root", type=Path, required=True)
     parser.add_argument("--three-stage-root", type=Path, required=True,
                         help="New exported training data, with source_frame_range metadata")
-    parser.add_argument("--output", type=Path, required=True, help="Summary JSON; also writes a per-episode CSV")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="Summary JSON; also writes CSV and <stem>.derivatives/ with full per-episode NPZs")
+    parser.add_argument("--derivatives-dir", type=Path,
+                        help="Optional alternative directory for the full derivative NPZs")
     parser.add_argument("--expected-sequences", type=int, default=1261)
     parser.add_argument("--fps", type=float, default=30.0)
     args = parser.parse_args()
@@ -182,8 +277,9 @@ def main():
         raise ValueError("FPS must be finite and positive")
     for name in ("mink_root", "three_stage_root", "output"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
+    raw_dir = (args.derivatives_dir or args.output.with_suffix(".derivatives")).expanduser().resolve()
     for root in (args.mink_root, args.three_stage_root):
-        if args.output.is_relative_to(root):
+        if args.output.is_relative_to(root) or raw_dir.is_relative_to(root):
             raise ValueError("Write analysis reports outside the input datasets")
     mink, new = discover_mink(args.mink_root), discover_three_stage(args.three_stage_root)
     if set(mink) != set(new) or len(mink) != args.expected_sequences:
@@ -196,6 +292,10 @@ def main():
               "acceleration_rms_deg_s2", "acceleration_max_deg_s2",
               "gt_30_deg", "gt_60_deg", "gt_90_deg")
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = raw_dir / "manifest.json"
+    save_json(manifest_path, {"status": "running", "expected_sequences": len(mink)})
+    raw_files = []
     csv_path = args.output.with_suffix(".episodes.csv")
     csv_temp = csv_path.with_suffix(".csv.tmp")
     started, frames, segments = time.monotonic(), 0, 0
@@ -231,13 +331,18 @@ def main():
             new_valid = np.isfinite(new_rows).all(axis=1)
             common = old_valid & new_valid
             whole = [(0, len(old_rows))]
+            raw_arrays = {"fps": np.float64(args.fps), "tick_ns": np.int64(old_meta["tick_ns"]),
+                          "metadata_t0_ns": np.int64(old_meta["t0_ns"])}
             for version, rows in (("mink", old_rows), ("three_stage", new_rows)):
                 add_intervals(stats, "as_trained", version, rows,
                               old_valid if version == "mink" else new_valid,
                               whole if version == "mink" else intervals,
-                              args.fps, writer, episode, split)
+                              args.fps, writer, episode, split, raw_arrays)
                 add_intervals(stats, "matched_training_intervals", version, rows, common, intervals,
-                              args.fps, writer, episode, split)
+                              args.fps, writer, episode, split, raw_arrays)
+            raw_files.append(save_derivatives(raw_dir, episode, split,
+                {"mink": old_rows, "three_stage": new_rows},
+                {"mink": old_valid, "three_stage": new_valid, "matched": common}, raw_arrays))
             segments += len(intervals)
             if number % 100 == 0 or number == len(mink):
                 print(f"Compared {number}/{len(mink)} real sequences", flush=True)
@@ -245,6 +350,37 @@ def main():
     views = {view: {version: {stream: {arm: stats[view, version, stream, arm].report(args.fps)
                                      for arm in ARMS} for stream in STREAMS} for version in VERSIONS}
              for view in VIEWS}
+    for view in VIEWS:
+        for version in VERSIONS:
+            for label, field_name in (("velocity", "first"), ("acceleration", "second")):
+                total = sum(row["samples"][view][version][label + "_samples"] for row in raw_files)
+                for stream in STREAMS:
+                    for arm in ARMS:
+                        if total != getattr(stats[view, version, stream, arm], field_name).count:
+                            raise ValueError("Saved sample count differs from summary statistics")
+    manifest = {
+        "status": "complete", "format_version": 1, "sequences": len(raw_files),
+        "bytes": sum(row["bytes"] for row in raw_files),
+        "fps": args.fps, "precision": "float64", "signed": True, "sampled": False,
+        "grippers_in_derivatives": False, "angle_unwrap": False,
+        "derivative_axes": ["sample", "stream: state/action", "arm: left/right", "joint: 1..6"],
+        "position_rows": "<version>__state_action_rows: (source_frames,28), original float64 radians/gripper values; three-stage excluded frames are NaN",
+        "frame_indices": "Source episode row indices, zero-based; velocity uses pairs, acceleration uses triples",
+        "time_s": "Relative to source row 0; velocity at the pair midpoint, acceleration at the triple center",
+        "arrays_per_view_version": {
+            "intervals": "(segments,2) source frame ranges [begin,end)",
+            "velocity_deg_s": "(N,2,2,6), all signed first derivative values",
+            "acceleration_deg_s2": "(M,2,2,6), all signed second derivative values",
+            "velocity_frame_indices": "(N,2), exact source frame pairs",
+            "acceleration_frame_indices": "(M,3), exact source frame triples",
+            "velocity_segment_ids": "(N,), index into intervals",
+            "acceleration_segment_ids": "(M,), index into intervals",
+            "velocity_time_s": "(N,), relative midpoint time",
+            "acceleration_time_s": "(M,), relative center time",
+        },
+        "key_format": "<view>__<version>__<array_name>", "files": raw_files,
+    }
+    save_json(manifest_path, manifest)
     summary = {
         "status": "complete", "sequences": len(mink), "source_frames": frames,
         "new_training_segments": segments, "new_retained_frames": retained,
@@ -259,7 +395,11 @@ def main():
         },
         "inputs": {name: str(getattr(args, name)) for name in
                    ("mink_root", "three_stage_root")},
-        "views": views, "per_episode_csv": str(csv_path), "seconds": time.monotonic() - started,
+        "views": views, "per_episode_csv": str(csv_path),
+        "derivatives": {"directory": str(raw_dir), "manifest": str(manifest_path),
+                        "files": len(raw_files), "bytes": manifest["bytes"],
+                        "precision": "float64", "signed": True, "sampled": False},
+        "seconds": time.monotonic() - started,
     }
     temporary = args.output.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
@@ -277,7 +417,7 @@ def main():
                       f"{fmt(a, 'first_derivative', 'rms'):>12} -> {fmt(b, 'first_derivative', 'rms'):<12} "
                       f"{fmt(a, 'second_derivative', 'rms'):>12} -> {fmt(b, 'second_derivative', 'rms'):<12} "
                       f"{fmt(a, 'second_derivative', 'maximum_absolute')} -> {fmt(b, 'second_derivative', 'maximum_absolute')}")
-    print(f"\nSUMMARY={args.output}\nEPISODES={csv_path}", flush=True)
+    print(f"\nSUMMARY={args.output}\nEPISODES={csv_path}\nDERIVATIVES={raw_dir}\nMANIFEST={manifest_path}", flush=True)
 
 
 if __name__ == "__main__":
