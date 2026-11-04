@@ -241,12 +241,57 @@ def draw_panel(ax, distributions, order, stream, arm, tail=False, joint=None, ve
         ax.set_ylim(lower, upper)
 
 
+def bar_counts(distribution, order, joint=None):
+    """Merge adjacent saved bins without approximating or discarding samples."""
+    edges = distribution.absolute_edges
+    threshold = ORDERS[order][4]
+    first = int(np.searchsorted(edges, threshold))
+    last = len(edges) - 1
+    boundaries = np.unique(np.r_[0, np.linspace(first, last, min(11, last - first + 1), dtype=int)])
+    counts = distribution.absolute_counts
+    counts = counts.sum(axis=0) if joint is None else counts[joint]
+    grouped = np.add.reduceat(counts, boundaries[:-1])
+    if grouped.sum() != counts.sum():
+        raise ValueError("Bar chart grouping lost samples")
+    return edges[boundaries], grouped
+
+
+def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None, versions=VERSIONS):
+    from matplotlib.ticker import PercentFormatter
+
+    percentages = {}
+    previous_edges = None
+    for version in VERSIONS:
+        edges, counts = bar_counts(distributions[order, stream, arm, version], order, joint)
+        if previous_edges is not None:
+            np.testing.assert_array_equal(edges, previous_edges)
+        previous_edges = edges
+        percentages[version] = counts / counts.sum() * 100 if counts.sum() else np.zeros_like(counts, dtype=float)
+    x = np.arange(len(edges) - 1)
+    width = 0.8 / len(versions)
+    for index, version in enumerate(versions):
+        offset = -0.4 + width * (index + 0.5)
+        ax.bar(x + offset, percentages[version], width=width,
+               color=COLORS[version], label=LABELS[version], alpha=0.9)
+    labels = [f"{a:.3g}\u2013{b:.3g}" for a, b in zip(edges[:-1], edges[1:])]
+    ax.set_xticks(x, labels, rotation=35, ha="right", fontsize=8)
+    ax.set_xlabel(f"|{order.capitalize()}| interval ({ORDERS[order][3]})")
+    ax.set_ylabel("Samples in interval (%)")
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+    maximum = max(values.max(initial=0) for values in percentages.values())
+    ax.set_ylim(0, max(1, maximum * 1.15))
+    ax.set_xlim(-0.6, len(x) - 0.4)
+    ax.grid(axis="y", alpha=0.2)
+    ax.set_axisbelow(True)
+    ax.set_title(f"{stream.capitalize()} / {arm} arm" if joint is None else f"Joint {joint + 1}")
+
+
 def save_figure(fig, output, stem):
     for extension in ("png", "pdf"):
         fig.savefig(output / f"{stem}.{extension}", dpi=180, facecolor="white")
 
 
-def make_figures(distributions, output, per_joint, separate=False):
+def make_figures(distributions, output, per_joint, separate=False, bars=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -254,20 +299,24 @@ def make_figures(distributions, output, per_joint, separate=False):
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
                          "axes.spines.top": False, "axes.spines.right": False})
     generated = []
-    groups = [(version, (version,)) for version in VERSIONS] if separate else [(None, VERSIONS)]
+    groups = [(None, VERSIONS)]
+    if separate:
+        groups.extend((version, (version,)) for version in VERSIONS)
+    draw = draw_bar_panel if bars else draw_panel
     for group, versions in groups:
         destination = output / group if group else output
         destination.mkdir(parents=True, exist_ok=True)
         label = LABELS[group] if group else "Mink vs three-stage"
         for order in ORDERS:
-            for tail in (False, True):
-                stem = f"{order}_{'absolute_tail' if tail else 'absolute_distribution'}"
+            for tail in ((False,) if bars else (False, True)):
+                suffix = "absolute_bars" if bars else "absolute_tail" if tail else "absolute_distribution"
+                stem = f"{order}_{suffix}"
                 fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
                 fig.suptitle(f"|{order.capitalize()}|: {label} / identical overlap intervals", fontsize=14)
                 for stream_id, stream in enumerate(STREAMS):
                     for arm_id, arm in enumerate(ARMS):
-                        draw_panel(axes[stream_id, arm_id], distributions, order, stream, arm,
-                                   tail, versions=versions)
+                        draw(axes[stream_id, arm_id], distributions, order, stream, arm,
+                             tail, versions=versions)
                 axes[0, 0].legend(loc="upper right", fontsize=9)
                 save_figure(fig, destination, stem)
                 plt.close(fig)
@@ -276,11 +325,11 @@ def make_figures(distributions, output, per_joint, separate=False):
             if per_joint:
                 for stream in STREAMS:
                     for arm in ARMS:
-                        stem = f"{order}_{stream}_{arm}_per_joint"
+                        stem = f"{order}_{stream}_{arm}_per_joint" + ("_bars" if bars else "")
                         fig, axes = plt.subplots(3, 2, figsize=(12, 10), layout="constrained")
                         fig.suptitle(f"{label} / |{order}| / {stream} / {arm}: identical overlap intervals", fontsize=14)
                         for joint, ax in enumerate(axes.flat):
-                            draw_panel(ax, distributions, order, stream, arm, joint=joint, versions=versions)
+                            draw(ax, distributions, order, stream, arm, joint=joint, versions=versions)
                         axes[0, 0].legend(loc="upper right", fontsize=9)
                         save_figure(fig, destination, stem)
                         plt.close(fig)
@@ -296,14 +345,16 @@ def main():
     source.add_argument("--from-histograms", type=Path, help="Reuse an existing plots directory without rereading derivative arrays")
     parser.add_argument("--output-dir", type=Path, help="Defaults to <input-dir>/plots_overlap")
     parser.add_argument("--per-joint", action="store_true", help="Also plot six separate joints per stream/arm")
-    parser.add_argument("--separate", action="store_true", help="Draw Mink and three-stage in separate directories with identical axes")
+    parser.add_argument("--separate", action="store_true", help="Also draw each version separately, keeping the combined comparison figures")
+    parser.add_argument("--bars", action="store_true", help="Plot sample percentages in magnitude intervals as bars")
     args = parser.parse_args()
     # Check the plotting dependency before reading the large derivative archives.
     import matplotlib  # noqa: F401
 
     source_dir = (args.input_dir or args.from_histograms).expanduser().resolve()
-    default_output = source_dir / ("separate" if args.from_histograms else
-                                   "plots_overlap_separate" if args.separate else "plots_overlap")
+    default_output = source_dir / ("bars" if args.bars else "separate") if args.from_histograms else (
+        source_dir / ("plots_overlap_bars" if args.bars else
+                      "plots_overlap_separate" if args.separate else "plots_overlap"))
     output = (args.output_dir or default_output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -324,20 +375,32 @@ def main():
         arrays[key + "__absolute_counts"] = distribution.absolute_counts
         reports[key] = distribution.report()
     np.savez_compressed(output / "histograms.npz", **arrays)
-    figures = make_figures(distributions, output, args.per_joint, args.separate)
+    figures = make_figures(distributions, output, args.per_joint, args.separate, args.bars)
     report = {
         "status": "complete", "view": VIEW, "sequences": summary["sequences"],
         "input_summary": input_summary, "derivatives_directory": str(raw_dir),
-        "separate_versions": args.separate, "shared_axes_between_versions": True,
+        "combined_versions": True, "separate_versions": args.separate,
+        "shared_axes_between_versions": True,
         "histograms_source": str(source_dir) if args.from_histograms else None,
         "all_samples_used": True, "sampling": False, "derivatives_recomputed": False,
         "distribution_values": "Absolute derivative magnitudes; direction signs are ignored in plots",
-        "histogram_axes": "Full absolute range, symlog x-axis and logarithmic probability density",
+        "plot_style": "bars" if args.bars else "density_and_tail",
+        "histogram_axes": ("Magnitude intervals; linear sample percentages" if args.bars else
+                           "Full absolute range, symlog x-axis and logarithmic probability density"),
         "tail_definition": "Fraction of absolute samples >= each bin lower edge; exact at these thresholds",
         "histogram_rows": "Six rows, one per joint; pooled arm counts are their sum",
         "summary_checks": "Sample counts, RMS, mean absolute, maximum and per-joint RMS match saved summary",
         "distributions": reports, "figures": figures, "seconds": time.monotonic() - started,
     }
+    if args.bars:
+        report["bar_intervals"] = {}
+        for (order, stream, arm, version), distribution in distributions.items():
+            edges, counts = bar_counts(distribution, order)
+            report["bar_intervals"][f"{order}__{stream}__{arm}__{version}"] = {
+                "edges": edges.tolist(), "counts": counts.tolist(),
+                "percentages": (counts / counts.sum() * 100 if counts.sum() else np.zeros_like(counts, dtype=float)).tolist(),
+                "interval_convention": "Left-inclusive, right-exclusive; last interval includes its right edge",
+            }
     (output / "distribution_summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     print(f"\nPLOTS={output}", flush=True)
     for figure in figures:
