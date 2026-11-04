@@ -256,8 +256,9 @@ def bar_counts(distribution, order, joint=None):
     return edges[boundaries], grouped
 
 
-def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None, versions=VERSIONS):
-    from matplotlib.ticker import PercentFormatter
+def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None,
+                   versions=VERSIONS, tail_bins=4):
+    from matplotlib.ticker import FuncFormatter, PercentFormatter
 
     percentages = {}
     previous_edges = None
@@ -267,19 +268,27 @@ def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None
             np.testing.assert_array_equal(edges, previous_edges)
         previous_edges = edges
         percentages[version] = counts / counts.sum() * 100 if counts.sum() else np.zeros_like(counts, dtype=float)
-    x = np.arange(len(edges) - 1)
+    start = max(0, len(edges) - 1 - tail_bins) if tail else 0
+    x = np.arange(len(edges) - 1 - start)
     width = 0.8 / len(versions)
     for index, version in enumerate(versions):
         offset = -0.4 + width * (index + 0.5)
-        ax.bar(x + offset, percentages[version], width=width,
-               color=COLORS[version], label=LABELS[version], alpha=0.9)
-    labels = [f"{a:.3g}\u2013{b:.3g}" for a, b in zip(edges[:-1], edges[1:])]
+        heights = percentages[version][start:]
+        bars = ax.bar(x + offset, heights, width=width,
+                      color=COLORS[version], label=LABELS[version], alpha=0.9)
+        if tail:
+            ax.bar_label(bars, labels=[f"{value:.3g}%" for value in heights],
+                         padding=3, fontsize=7)
+    selected_edges = edges[start:]
+    labels = [f"{a:.3g}\u2013{b:.3g}" for a, b in zip(selected_edges[:-1], selected_edges[1:])]
     ax.set_xticks(x, labels, rotation=35, ha="right", fontsize=8)
     ax.set_xlabel(f"|{order.capitalize()}| interval ({ORDERS[order][3]})")
-    ax.set_ylabel("Samples in interval (%)")
-    ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
-    maximum = max(values.max(initial=0) for values in percentages.values())
-    ax.set_ylim(0, max(1, maximum * 1.15))
+    ax.set_ylabel("Share of all samples (%)")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.3g}%") if tail else
+                                PercentFormatter(xmax=100))
+    maximum = max(values[start:].max(initial=0) for values in percentages.values())
+    upper = maximum * 1.3 if tail else max(1, maximum * 1.15)
+    ax.set_ylim(0, upper if upper > 0 else 1)
     ax.set_xlim(-0.6, len(x) - 0.4)
     ax.grid(axis="y", alpha=0.2)
     ax.set_axisbelow(True)
@@ -291,7 +300,7 @@ def save_figure(fig, output, stem):
         fig.savefig(output / f"{stem}.{extension}", dpi=180, facecolor="white")
 
 
-def make_figures(distributions, output, per_joint, separate=False, bars=False):
+def make_figures(distributions, output, per_joint, separate=False, bars=False, tail_bins=4):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -303,20 +312,26 @@ def make_figures(distributions, output, per_joint, separate=False, bars=False):
     if separate:
         groups.extend((version, (version,)) for version in VERSIONS)
     draw = draw_bar_panel if bars else draw_panel
+    draw_kwargs = {"tail_bins": tail_bins} if bars else {}
     for group, versions in groups:
         destination = output / group if group else output
         destination.mkdir(parents=True, exist_ok=True)
         label = LABELS[group] if group else "Mink vs three-stage"
         for order in ORDERS:
-            for tail in ((False,) if bars else (False, True)):
+            for tail in (False, True):
                 suffix = "absolute_bars" if bars else "absolute_tail" if tail else "absolute_distribution"
+                if bars and tail:
+                    suffix += "_tail_zoom"
                 stem = f"{order}_{suffix}"
                 fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
-                fig.suptitle(f"|{order.capitalize()}|: {label} / identical overlap intervals", fontsize=14)
+                title = f"|{order.capitalize()}|: {label} / identical overlap intervals"
+                if bars and tail:
+                    title += f"\nRightmost {tail_bins} intervals (zoom); percentages of all samples"
+                fig.suptitle(title, fontsize=14)
                 for stream_id, stream in enumerate(STREAMS):
                     for arm_id, arm in enumerate(ARMS):
                         draw(axes[stream_id, arm_id], distributions, order, stream, arm,
-                             tail, versions=versions)
+                             tail, versions=versions, **draw_kwargs)
                 axes[0, 0].legend(loc="upper right", fontsize=9)
                 save_figure(fig, destination, stem)
                 plt.close(fig)
@@ -329,7 +344,8 @@ def make_figures(distributions, output, per_joint, separate=False, bars=False):
                         fig, axes = plt.subplots(3, 2, figsize=(12, 10), layout="constrained")
                         fig.suptitle(f"{label} / |{order}| / {stream} / {arm}: identical overlap intervals", fontsize=14)
                         for joint, ax in enumerate(axes.flat):
-                            draw(ax, distributions, order, stream, arm, joint=joint, versions=versions)
+                            draw(ax, distributions, order, stream, arm, joint=joint,
+                                 versions=versions, **draw_kwargs)
                         axes[0, 0].legend(loc="upper right", fontsize=9)
                         save_figure(fig, destination, stem)
                         plt.close(fig)
@@ -347,7 +363,11 @@ def main():
     parser.add_argument("--per-joint", action="store_true", help="Also plot six separate joints per stream/arm")
     parser.add_argument("--separate", action="store_true", help="Also draw each version separately, keeping the combined comparison figures")
     parser.add_argument("--bars", action="store_true", help="Plot sample percentages in magnitude intervals as bars")
+    parser.add_argument("--tail-bins", type=int, default=4,
+                        help="Also magnify this many rightmost intervals in bar charts (default: 4)")
     args = parser.parse_args()
+    if args.tail_bins < 1:
+        parser.error("--tail-bins must be at least 1")
     # Check the plotting dependency before reading the large derivative archives.
     import matplotlib  # noqa: F401
 
@@ -375,7 +395,7 @@ def main():
         arrays[key + "__absolute_counts"] = distribution.absolute_counts
         reports[key] = distribution.report()
     np.savez_compressed(output / "histograms.npz", **arrays)
-    figures = make_figures(distributions, output, args.per_joint, args.separate, args.bars)
+    figures = make_figures(distributions, output, args.per_joint, args.separate, args.bars, args.tail_bins)
     report = {
         "status": "complete", "view": VIEW, "sequences": summary["sequences"],
         "input_summary": input_summary, "derivatives_directory": str(raw_dir),
@@ -393,6 +413,11 @@ def main():
         "distributions": reports, "figures": figures, "seconds": time.monotonic() - started,
     }
     if args.bars:
+        report["bar_tail_zoom"] = {
+            "rightmost_intervals": args.tail_bins,
+            "denominator": "All overlap derivative samples, unchanged from the full bar chart",
+            "axes": "Linear percentage scale fitted to the tail; identical between versions",
+        }
         report["bar_intervals"] = {}
         for (order, stream, arm, version), distribution in distributions.items():
             edges, counts = bar_counts(distribution, order)
