@@ -289,9 +289,9 @@ def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None
     start = max(0, len(edges) - 1 - tail_bins) if tail else 0
     x = np.arange(len(edges) - 1 - start)
     packed_labels = len(x) * len(available) > 12
-    width = 0.8 / len(versions)
+    width = 0.94 / len(versions)
     for index, version in enumerate(versions):
-        offset = -0.4 + width * (index + 0.5)
+        offset = -0.47 + width * (index + 0.5)
         heights = percentages[version][start:]
         bars = ax.bar(x + offset, heights, width=width,
                       color=COLORS[version], label=LABELS[version], alpha=0.9)
@@ -304,7 +304,7 @@ def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None
     selected_edges = edges[start:]
     labels = [f"{a:.3g}\u2013{b:.3g}" for a, b in zip(selected_edges[:-1], selected_edges[1:])]
     tick_step = max(1, int(np.ceil(len(x) / 12)))
-    ax.set_xticks(x[::tick_step], labels[::tick_step], rotation=35, ha="right", fontsize=8)
+    ax.set_xticks(x[::tick_step], labels[::tick_step], rotation=35, ha="right", fontsize=10)
     ax.set_xlabel(f"|{order.capitalize()}| interval ({ORDERS[order][3]})")
     ax.set_ylabel("Share of all samples (%)")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:.3g}%") if tail else
@@ -318,7 +318,7 @@ def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None
             ax.set_ylim(0.01, 1)
         ax.set_yscale("log")
         for index, version in enumerate(versions):
-            offset = -0.4 + width * (index + 0.5)
+            offset = -0.47 + width * (index + 0.5)
             for position in np.flatnonzero(counts_by_version[version][start:] == 0):
                 ax.text(x[position] + offset, ax.get_ylim()[0] * 1.15, "0", ha="center", fontsize=6)
     elif tail:
@@ -334,21 +334,22 @@ def draw_bar_panel(ax, distributions, order, stream, arm, tail=False, joint=None
         stats = distributions[order, stream, arm, version].report()
         maximum_value = stats.get("maximum_absolute", 0) if joint is None else stats.get("per_joint_maximum_absolute", [0] * 6)[joint]
         maximum_labels.append(f"{LABELS[version]} max: {maximum_value:.6g} {ORDERS[order][3]}")
-    ax.text(0.02, 0.98, "\n".join(maximum_labels), transform=ax.transAxes, va="top", fontsize=8,
+    ax.text(0.02, 0.98, "\n".join(maximum_labels), transform=ax.transAxes, va="top", fontsize=10,
             bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none"})
 
 
-def save_figure(fig, output, stem):
+def save_figure(fig, output, stem, dpi=240):
     for extension in ("png", "pdf"):
-        fig.savefig(output / f"{stem}.{extension}", dpi=180, facecolor="white")
+        fig.savefig(output / f"{stem}.{extension}", dpi=dpi, facecolor="white")
 
 
-def make_figures(distributions, output, per_joint, separate=False, bars=False, tail_bins=4, bar_bins=30):
+def make_figures(distributions, output, per_joint, separate=False, bars=False, tail_bins=4, bar_bins=30,
+                 single_panels=False, figure_width=26, dpi=240):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 12,
                          "axes.spines.top": False, "axes.spines.right": False})
     generated = []
     available = versions_in(distributions)
@@ -370,7 +371,7 @@ def make_figures(distributions, output, per_joint, separate=False, bars=False, t
                 if bars and tail:
                     suffix += "_tail_log" if tail_log else "_tail_zoom"
                 stem = f"{order}_{suffix}"
-                fig, axes = plt.subplots(2, 2, figsize=(14, 9) if bars else (12, 8), layout="constrained")
+                fig, axes = plt.subplots(2, 2, figsize=(figure_width, 12) if bars else (12, 8), layout="constrained")
                 title = f"|{order.capitalize()}|: {label} / identical overlap intervals"
                 if bars and tail:
                     title += (f"\nRightmost {tail_bins} intervals; log percentage axis; labels: count (percent of all samples)"
@@ -382,21 +383,39 @@ def make_figures(distributions, output, per_joint, separate=False, bars=False, t
                         draw(axes[stream_id, arm_id], distributions, order, stream, arm,
                              tail, versions=versions, **options)
                 axes[0, 0].legend(loc="upper right", fontsize=9)
-                save_figure(fig, destination, stem)
+                save_figure(fig, destination, stem, dpi)
                 plt.close(fig)
                 generated.extend(str((destination / (stem + ext)).relative_to(output))
                                  for ext in (".png", ".pdf"))
+                if single_panels:
+                    panel_dir = destination / "panels"
+                    panel_dir.mkdir(parents=True, exist_ok=True)
+                    for stream in STREAMS:
+                        for arm in ARMS:
+                            panel_stem = f"{order}_{stream}_{arm}_{suffix}"
+                            panel_fig, ax = plt.subplots(figsize=(figure_width, 7), layout="constrained")
+                            panel_fig.suptitle(title, fontsize=16)
+                            draw(ax, distributions, order, stream, arm, tail,
+                                 versions=versions, **options)
+                            ax.legend(loc="upper right", fontsize=12)
+                            ax.tick_params(labelsize=12)
+                            ax.xaxis.label.set_size(14)
+                            ax.yaxis.label.set_size(14)
+                            save_figure(panel_fig, panel_dir, panel_stem, dpi)
+                            plt.close(panel_fig)
+                            generated.extend(str((panel_dir / (panel_stem + ext)).relative_to(output))
+                                             for ext in (".png", ".pdf"))
             if per_joint:
                 for stream in STREAMS:
                     for arm in ARMS:
                         stem = f"{order}_{stream}_{arm}_per_joint" + ("_bars" if bars else "")
-                        fig, axes = plt.subplots(3, 2, figsize=(12, 10), layout="constrained")
+                        fig, axes = plt.subplots(3, 2, figsize=(figure_width, 14), layout="constrained")
                         fig.suptitle(f"{label} / |{order}| / {stream} / {arm}: identical overlap intervals", fontsize=14)
                         for joint, ax in enumerate(axes.flat):
                             draw(ax, distributions, order, stream, arm, joint=joint,
                                  versions=versions, **draw_kwargs)
                         axes[0, 0].legend(loc="upper right", fontsize=9)
-                        save_figure(fig, destination, stem)
+                        save_figure(fig, destination, stem, dpi)
                         plt.close(fig)
                         generated.extend(str((destination / (stem + ext)).relative_to(output))
                                          for ext in (".png", ".pdf"))
@@ -411,6 +430,11 @@ def main():
     parser.add_argument("--output-dir", type=Path, help="Defaults to <input-dir>/plots_overlap")
     parser.add_argument("--per-joint", action="store_true", help="Also plot six separate joints per stream/arm")
     parser.add_argument("--separate", action="store_true", help="Also draw each version separately, keeping the combined comparison figures")
+    parser.add_argument("--single-panels", action="store_true",
+                        help="Also save each state/action and left/right panel as a separate large figure")
+    parser.add_argument("--figure-width", type=float, default=26,
+                        help="Width of bar-chart figures and individual panels in inches (default: 26)")
+    parser.add_argument("--dpi", type=int, default=240, help="PNG resolution (default: 240); PDF remains vector")
     parser.add_argument("--bars", action="store_true", help="Plot sample percentages in magnitude intervals as bars")
     parser.add_argument("--bar-bins", type=int, default=30,
                         help="Number of noncentral magnitude intervals (default: 30; old charts used 10)")
@@ -421,6 +445,8 @@ def main():
         parser.error("--tail-bins must be at least 1")
     if args.bar_bins < 1:
         parser.error("--bar-bins must be at least 1")
+    if not np.isfinite(args.figure_width) or args.figure_width <= 0 or args.dpi < 1:
+        parser.error("--figure-width and --dpi must be positive")
     # Check the plotting dependency before reading the large derivative archives.
     import matplotlib  # noqa: F401
 
@@ -449,12 +475,13 @@ def main():
         reports[key] = distribution.report()
     np.savez_compressed(output / "histograms.npz", **arrays)
     figures = make_figures(distributions, output, args.per_joint, args.separate, args.bars,
-                           args.tail_bins, args.bar_bins)
+                           args.tail_bins, args.bar_bins, args.single_panels, args.figure_width, args.dpi)
     report = {
         "status": "complete", "view": VIEW, "sequences": summary["sequences"],
         "versions": list(versions_in(distributions)),
         "input_summary": input_summary, "derivatives_directory": str(raw_dir),
         "combined_versions": True, "separate_versions": args.separate,
+        "single_panels": args.single_panels, "figure_width_inches": args.figure_width, "png_dpi": args.dpi,
         "shared_axes_between_versions": True,
         "histograms_source": str(source_dir) if args.from_histograms else None,
         "all_samples_used": True, "sampling": False, "derivatives_recomputed": False,
