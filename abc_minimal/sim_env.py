@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 import abc_sim
 from abc_sim.task_specs import SimTaskSpec
@@ -49,6 +50,8 @@ class SimTaskEnv:
         self.spec = task_spec(task)
         self.height = height
         self.width = width
+        self.render_width = 1024
+        self.render_height = round(height * self.render_width / width)
         self.camera_keys = tuple(camera_keys)
         self.prompt = prompt
         self.randomization: Any = None
@@ -68,8 +71,12 @@ class SimTaskEnv:
             render_cameras=True,
             camera_backend=camera_backend,
             camera_gpu_id=gpu_id,
-            camera_height=height,
-            camera_width=width,
+            camera_height=self.render_height,
+            camera_width=self.render_width,
+        )
+        print(
+            f"camera rendering: {self.render_width}x{self.render_height} "
+            f"-> Pillow resize (default) -> {width}x{height}", flush=True,
         )
 
     def reset(self, seed: int, options: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -125,4 +132,11 @@ class SimTaskEnv:
                 f"Cameras missing from the {self.spec.name} scene: {', '.join(missing)} "
                 f"(scene has {', '.join(images)})"
             )
-        return {name: images[name] for name in self.camera_keys}
+        selected = {name: images[name] for name in self.camera_keys}
+
+        for name, image in selected.items():
+            resized = Image.fromarray(image.transpose(1, 2, 0)).resize(
+                (self.width, self.height),
+            )
+            selected[name] = np.asarray(resized).transpose(2, 0, 1).copy()
+        return selected
