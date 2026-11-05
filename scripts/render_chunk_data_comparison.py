@@ -1,10 +1,11 @@
 """Export old/new images, states and actions for paired loss-example chunks.
 
 Recorded images use the production training decoder and clean preprocessing.
-Export the first conditioning image and all 30 frames of saved state/action.
+Export one synchronized image and saved-joint replay video per chunk at 30 Hz.
 """
 import os
 
+os.environ["MUJOCO_GL"] = "disable"  # MJWarp rendering does not require EGL.
 for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(name, "1")
 
@@ -14,9 +15,11 @@ import hashlib
 import json
 from pathlib import Path
 
+import imageio.v2 as imageio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import mujoco
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -25,6 +28,7 @@ from abc_minimal.dataloader import decode_frame, read_state_action_rows
 from abc_minimal.preprocess import NORM_PRESETS, augment_and_normalize, normalize, preset_for_backbone
 import torch
 from abc_minimal.preprocess import parse_norm_stats
+from abc_sim.rendering.replay.renderer import RendererWrapper, WarpReplayRuntime
 
 
 DEFAULT_CHUNKS = (
@@ -32,6 +36,9 @@ DEFAULT_CHUNKS = (
     "episode_5d3515a9-3f0d-4275-a5bd-1daa9db9c78a:1076",
 )
 CELLS = ("old_on_old", "new_on_old", "old_on_new", "new_on_new")
+VIDEO_OPTIONS = dict(codec="libx264rgb", pixelformat="rgb24", quality=None,
+                     macro_block_size=1,
+                     output_params=["-crf", "0", "-preset", "fast", "-threads", "1"])
 JOINT_NAMES = [f"{side}_{'gripper' if j == 6 else 'j'+str(j+1)}"
                for side in ("left", "right") for j in range(7)]
 
@@ -97,7 +104,48 @@ def checkpoint_metadata(path):
     return dict(train=saved["train_config"], stats=parse_norm_stats(saved["norm_stats"]))
 
 
-def export_chunk(row, source_index, metadata, source, output):
+class JointRenderer:
+    """Replay saved XML-base joints through FK; no IK or dynamics stepping."""
+
+    def __init__(self, gpu_id):
+        xml = Path(__file__).resolve().parents[1] / "abc_sim/models/yam_dishrack_base.xml"
+        self.model = mujoco.MjModel.from_xml_path(str(xml))
+        self.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        data = mujoco.MjData(self.model)
+        mujoco.mj_resetDataKeyframe(self.model, data, self.model.key("home").id)
+        mujoco.mj_forward(self.model, data)
+        self.home = data.qpos.copy()
+        self.maps = []
+        for side in ("left", "right"):
+            joints = [int(self.model.joint(f"{side}_joint{i}").qposadr[0]) for i in range(1, 7)]
+            driver, follower = [self.model.joint(f"{side}_{finger}_finger") for finger in ("left", "right")]
+            eq = np.flatnonzero((self.model.eq_type == mujoco.mjtEq.mjEQ_JOINT)
+                                & (self.model.eq_obj1id == driver.id)
+                                & (self.model.eq_obj2id == follower.id)).item()
+            constant, ratio = self.model.eq_data[eq, :2]
+            self.maps.append((joints, int(driver.qposadr[0]), int(follower.qposadr[0]), constant, ratio))
+        self.runtime = WarpReplayRuntime(self.model, data, nworld=4, gpu_id=gpu_id,
+                                         nconmax=32, njmax=128)
+        self.runtime.refresh_geom_poses()
+        self.renderer = RendererWrapper(backend="mjwarp", runtime=self.runtime,
+                                         cam_res=(640, 480), camera_names=("top",), gpu_id=gpu_id)
+
+    def render(self, values):
+        qpos = np.tile(self.home, (4, 1))
+        for arm, (joints, driver, follower, constant, ratio) in enumerate(self.maps):
+            qpos[:, joints] = values[:, arm*7:arm*7+6]
+            qpos[:, driver] = .0475 * values[:, arm*7+6]
+            qpos[:, follower] = (qpos[:, driver] - constant) / ratio
+        self.runtime.load_qpos_batch(qpos)
+        self.runtime.forward()
+        return self.renderer.render_numpy(actual_batch=4)[:, 0]
+
+    def close(self):
+        self.renderer.close()
+        self.runtime.close()
+
+
+def export_chunk(row, source_index, metadata, source, renderer, output):
     first, count = row["source_frame"], row["chunk_length"]
     folder = output / f"{row['source_episode']}_frames_{first}_{first+count-1}"
     folder.mkdir()
@@ -145,6 +193,30 @@ def export_chunk(row, source_index, metadata, source, output):
         a, b = native["old"][cam].numpy(), native["new"][cam].numpy()
         image_differences[cam] = dict(exact_equal=bool(np.array_equal(a, b)),
                                      mean_abs_normalized_difference=float(np.abs(a-b).mean()))
+    print(f"Exporting {row['source_episode']} frames {first}-{first+count-1}...", flush=True)
+    # Frame 0 uses the exact same decoded tensors saved above; the remaining
+    # frames follow the same training decoder and original source-frame map.
+    with imageio.get_writer(str(folder / "comparison.mp4"), fps=30, **VIDEO_OPTIONS) as video:
+        for frame in range(count):
+            if frame:
+                panels = []
+                for side in ("old", "new"):
+                    _, _, previews = decode_side(row, side, metadata[side], frame)
+                    panels.extend((f"{side} / {cam} / source frame {first+frame}", previews[cam])
+                                  for cam in cameras)
+            image_grid = panel_grid(panels, len(cameras))
+            images = renderer.render(np.stack([arrays[key][frame] for key in keys]))
+            joint_grid = panel_grid([(f"{key} / XML FK / source frame {first+frame}", image)
+                                     for key, image in zip(keys, images)], 2)
+            # Stack without resizing either section: original panel pixels stay intact.
+            width = max(image_grid.shape[1], joint_grid.shape[1])
+            canvas = Image.new("RGB", (width, image_grid.shape[0]+joint_grid.shape[0]), "#202020")
+            canvas.paste(Image.fromarray(image_grid), ((width-image_grid.shape[1])//2, 0))
+            canvas.paste(Image.fromarray(joint_grid),
+                         ((width-joint_grid.shape[1])//2, image_grid.shape[0]))
+            video.append_data(np.asarray(canvas))
+            if frame == 0:
+                canvas.save(folder / "comparison_preview.png")
     np.savez(folder / "data.npz", **arrays)
     with np.load(source / "screen_draws.npz", allow_pickle=False) as archive:
         losses = {cell: float(archive[cell][source_index, 0].mean()) for cell in CELLS}
@@ -154,11 +226,16 @@ def export_chunk(row, source_index, metadata, source, output):
         differences[stream] = dict(max_joint_difference_rad=float(np.abs(delta[:, [*range(6), *range(7,13)]]).max()),
                                    max_gripper_difference=float(np.abs(delta[:, [6,13]]).max()))
     report = dict(chunk=row, data_sources=information, single_draw_losses=losses,
+                  video_frames=count, video_fps=30,
+                  videos=["comparison.mp4"],
+                  video_layout="Top: old/new camera rows; bottom: old/new state row, old/new action row",
                   gap=losses["new_on_new"]-losses["old_on_old"],
                   image_differences=image_differences, data_differences=differences,
-                  notes=["Images use the native training decoder and clean preprocessing; PNG encoding is lossless.",
+                  notes=["Images use the native training decoder and clean preprocessing; video RGB encoding is lossless.",
                          "data.npz preserves exact normalized image tensors, original joints and normalized joints.",
                          "Policy conditions use only the first image/state; full 30-frame data is provided for context.",
+                         "The bottom panels replay saved joints in the fixed XML-base scene, not model predictions.",
+                         "Replay objects are not reconstructed; compare task motion in the recorded image video.",
                          "No joint clipping, IK recomputation, policy generation or physics stepping."])
     save_json(folder / "report.json", report)
     print(json.dumps(dict(output=str(folder), losses=losses, image_differences=image_differences,
@@ -170,6 +247,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--loss-run", type=Path, required=True)
     parser.add_argument("--chunks", nargs="+", default=list(DEFAULT_CHUNKS), help="Original episode:start_frame")
+    parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if (args.output / "manifest.json").exists():
@@ -186,9 +264,13 @@ def main():
         selections.append(matches[0])
     metadata = {side: checkpoint_metadata(Path(source[f"{side}_checkpoint"])) for side in ("old", "new")}
     args.output.mkdir(parents=True, exist_ok=True)
-    print("Exporting saved images and state/action curves...", flush=True)
-    folders = [export_chunk(row, index, metadata, args.loss_run, args.output)
-               for index, row in selections]
+    print("Exporting complete chunks: recorded images and saved-joint FK replay...", flush=True)
+    renderer = JointRenderer(args.gpu_id)
+    try:
+        folders = [export_chunk(row, index, metadata, args.loss_run, renderer, args.output)
+                   for index, row in selections]
+    finally:
+        renderer.close()
     save_json(args.output / "manifest.json", dict(status="complete", loss_run=str(args.loss_run), chunks=folders))
 
 
