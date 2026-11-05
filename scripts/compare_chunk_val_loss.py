@@ -1,7 +1,7 @@
 """Compare old/new policies on both processed datasets, paired by original frames.
 
-Uses the official clean, unprefixed validation objective. Screening and paired
-confirmation use independent noise/time draws. No training updates or rollouts.
+Uses the official clean, unprefixed validation objective with one fixed noise/time
+draw per chunk by default. No confirmation, training updates or rollouts.
 Primary selection compares each model on its own data; cross-evaluations are diagnostic.
 """
 import os
@@ -14,7 +14,6 @@ import argparse
 import csv
 import gc
 import json
-import math
 import time
 from dataclasses import asdict
 from functools import partial
@@ -24,7 +23,6 @@ if __name__ == "__main__":
     print("compare_chunk_val_loss: importing dependencies...", flush=True)
 
 import numpy as np
-from scipy.stats import t as student_t
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -270,7 +268,7 @@ def evaluate(models, embedder, datasets, locations, args, phase, draws):
         count += len(identifiers)
         elapsed = time.perf_counter() - started
         remaining = elapsed / count * (len(samples) - count)
-        print(f"{'screen' if phase == 0 else 'confirm'}: {count}/{len(samples)} chunks; "
+        print(f"screen: {count}/{len(samples)} chunks; "
               f"elapsed={elapsed:.1f}s; estimated_remaining={remaining:.1f}s", flush=True)
     return {cell: np.concatenate(values) for cell, values in collected.items()}
 
@@ -301,37 +299,6 @@ def pick_candidates(rows, count):
     return selected
 
 
-def confirm_rows(locations, losses, min_delta, min_ratio, top_k=5):
-    rows = mean_rows(locations, losses)
-    for index, row in enumerate(rows):
-        for comparison, (old, new) in COMPARISONS.items():
-            difference = (losses[new][index] - losses[old][index]).mean(axis=-1)
-            standard_error = float(difference.std(ddof=1) / math.sqrt(len(difference)))
-            # Independent confirmation; control candidate tests within each comparison.
-            critical = float(student_t.ppf(1 - .05 / len(rows), len(difference) - 1))
-            lower = float(difference.mean()) - critical * standard_error
-            row[f"{comparison}_gap_standard_error"] = standard_error
-            row[f"{comparison}_gap_lower_bound_fwer95"] = lower
-            row[f"{comparison}_new_worse_draw_fraction"] = float((difference > 0).mean())
-            row[f"{comparison}_significantly_worse"] = bool(
-                lower > 0 and row[f"gap_{comparison}"] >= min_delta
-                and row[f"ratio_{comparison}"] >= min_ratio)
-        row["noise_time_draws"] = len(difference)
-        row["significantly_worse"] = row["own_data_significantly_worse"]
-        for cell in CELLS:
-            dimensions = losses[cell][index].mean(axis=0)
-            row[f"{cell}_left_joints_loss"] = float(dimensions[:6].mean())
-            row[f"{cell}_right_joints_loss"] = float(dimensions[7:13].mean())
-            row[f"{cell}_grippers_loss"] = float(dimensions[[6, 13]].mean())
-    rows.sort(key=lambda row: -row["gap_own_data"])
-    qualified = 0
-    for rank, row in enumerate(rows, 1):
-        row["primary_rank"] = rank
-        qualified += int(row["significantly_worse"])
-        row["is_top_chunk"] = bool(row["significantly_worse"] and qualified <= top_k)
-    return rows
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--old-checkpoint", type=Path,
@@ -340,16 +307,12 @@ def main():
                         default=SERVER / "output/dit_xml_default_real_ik_raw_sim_20261103_112255/100000.pt")
     parser.add_argument("--old-cache-root", type=Path, help="Defaults to the old checkpoint's training cache_root")
     parser.add_argument("--new-cache-root", type=Path, help="Defaults to the new checkpoint's training cache_root")
-    parser.add_argument("--screen-from", type=Path, help="Reuse screening from an existing output directory; only run confirmation")
+    parser.add_argument("--screen-from", type=Path, help="Reuse screening from an existing output directory with matching settings")
     parser.add_argument("--splits", nargs="+", choices=("train_real", "train_sim", "val_real", "val_sim"),
                         default=["train_real"])
     parser.add_argument("--chunks-per-split", type=int, default=1024)
-    parser.add_argument("--screen-draws", type=int, default=4)
-    parser.add_argument("--confirm-draws", type=int, default=32)
-    parser.add_argument("--candidates", type=int, default=20)
+    parser.add_argument("--screen-draws", type=int, default=1)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--min-delta", type=float, default=.005)
-    parser.add_argument("--min-ratio", type=float, default=1.5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=123)
@@ -358,12 +321,10 @@ def main():
     args = parser.parse_args()
     started = time.perf_counter()
     print(f"start: pid={os.getpid()} splits={args.splits} seed={args.seed} output={args.output}", flush=True)
-    if min(args.chunks_per_split, args.screen_draws, args.candidates, args.top_k, args.batch_size) < 1:
-        parser.error("chunk/draw/candidate/batch counts must be positive")
-    if args.confirm_draws < 2 or args.num_workers < 0 or args.seed < 0:
-        parser.error("confirmation requires >=2 draws; workers and seed must be nonnegative")
-    if args.min_delta < 0 or args.min_ratio < 1:
-        parser.error("min-delta must be nonnegative and min-ratio must be >=1")
+    if min(args.chunks_per_split, args.screen_draws, args.top_k, args.batch_size) < 1:
+        parser.error("chunk/draw/batch counts must be positive")
+    if args.num_workers < 0 or args.seed < 0:
+        parser.error("workers and seed must be nonnegative")
     if (args.output / "input.json").exists():
         parser.error("Use a new output directory")
     if not 0 <= args.gpu_id < torch.cuda.device_count():
@@ -421,54 +382,41 @@ def main():
         coverage=coverage,
         screen_from=str(args.screen_from.resolve()) if args.screen_from else None,
         splits=args.splits, seed=args.seed, normalization_verified_equal=True,
-        screen_draws=args.screen_draws, confirm_draws=args.confirm_draws,
-        min_delta=args.min_delta, min_ratio=args.min_ratio,
+        screen_draws=args.screen_draws,
         objective="Official validation flow-matching MSE; clean images/state; no prefix",
         old_dino_bf16=metadata["old"]["train"].get("dino_bf16", True),
         new_dino_bf16=metadata["new"]["train"].get("dino_bf16", True)))
     save_json(args.output / "sampled_chunks.json", locations)
     print(json.dumps(dict(paired_chunks=len(locations), coverage=coverage,
                           cache_roots={side: str(root) for side, root in roots.items()}), indent=2), flush=True)
-    models = {}
-    for side in ("old", "new"):
-        print(f"model: loading {side} weights onto {args.device}...", flush=True)
-        model = DiTPolicy(architectures[side])
-        load_pretrained(model, getattr(args, f"{side}_checkpoint"))
-        model.img_backbone.set_bfloat16(metadata[side]["train"].get("dino_bf16", True))
-        models[side] = model.to(args.device).eval()
-        gc.collect()
-        print(f"model: {side} ready", flush=True)
-    print("text encoder: loading CLIP...", flush=True)
-    embedder = CLIPTextEmbedder(ClipConfig(**saved.get("clip", {})), device=args.device)
     if screened is None:
+        models = {}
+        for side in ("old", "new"):
+            print(f"model: loading {side} weights onto {args.device}...", flush=True)
+            model = DiTPolicy(architectures[side])
+            load_pretrained(model, getattr(args, f"{side}_checkpoint"))
+            model.img_backbone.set_bfloat16(metadata[side]["train"].get("dino_bf16", True))
+            models[side] = model.to(args.device).eval()
+            gc.collect()
+            print(f"model: {side} ready", flush=True)
+        print("text encoder: loading CLIP...", flush=True)
+        embedder = CLIPTextEmbedder(ClipConfig(**saved.get("clip", {})), device=args.device)
         print("screen: starting paired evaluation...", flush=True)
         screened = evaluate(models, embedder, datasets, locations, args, phase=0, draws=args.screen_draws)
     rows = mean_rows(locations, screened)
-    save_csv(args.output / "screen_chunks.csv", rows)
     np.savez_compressed(args.output / "screen_draws.npz", **screened)
-    candidates = pick_candidates(rows, args.candidates)
-    by_id = {row["sample_id"]: row for row in locations}
-    selected_locations = [by_id[row["sample_id"]] for row in candidates]
-    confirmed_rows = []
-    if selected_locations:
-        confirmed = evaluate(models, embedder, datasets, selected_locations, args,
-                             phase=1, draws=args.confirm_draws)
-        confirmed_rows = confirm_rows(selected_locations, confirmed, args.min_delta, args.min_ratio, args.top_k)
-        save_csv(args.output / "confirmed_chunks.csv", confirmed_rows)
-        np.savez_compressed(args.output / "confirmation_draws.npz", **confirmed,
-                            sample_ids=[row["sample_id"] for row in selected_locations])
-    worse = [row for row in confirmed_rows if row["significantly_worse"]]
-    summary = dict(status="found" if worse else "no_confirmed_large_gap", sampled_chunks=len(locations),
+    top = pick_candidates(rows, args.top_k)
+    selected = {row["sample_id"] for row in top}
+    rows.sort(key=lambda row: -row["gap_own_data"])
+    for rank, row in enumerate(rows, 1):
+        row["primary_rank"] = rank
+        row["is_top_chunk"] = row["sample_id"] in selected
+    save_csv(args.output / "screen_chunks.csv", rows)
+    summary = dict(status="found" if top else "no_positive_gap", sampled_chunks=len(locations),
                    primary_comparison="own_data",
                    screen_from=str(args.screen_from.resolve()) if args.screen_from else None,
-                   confirmed_candidates=len(confirmed_rows), significantly_worse_chunks=len(worse),
-                   top_chunks=worse[:args.top_k], largest_confirmed_gaps=confirmed_rows[:args.top_k],
-                   comparisons={comparison: dict(
-                       significantly_worse_chunks=sum(row[f"{comparison}_significantly_worse"] for row in confirmed_rows),
-                       top_chunks=sorted(
-                           [row for row in confirmed_rows if row[f"{comparison}_significantly_worse"]],
-                           key=lambda row: -row[f"gap_{comparison}"])[:args.top_k])
-                       for comparison in COMPARISONS},
+                   screen_draws=args.screen_draws, positive_gap_chunks=sum(row["gap_own_data"] > 0 for row in rows),
+                   top_chunks=top,
                    screen_mean_losses={split: {
                        cell: float(screened[cell][[i for i, row in enumerate(locations) if row["split"] == split]].mean())
                        for cell in CELLS} for split in datasets["new"]},
@@ -480,20 +428,18 @@ def main():
                           "on_old_data/on_new_data compare weights on fixed inputs and labels; own_data also changes preprocessing.",
                           "Training splits use clean validation transforms; this is not held-out validation.",
                           "Each candidate comes from a different source episode.",
-                          "Confirmation uses new draws; paired-t bounds have Bonferroni correction across candidates within each comparison.",
-                          "Significance concerns noise/time draws for each fixed chunk, not dataset-level generalization."])
+                          "Default: one fixed noise/time draw per chunk; no confirmation or significance filtering."])
     save_json(args.output / "summary.json", summary)
     print(json.dumps(dict(
         status=summary["status"], sampled_chunks=len(locations),
-        confirmed_candidates=len(confirmed_rows), seconds=summary["seconds"],
+        screen_draws=args.screen_draws, seconds=summary["seconds"],
         screen_mean_losses=summary["screen_mean_losses"],
         primary_comparison="new_on_new vs old_on_old",
         top_chunks=[{key: row[key] for key in (
             "split", "source_episode", "source_frame", "source_frame_last",
             "old_on_old_loss", "new_on_new_loss", "gap_own_data", "ratio_own_data",
-            "own_data_gap_lower_bound_fwer95", "own_data_new_worse_draw_fraction",
             "old_on_new_loss", "new_on_old_loss", "gap_on_old_data", "gap_on_new_data")}
-            for row in worse[:args.top_k]],
+            for row in top],
         summary=str(args.output / "summary.json")), indent=2), flush=True)
 
 
