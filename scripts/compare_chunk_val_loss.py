@@ -20,6 +20,9 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 
+if __name__ == "__main__":
+    print("compare_chunk_val_loss: importing dependencies...", flush=True)
+
 import numpy as np
 from scipy.stats import t as student_t
 import torch
@@ -111,7 +114,10 @@ def sample_locations(datasets, per_split, seed):
     locations, coverage = [], {}
     for split_number, split in enumerate(datasets["new"]):
         old, new = (datasets[side][split] for side in ("old", "new"))
-        sources = {side: source_spans(dataset) for side, dataset in (("old", old), ("new", new))}
+        sources = {}
+        for side, dataset in (("old", old), ("new", new)):
+            print(f"pair: reading {side}/{split} source-frame metadata...", flush=True)
+            sources[side] = source_spans(dataset)
         intervals = []
         for origin in sorted(sources["old"].keys() & sources["new"].keys()):
             old_spans, new_spans = sources["old"][origin], sources["new"][origin]
@@ -294,7 +300,7 @@ def main():
     parser.add_argument("--old-cache-root", type=Path, help="Defaults to the old checkpoint's training cache_root")
     parser.add_argument("--new-cache-root", type=Path, help="Defaults to the new checkpoint's training cache_root")
     parser.add_argument("--splits", nargs="+", choices=("train_real", "train_sim", "val_real", "val_sim"),
-                        default=["train_real", "train_sim"])
+                        default=["train_real"])
     parser.add_argument("--chunks-per-split", type=int, default=1024)
     parser.add_argument("--screen-draws", type=int, default=4)
     parser.add_argument("--confirm-draws", type=int, default=32)
@@ -308,6 +314,8 @@ def main():
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    started = time.perf_counter()
+    print(f"start: pid={os.getpid()} splits={args.splits} seed={args.seed} output={args.output}", flush=True)
     if min(args.chunks_per_split, args.screen_draws, args.candidates, args.top_k, args.batch_size) < 1:
         parser.error("chunk/draw/candidate/batch counts must be positive")
     if args.confirm_draws < 2 or args.num_workers < 0 or args.seed < 0:
@@ -321,7 +329,12 @@ def main():
     configure_determinism(args.seed)
     torch.cuda.set_device(args.gpu_id)
     args.device = torch.device(f"cuda:{args.gpu_id}")
-    metadata = {side: checkpoint_metadata(getattr(args, f"{side}_checkpoint")) for side in ("old", "new")}
+    metadata = {}
+    for side in ("old", "new"):
+        path = getattr(args, f"{side}_checkpoint")
+        print(f"metadata: reading {side} checkpoint {path}...", flush=True)
+        metadata[side] = checkpoint_metadata(path)
+        print(f"metadata: {side} step={metadata[side]['step']} ready", flush=True)
     if metadata["old"]["step"] != metadata["new"]["step"]:
         raise ValueError("Compare checkpoints at the same training step")
     architectures = {side: DiTConfig(**row["train"]["model"]) for side, row in metadata.items()}
@@ -346,10 +359,13 @@ def main():
         datasets[side] = {}
         for split in dict.fromkeys(args.splits):
             task = ("sim_" if split.endswith("sim") else "") + "load_the_plates_into_the_dish_rack"
+            print(f"dataset: scanning {side}/{split} at {roots[side] / split}...", flush=True)
             datasets[side][split] = EpisodeDataset(
                 roots[side] / split, metadata[side]["stats"], train=False,
                 default_task_name=task, mask_state_ratio=0., model_config=architecture,
                 prompt_config=prompt, operator_label_maps=labels)
+            dataset = datasets[side][split]
+            print(f"dataset: {side}/{split} episodes={len(dataset.episodes)} chunks={len(dataset)}", flush=True)
     if ClipConfig(**metadata["old"]["train"].get("clip", {})).model_name != ClipConfig(**saved.get("clip", {})).model_name:
         raise ValueError("Different CLIP text models: cannot share the text embedder")
     locations, coverage = sample_locations(datasets, args.chunks_per_split, args.seed)
@@ -369,15 +385,18 @@ def main():
     save_json(args.output / "sampled_chunks.json", locations)
     print(json.dumps(dict(paired_chunks=len(locations), coverage=coverage,
                           cache_roots={side: str(root) for side, root in roots.items()}), indent=2), flush=True)
-    started = time.perf_counter()
     models = {}
     for side in ("old", "new"):
+        print(f"model: loading {side} weights onto {args.device}...", flush=True)
         model = DiTPolicy(architectures[side])
         load_pretrained(model, getattr(args, f"{side}_checkpoint"))
         model.img_backbone.set_bfloat16(metadata[side]["train"].get("dino_bf16", True))
         models[side] = model.to(args.device).eval()
         gc.collect()
+        print(f"model: {side} ready", flush=True)
+    print("text encoder: loading CLIP...", flush=True)
     embedder = CLIPTextEmbedder(ClipConfig(**saved.get("clip", {})), device=args.device)
+    print("screen: starting paired evaluation...", flush=True)
     screened = evaluate(models, embedder, datasets, locations, args, phase=0, draws=args.screen_draws)
     rows = mean_rows(locations, screened)
     save_csv(args.output / "screen_chunks.csv", rows)
