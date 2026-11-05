@@ -69,6 +69,47 @@ def checkpoint_metadata(path):
                 stats=parse_norm_stats(checkpoint["norm_stats"]))
 
 
+def reuse_screen(directory, locations, args, metadata, roots):
+    saved = json.loads((directory / "input.json").read_text())
+    for key in ("seed", "screen_draws"):
+        if saved[key] != getattr(args, key):
+            raise ValueError(f"Cached screening {key} differs from the current setting")
+    for side in ("old", "new"):
+        if Path(saved[f"{side}_checkpoint"]).resolve() != getattr(args, f"{side}_checkpoint").resolve():
+            raise ValueError(f"Cached screening uses a different {side} checkpoint")
+        if (saved["step"] != metadata[side]["step"]
+                or Path(saved["cache_roots"][side]).resolve() != roots[side]
+                or saved[f"{side}_dino_bf16"] != metadata[side]["train"].get("dino_bf16", True)):
+            raise ValueError(f"Cached screening has different {side} data/model settings")
+    previous = json.loads((directory / "sampled_chunks.json").read_text())
+    key = lambda row: (row["split"], row["source_episode"], row["source_frame"])
+    lookup = {key(row): index for index, row in enumerate(previous)}
+    if len(lookup) != len(previous):
+        raise ValueError("Cached screening contains duplicate source chunks")
+    indices = []
+    for row in locations:
+        index = lookup.get(key(row))
+        if index is None:
+            raise ValueError("Requested chunks differ from cached screening; keep its seed and sample count")
+        original = previous[index]
+        for name in ("old_episode", "new_episode", "old_frame", "new_frame",
+                     "old_dataset_index", "new_dataset_index", "chunk_length"):
+            if row[name] != original[name]:
+                raise ValueError(f"Cached source-frame mapping changed: {key(row)}, {name}")
+        # Preserve the original per-chunk RNG identity when filtering splits.
+        row["sample_id"] = original["sample_id"]
+        indices.append(index)
+    with np.load(directory / "screen_draws.npz", allow_pickle=False) as archive:
+        losses = {}
+        for cell in CELLS:
+            values = archive[cell]
+            if values.shape != (len(previous), args.screen_draws, 14) or not np.isfinite(values).all():
+                raise ValueError(f"Invalid cached screening losses: {cell}")
+            losses[cell] = values[indices]
+    print(f"screen: reusing {len(locations)} chunks from {directory}; no screening forwards", flush=True)
+    return losses
+
+
 class ChunkSamples(Dataset):
     def __init__(self, datasets, locations):
         self.datasets = datasets
@@ -299,6 +340,7 @@ def main():
                         default=SERVER / "output/dit_xml_default_real_ik_raw_sim_20261103_112255/100000.pt")
     parser.add_argument("--old-cache-root", type=Path, help="Defaults to the old checkpoint's training cache_root")
     parser.add_argument("--new-cache-root", type=Path, help="Defaults to the new checkpoint's training cache_root")
+    parser.add_argument("--screen-from", type=Path, help="Reuse screening from an existing output directory; only run confirmation")
     parser.add_argument("--splits", nargs="+", choices=("train_real", "train_sim", "val_real", "val_sim"),
                         default=["train_real"])
     parser.add_argument("--chunks-per-split", type=int, default=1024)
@@ -369,6 +411,7 @@ def main():
     if ClipConfig(**metadata["old"]["train"].get("clip", {})).model_name != ClipConfig(**saved.get("clip", {})).model_name:
         raise ValueError("Different CLIP text models: cannot share the text embedder")
     locations, coverage = sample_locations(datasets, args.chunks_per_split, args.seed)
+    screened = reuse_screen(args.screen_from, locations, args, metadata, roots) if args.screen_from else None
     args.output.mkdir(parents=True, exist_ok=True)
     save_json(args.output / "input.json", dict(
         old_checkpoint=str(args.old_checkpoint), new_checkpoint=str(args.new_checkpoint),
@@ -376,6 +419,7 @@ def main():
         pairing="Same source episode and original frame range; each model uses its own processed data",
         primary_comparison="new_on_new loss minus old_on_old loss; cross-evaluations are diagnostic only",
         coverage=coverage,
+        screen_from=str(args.screen_from.resolve()) if args.screen_from else None,
         splits=args.splits, seed=args.seed, normalization_verified_equal=True,
         screen_draws=args.screen_draws, confirm_draws=args.confirm_draws,
         min_delta=args.min_delta, min_ratio=args.min_ratio,
@@ -396,13 +440,15 @@ def main():
         print(f"model: {side} ready", flush=True)
     print("text encoder: loading CLIP...", flush=True)
     embedder = CLIPTextEmbedder(ClipConfig(**saved.get("clip", {})), device=args.device)
-    print("screen: starting paired evaluation...", flush=True)
-    screened = evaluate(models, embedder, datasets, locations, args, phase=0, draws=args.screen_draws)
+    if screened is None:
+        print("screen: starting paired evaluation...", flush=True)
+        screened = evaluate(models, embedder, datasets, locations, args, phase=0, draws=args.screen_draws)
     rows = mean_rows(locations, screened)
     save_csv(args.output / "screen_chunks.csv", rows)
     np.savez_compressed(args.output / "screen_draws.npz", **screened)
     candidates = pick_candidates(rows, args.candidates)
-    selected_locations = [locations[row["sample_id"]] for row in candidates]
+    by_id = {row["sample_id"]: row for row in locations}
+    selected_locations = [by_id[row["sample_id"]] for row in candidates]
     confirmed_rows = []
     if selected_locations:
         confirmed = evaluate(models, embedder, datasets, selected_locations, args,
@@ -414,6 +460,7 @@ def main():
     worse = [row for row in confirmed_rows if row["significantly_worse"]]
     summary = dict(status="found" if worse else "no_confirmed_large_gap", sampled_chunks=len(locations),
                    primary_comparison="own_data",
+                   screen_from=str(args.screen_from.resolve()) if args.screen_from else None,
                    confirmed_candidates=len(confirmed_rows), significantly_worse_chunks=len(worse),
                    top_chunks=worse[:args.top_k], largest_confirmed_gaps=confirmed_rows[:args.top_k],
                    comparisons={comparison: dict(
