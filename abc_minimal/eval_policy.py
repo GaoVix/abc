@@ -394,6 +394,7 @@ def _make_env(config: SimEvalConfig, camera_keys: tuple[str, ...]) -> SimTaskEnv
         camera_backend=config.camera_backend,
         gpu_id=config.gpu_id,
         disable_arm_control_limits=config.disable_arm_control_limits,
+        disable_all_arm_limits=config.disable_all_arm_limits,
     )
 
 
@@ -555,7 +556,13 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     else:
         env = _make_env(config, tuple(model_config.camera_keys))
         rollout = rollout_worlds
-    if config.disable_arm_control_limits:
+    if config.disable_all_arm_limits:
+        print(
+            "[control] arm PD target, physical joint, actuator force and joint "
+            "actuator force limits disabled; gripper limits retained",
+            flush=True,
+        )
+    elif config.disable_arm_control_limits:
         print(
             "[control] arm actuator target clamping disabled; "
             "XML physical joint limits and actuator force limits retained",

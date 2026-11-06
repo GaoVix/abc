@@ -286,6 +286,7 @@ class SimEvalConfig:
     render_policy_cameras_only: bool = False  # Parallel eval: skip cameras absent from model.camera_keys.
     randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
     disable_arm_control_limits: bool = False  # Eval ablation: allow raw arm PD targets beyond XML ctrlrange.
+    disable_all_arm_limits: bool = False  # Also disable physical arm joint limits and actuator/joint force limits; keep grippers unchanged.
     compensate_arm_bases: bool = False
     # Testing-time compensation IK only; independent of training/data conversion.
     base_compensation_ik: Literal["pink", "pink-debug", "mink", "slsqp"] = "pink"

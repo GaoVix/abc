@@ -53,6 +53,7 @@ def make_batched_env(config: SimEvalConfig, camera_keys: tuple[str, ...]) -> Bat
         camera_gpu_id=config.gpu_id,
         render_camera_names=camera_keys if config.render_policy_cameras_only else None,
         disable_arm_control_limits=config.disable_arm_control_limits,
+        disable_all_arm_limits=config.disable_all_arm_limits,
     )
 
 

@@ -47,6 +47,7 @@ class SimTaskEnv:
         camera_backend: str = "mjwarp",
         gpu_id: int | None = None,
         disable_arm_control_limits: bool = False,
+        disable_all_arm_limits: bool = False,
     ):
         self.spec = task_spec(task)
         self.height = height
@@ -75,6 +76,7 @@ class SimTaskEnv:
             camera_height=self.render_height,
             camera_width=self.render_width,
             disable_arm_control_limits=disable_arm_control_limits,
+            disable_all_arm_limits=disable_all_arm_limits,
         )
         print(
             f"camera rendering: {self.render_width}x{self.render_height} "
