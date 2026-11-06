@@ -297,6 +297,13 @@ def validate_rtc_config(config: SimEvalConfig) -> list[str]:
 
 
 def validate_batched_config(config: SimEvalConfig) -> list[str]:
+    if config.world_indices is not None:
+        if not config.world_indices or len(set(config.world_indices)) != len(config.world_indices):
+            return ["world_indices must be nonempty and contain no duplicates"]
+        if any(index < 0 or index >= config.num_worlds for index in config.world_indices):
+            return ["world_indices must be original indices in [0, num_worlds)"]
+        if config.parallel_worlds:
+            return ["world_indices requires --parallel-worlds 0"]
     if config.parallel_worlds < 0:
         return ["parallel_worlds must be >= 0"]
     if config.parallel_worlds == 0:
@@ -597,7 +604,8 @@ def rollout_worlds(
         return generator.standard_normal(action_shape, dtype=np.float32)
 
     try:
-        for world_index in range(config.num_worlds):
+        indices = config.world_indices if config.world_indices is not None else range(config.num_worlds)
+        for world_index in indices:
             # Match batched eval: previous episodes must not affect this
             # world's initial arm pose or diffusion-noise stream.
             rng = np.random.default_rng([config.policy_seed, world_index])

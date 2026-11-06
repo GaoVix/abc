@@ -19,6 +19,7 @@ PROTOCOL_KEYS = (
     "rtc_prefix_length", "rtc_inference_lead_steps", "camera_backend",
     "camera_height", "camera_width", "parallel_worlds", "fast_inference",
     "deterministic_inference", "vanilla_physics", "norm_stats_path",
+    "disable_arm_control_limits",
 )
 
 
@@ -38,6 +39,7 @@ def read_runs(root, side, step, policy_seed):
                 or config.get("fast_inference") is not False
                 or config.get("parallel_worlds") != 0
                 or config.get("compensate_arm_bases") is not False
+                or config.get("disable_arm_control_limits", False)
                 or request.get("randomize_arm_bases") is not False
                 or request.get("arm_base_source") != "xml"
                 or request.get("arm_collision_mode") != "eef_only"
@@ -52,6 +54,7 @@ def read_runs(root, side, step, policy_seed):
         if len(keyed) != len(worlds):
             raise ValueError(f"Duplicate world records: {path}")
         protocol = {key: config.get(key) for key in PROTOCOL_KEYS}
+        protocol["disable_arm_control_limits"] = False
         protocol.update(randomization=request, prompt=data.get("prompt"),
                         physics=data["resolved_physics"])
         runs.append(dict(summary=str(path), checkpoint=str(checkpoint),
@@ -96,10 +99,12 @@ def find_cases(old_runs, new_runs):
     return cases, rejected_scenes
 
 
-def build_report(root, step=100000, policy_seed=None):
+def build_report(root, step=100000, policy_seed=None, world_index=None):
     old = read_runs(root, "old", step, policy_seed)
     new = read_runs(root, "new", step, policy_seed)
     cases, rejected = find_cases(old, new)
+    if world_index is not None:
+        cases = [case for case in cases if case["world_index"] == world_index]
     report = dict(status="found" if cases else "no_matching_pair",
                   eligible_runs=dict(old=len(old), new=len(new)),
                   matching_pairs=len(cases), rejected_scene_mismatches=rejected,
@@ -127,11 +132,12 @@ def main():
                         default=Path("/mnt/afs/L202500703/abc_storage/output"))
     parser.add_argument("--step", type=int, default=100000)
     parser.add_argument("--policy-seed", type=int)
+    parser.add_argument("--world-index", type=int, help="Restrict selection to this original world index")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if not args.root.is_dir():
         parser.error(f"Results directory not found: {args.root}")
-    report = build_report(args.root, args.step, args.policy_seed)
+    report = build_report(args.root, args.step, args.policy_seed, args.world_index)
     output = args.output or args.root / "xml_old_success_new_failure" / "selection.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2))
