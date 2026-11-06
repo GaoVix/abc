@@ -1,4 +1,4 @@
-"""Export real model predictions, then render full paired chunk overlays.
+"""Render XML-base joint replays with calibrated original-data reference arms.
 
 `--export-only` runs where the fine-tuned checkpoints/caches are available. Its
 small portable bundle can be copied to a machine with the original MCAP, then
@@ -11,10 +11,12 @@ for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
     os.environ.setdefault(variable, '1')
 
 import argparse
+import copy
 from dataclasses import asdict
 import gzip
 import json
 from pathlib import Path
+import subprocess
 import zipfile
 
 import numpy as np
@@ -24,10 +26,76 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHUNK = 'episode_298becaa-b397-4766-9c80-6fb74e182f4b:1336'
 CELLS = ('old_on_old', 'new_on_old', 'old_on_new', 'new_on_new')
 JOINT_COLUMNS = [*range(6), *range(7, 13)]
+SEVEN_CASES = (
+    ('compare_chunk_loss_20261105_125057', 'episode_298becaa-b397-4766-9c80-6fb74e182f4b', 1336),
+    ('compare_chunk_loss_20261105_125057', 'episode_5d3515a9-3f0d-4275-a5bd-1daa9db9c78a', 1076),
+    ('compare_real_10000_seed124_20261105_140707', 'episode_18c1a663-4a50-4de8-838f-e1e979ba9bfb', 1084),
+    ('compare_real_10000_seed124_20261105_140707', 'episode_f6bc340d-405f-42c4-9a10-8b8e894ae11d', 555),
+    ('compare_real_10000_seed124_20261105_140707', 'episode_7ce30833-d859-41ce-bd54-710e96f66728', 1213),
+    ('compare_real_10000_seed124_20261105_140707', 'episode_6a9bc75b-ad04-443f-b7fa-9fdb67d099cb', 378),
+    ('compare_real_10000_seed124_20261105_140707', 'episode_3bb77850-b887-48de-b79d-996a1381cc09', 3366),
+)
 
 
 def save_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False)+'\n')
+
+
+def seven_cases(args):
+    """Preserve each selected chunk's original loss-run/RNG identity."""
+    output = args.output
+    if (output/'manifest.json').exists():
+        raise ValueError('Use a new output directory')
+    jobs = []
+    for number, (run, episode, first) in enumerate(SEVEN_CASES, start=1):
+        name = f'{number:02d}_{episode}_frames_{first}_{first+29}'
+        job = copy.copy(args)
+        job.output = output/name
+        job.loss_run = args.loss_root/run
+        job.chunk = f'{episode}:{first}'
+        job.bundle = args.bundle_root/name/'bundle.npz' if args.bundle_root else None
+        required = ([job.bundle, job.bundle.with_suffix('.json')] if job.bundle else
+                    [job.loss_run/file for file in ('input.json', 'sampled_chunks.json', 'screen_draws.npz')])
+        for path in required:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        jobs.append(job)
+    if not args.export_only:
+        records = {r['episode']: r for r in json.load(gzip.open(args.calibrations, 'rt'))['records']}
+        for _, episode, _ in SEVEN_CASES:
+            path = args.raw_root/records[episode]['source_relative']
+            if not path.is_file():
+                raise FileNotFoundError(f'Original MCAP required for native-resolution images: {path}')
+    output.mkdir(parents=True, exist_ok=True)
+    manifest = dict(status='running', selected=7, completed=0, cases=[])
+    save_json(output/'manifest.json', manifest)
+    for number, job in enumerate(jobs, start=1):
+        print(f'CASE {number}/7: {job.chunk}', flush=True)
+        try:
+            bundle = job.bundle or export_predictions(job)
+            if not args.export_only:
+                render_bundle(job, bundle)
+            manifest['cases'].append(dict(chunk=job.chunk, loss_run=str(job.loss_run),
+                                          directory=job.output.name,
+                                          bundle=(str(bundle) if args.bundle_root else f'{job.output.name}/bundle.npz'),
+                                          video=None if args.export_only else f'{job.output.name}/comparison.mp4'))
+            manifest['completed'] = number
+            save_json(output/'manifest.json', manifest)
+        except Exception as error:
+            manifest.update(status='failed', failed_case=job.chunk, error=f'{type(error).__name__}: {error}')
+            save_json(output/'manifest.json', manifest)
+            raise
+    manifest['status'] = 'complete'
+    save_json(output/'manifest.json', manifest)
+    archive = output/('seven_chunk_bundles.zip' if args.export_only else 'seven_chunk_videos.zip')
+    with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as zipped:
+        zipped.write(output/'manifest.json', arcname='manifest.json')
+        for job in jobs:
+            names = ('bundle.npz', 'bundle.json') if args.export_only else (
+                'comparison.mp4', 'comparison_preview.png', 'report.json')
+            for name in names:
+                zipped.write(job.output/name, arcname=f'{job.output.name}/{name}')
+    print(f'COMPLETE 7/7: {archive}', flush=True)
 
 
 def export_predictions(args):
@@ -154,21 +222,13 @@ def export_predictions(args):
     return target
 
 
-def inverse_brown(x, y, distortion):
-    k1, k2, p1, p2, k3 = distortion
-    r2 = x*x+y*y
-    radial = 1+r2*(k1+r2*(k2+r2*k3))
-    a, b = x*radial, y*radial
-    return a+2*p1*a*b+p2*(r2+2*a*a), b+2*p2*a*b+p1*(r2+2*b*b)
-
-
 def render_bundle(args, bundle):
     # Imports are delayed so exporting predictions never initializes OpenGL.
     import imageio.v2 as imageio
     import mujoco
     from mcap.reader import make_reader
     from mcap_protobuf.decoder import DecoderFactory
-    from scipy.ndimage import binary_erosion, map_coordinates
+    from scipy.ndimage import binary_erosion
     from scipy.spatial.transform import Rotation
     from abc_minimal.export_mcap import STATE_TOPICS, ACTION_TOPICS, floor_indices
     from scripts.verify_camera_fk_ik import Robot, pose, video_frames
@@ -178,21 +238,20 @@ def render_bundle(args, bundle):
         arrays = {k: saved[k].copy() for k in saved.files}
     row = metadata['chunk']
     count, first = row['chunk_length'], row['source_frame']
+    rendered_cells = ('old_on_old', 'new_on_new')
     for name in ('old_state', 'old_action', 'new_state', 'new_action',
-                 *[f'{c}_prediction' for c in CELLS]):
+                 *[f'{c}_prediction' for c in rendered_cells]):
         if arrays[name].shape != (count, 14) or not np.isfinite(arrays[name]).all():
             raise ValueError(f'Missing/nonfinite data: {name}')
     record = next(r for r in json.load(gzip.open(args.calibrations, 'rt'))['records']
                   if r['episode'] == row['source_episode'])
     calibration = record['calibration']
     intrinsics = calibration['recorded_intrinsics']
-    if intrinsics['distortion_model'] != 'inverse_brown_conrady':
-        raise ValueError('Unsupported recorded camera distortion model')
     path = args.raw_root/record['source_relative']
     top_topic = calibration['camera_topic']
     topics = [top_topic, '/left-wrist-camera', '/right-wrist-camera']
     if top_topic != '/top-camera':
-        raise ValueError('This native-pixel overlay currently requires calibrated monocular top video')
+        raise ValueError('This native-pixel replay currently requires calibrated monocular top video')
     scalars = {t: [] for t, _ in STATE_TOPICS+ACTION_TOPICS}
     camera_clocks = {t: [] for t in topics}
     with path.open('rb') as stream:
@@ -239,45 +298,56 @@ def render_bundle(args, bundle):
         raise ValueError(f'Native cameras have different sizes {sizes}; refusing to resize original images')
     real = Robot(ROOT/'abc_sim/models/yam_bimanual_empty.xml', calibration['base_poses'])
     virtual = Robot(ROOT/'abc_sim/models/yam_dishrack_base.xml')
+    # Robot's calibration helper hides scenery for overlays. Restore the whole
+    # original XML scene here, matching the original saved-joint replay view.
+    original_model = mujoco.MjModel.from_xml_path(str(ROOT/'abc_sim/models/yam_dishrack_base.xml'))
+    virtual.model.geom_group[:] = original_model.geom_group
+    del original_model
+    virtual.options = mujoco.MjvOption()
+    virtual.options.geomgroup[:] = 0
+    virtual.options.geomgroup[:3] = 1
+    virtual.options.sitegroup[:] = 0
+    virtual.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    mujoco.mj_resetDataKeyframe(virtual.model, virtual.data, virtual.model.key('home').id)
     mujoco.mj_forward(real.model, real.data)
     mujoco.mj_forward(virtual.model, virtual.data)
     real_camera_from_world = np.asarray(calibration['left_base_to_camera'])
     world_from_camera = pose(virtual.data.camera('top'))
     world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
     camera_from_world = np.linalg.inv(world_from_camera)
-    for geom in range(virtual.model.ngeom):
-        body = virtual.model.body(int(virtual.model.geom_bodyid[geom])).name
-        if 'camera' in body:
-            virtual.model.geom_group[geom] = 0
+    # The colored reference uses the original real joints and each episode's
+    # calibrated real bases, expressed in the unchanged simulation world.
+    # It must never reuse the processed-data/XML bases.
+    sim_world_from_real_world = world_from_camera@real_camera_from_world
+    reference_bases = {side: sim_world_from_real_world@np.asarray(calibration['base_poses'][side])
+                       for side in ('left', 'right')}
+    reference_robot = Robot(ROOT/'abc_sim/models/yam_bimanual_empty.xml', reference_bases)
+    reference_robot.model.camera('top').fovy[:] = virtual.model.camera('top').fovy
+    reference_robot.model.vis.quality.offsamples = 2
+    for geom in range(reference_robot.model.ngeom):
+        if 'camera' in reference_robot.model.body(int(reference_robot.model.geom_bodyid[geom])).name:
+            reference_robot.model.geom_group[geom] = 0
+    mujoco.mj_forward(reference_robot.model, reference_robot.data)
+    reference_geoms = [[i for i in range(reference_robot.model.ngeom)
+                        if reference_robot.model.body(int(reference_robot.model.geom_bodyid[i])).name.startswith(side+'_')]
+                       for side in ('left', 'right')]
     virtual.model.vis.quality.offsamples = 2
     renderer = mujoco.Renderer(virtual.model, height, width)
-    renderer.enable_segmentation_rendering()
-    k = np.asarray(intrinsics['K']).reshape(3, 3)
-    u, v = np.meshgrid(np.arange(width), np.arange(height))
-    x, y = inverse_brown((u-k[0, 2])/k[0, 0], (v-k[1, 2])/k[1, 1], intrinsics['D'])
+    reference_renderer = mujoco.Renderer(reference_robot.model, height, width)
+    reference_renderer.enable_segmentation_rendering()
     f = height/(2*np.tan(np.deg2rad(float(virtual.model.camera('top').fovy[0]))/2))
-    coordinates = np.array([f*y+(height-1)/2, f*x+(width-1)/2])
-    arm_geoms = [[i for i in range(virtual.model.ngeom)
-                  if virtual.model.body(int(virtual.model.geom_bodyid[i])).name.startswith(s+'_')]
-                 for s in ('left', 'right')]
     colors = [(40, 210, 255), (255, 165, 45)]
     font = ImageFont.truetype('DejaVuSans.ttf', 18)
     small = ImageFont.truetype('DejaVuSans.ttf', 16)
     header, footer, top = 42, 100, 62
     panel_height = header+height+footer
+    camera_row_height = header+height
 
     def pixel(point):
         if point[2] <= 0:
             return None
-        a, b = xx, yy = point[:2]/point[2]
-        # Points outside the source image need numerical error reporting,
-        # but no drawn marker or unstable distortion inversion.
-        if max(abs(xx), abs(yy)) > 1.5:
-            return None
-        for _ in range(20):
-            aa, bb = inverse_brown(a, b, intrinsics['D'])
-            a, b = a+xx-aa, b+yy-bb
-        uv = a*k[0, 0]+k[0, 2], b*k[1, 1]+k[1, 2]
+        x, y = point[:2]/point[2]
+        uv = f*x+(width-1)/2, f*y+(height-1)/2
         return uv if np.isfinite(uv).all() and 0 <= uv[0] < width and 0 <= uv[1] < height else None
 
     def poses(values, robot=virtual):
@@ -285,8 +355,25 @@ def render_bundle(args, bundle):
         transform = camera_from_world if robot is virtual else real_camera_from_world
         return np.array([transform@robot.tcp(arm) for arm in range(2)])
 
+    def reference_masks(values, expected):
+        reference_robot.set_state(values)
+        actual = np.array([camera_from_world@reference_robot.tcp(arm) for arm in range(2)])
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=2e-12)
+        reference_renderer.update_scene(reference_robot.data, camera='top', scene_option=reference_robot.options)
+        for eye in reference_renderer.scene.camera:
+            eye.pos[:] = world_from_camera[:3, 3]
+            eye.forward[:] = world_from_camera[:3, 2]
+            eye.up[:] = -world_from_camera[:3, 1]
+        ids = reference_renderer.render()[..., 0]
+        return [np.isin(ids, geoms) for geoms in reference_geoms]
+
+    def pose_errors(actual, target):
+        return [[float(np.linalg.norm(a[:3, 3]-b[:3, 3])*1000),
+                 float(np.rad2deg(Rotation.from_matrix(a[:3, :3]@b[:3, :3].T).magnitude()))]
+                for a, b in zip(actual, target)]
+
     def make_panel(rgb, title, lines, border=None):
-        result = Image.new('RGB', (width, panel_height), '#151b24')
+        result = Image.new('RGB', (width, panel_height if lines else camera_row_height), '#151b24')
         if rgb is not None:
             result.paste(Image.fromarray(rgb), (0, header))
         draw = ImageDraw.Draw(result)
@@ -297,58 +384,49 @@ def render_bundle(args, bundle):
             draw.rectangle((1, header+1, width-2, header+height-2), outline=border, width=3)
         return result
 
-    prediction_inputs = {f'{cell}_prediction': cell.split('_on_')[1] for cell in CELLS}
+    prediction_inputs = {f'{cell}_prediction': cell.split('_on_')[1] for cell in rendered_cells}
     report_frames = []
     layout = [
         ('old_state', 'OLD data: state', 'physical_state'),
         ('old_action', 'OLD data: action label', 'physical_action'),
-        ('old_on_old_prediction', 'OLD model / OLD input: generated', 'old_action'),
+        ('old_on_old_prediction', 'OLD model / OLD input: generated', 'physical_action'),
         ('new_state', 'NEW data: state', 'physical_state'),
         ('new_action', 'NEW data: action label', 'physical_action'),
-        ('new_on_new_prediction', 'NEW model / NEW input: generated', 'new_action'),
-        ('old_on_new_prediction', 'OLD model / NEW input: generated', 'new_action'),
-        ('new_on_old_prediction', 'NEW model / OLD input: generated', 'old_action'),
+        ('new_on_new_prediction', 'NEW model / NEW input: generated', 'physical_action'),
     ]
     destination = args.output
     destination.mkdir(parents=True, exist_ok=True)
-    if (destination/'comparison.mp4').exists():
+    if any((destination/name).exists() for name in ('comparison.mp4', 'comparison_rgb_lossless.mp4')):
         raise ValueError('Use a new output directory')
     options = dict(codec='libx264rgb', pixelformat='rgb24', quality=None,
                    macro_block_size=1, output_params=['-crf', '0', '-preset', 'fast', '-threads', '1'])
-    print('Rendering all 12 panels; original image pixels unchanged...', flush=True)
+    print('Rendering XML joint replays + colored original joints at calibrated real bases...', flush=True)
     try:
-        with imageio.get_writer(str(destination/'comparison.mp4'), fps=30, **options) as video:
+        with imageio.get_writer(str(destination/'comparison_rgb_lossless.mp4'), fps=30, **options) as video:
             for index in range(count):
                 reference = {'physical_state': poses(original_rows[index, :14], real),
                              'physical_action': poses(original_rows[index, 14:], real)}
                 reference.update({f'{s}_action': poses(arrays[f'{s}_action'][index]) for s in ('old', 'new')})
-                canvas = Image.new('RGB', (3*width, 4*panel_height+top), '#0c1119')
+                masks = {'physical_state': reference_masks(original_rows[index, :14], reference['physical_state']),
+                         'physical_action': reference_masks(original_rows[index, 14:], reference['physical_action'])}
+                canvas = Image.new('RGB', (3*width, camera_row_height+2*panel_height+top), '#0c1119')
                 draw = ImageDraw.Draw(canvas)
                 draw.text((12, 6), f"{row['source_episode']} | source {first+index} | 30 Hz | same-size native pixels", font=font, fill='white')
-                draw.text((12, 33), 'cyan=L; orange=R; white cross=target TCP | generation uses only first image/state; no joint clipping', font=small, fill='#a9c3d7')
-                for camera, label in enumerate(('Shared real TOP', 'Shared real LEFT wrist', 'Shared real RIGHT wrist')):
-                    p = make_panel(images[camera][index], label,
-                        ['Original source image, shown once; no resize/undistortion.',
-                         'Causal 30 Hz clock; no time offset or interpolation.',
-                         f'Actual model condition: source frame {first} only.'])
+                guide = (f'White/gray + white cross: XML arm/TCP | Cyan/orange + circle: original real arm/TCP | loss: old={metadata["losses"]["old_on_old"]:.6f}, '
+                         f'new={metadata["losses"]["new_on_new"]:.6f}, t={metadata["loss_draw_time"]:.6f} | '
+                         'red: >0.1 mm/deg; amber: >30 deg step')
+                draw.text((12, 33), guide, font=small, fill='#a9c3d7')
+                for camera, label in enumerate(('Real data: TOP', 'Real data: LEFT wrist', 'Real data: RIGHT wrist')):
+                    p = make_panel(images[camera][index], label, [])
                     canvas.paste(p, (camera*width, top))
                 frame_report = {'source_frame': first+index}
                 for slot, (key, title, target_name) in enumerate(layout, start=3):
                     actual = poses(arrays[key][index])
                     target = reference[target_name]
-                    errors = [[float(np.linalg.norm(a[:3, 3]-b[:3, 3])*1000),
-                               float(np.rad2deg(Rotation.from_matrix(a[:3, :3]@b[:3, :3].T).magnitude()))]
-                              for a, b in zip(actual, target)]
+                    errors = pose_errors(actual, target)
                     renderer.update_scene(virtual.data, camera='top', scene_option=virtual.options)
-                    for eye in renderer.scene.camera:
-                        eye.pos[:] = world_from_camera[:3, 3]
-                        eye.forward[:] = world_from_camera[:3, 2]
-                        eye.up[:] = -world_from_camera[:3, 1]
-                    segmentation = renderer.render()
-                    ids = map_coordinates(segmentation[..., 0], coordinates, order=0, mode='constant', cval=-1)
-                    rgb = images[0][index].copy()
-                    for geoms, color in zip(arm_geoms, colors):
-                        mask = np.isin(ids, geoms)
+                    rgb = renderer.render()
+                    for mask, color in zip(masks[target_name], colors):
                         rgb[mask] = np.rint(.76*rgb[mask]+.24*np.asarray(color)).astype(np.uint8)
                         rgb[mask & ~binary_erosion(mask)] = color
                     jump = None if index == 0 else float(np.rad2deg(np.abs(
@@ -359,19 +437,23 @@ def render_bundle(args, bundle):
                         truth = arrays[f'{data_side}_action'][index]
                         joint_error = float(np.rad2deg(np.abs(arrays[key][index, JOINT_COLUMNS]-truth[JOINT_COLUMNS])).mean())
                         grip_error = float(np.abs(arrays[key][index, [6, 13]]-truth[[6, 13]]).max())
-                        last_line = f'Joint MAE {joint_error:.2f} deg | grip max abs {grip_error:.4f}'
+                        label_errors = pose_errors(actual, reference[f'{data_side}_action'])
+                        last_line = f'vs label: joint MAE {joint_error:.2f} deg | grip max abs {grip_error:.4f}'
                     else:
+                        label_errors = None
                         grip_truth = original_rows[index, :14] if key.endswith('state') else original_rows[index, 14:]
                         grip_error = float(np.abs(arrays[key][index, [6, 13]]-grip_truth[[6, 13]]).max())
                         last_line = f'Grip max abs difference vs physical stream: {grip_error:.4f}'
-                    border = '#ff4040' if np.any(np.asarray(errors)>.1) else ('#ffb347' if jump is not None and jump>30 else '#48c989')
+                    border = '#ff4040' if np.any(np.asarray(errors)>.1) else ('#ffb347' if jump is not None and jump>30 else None)
                     lines = [f'L TCP {errors[0][0]:.4f} mm / {errors[0][1]:.4f} deg | target: {target_name}',
                              f'R TCP {errors[1][0]:.4f} mm / {errors[1][1]:.4f} deg',
                              f'Max raw joint step: {"N/A (chunk start)" if jump is None else f"{jump:.2f} deg"}', last_line]
                     p = make_panel(rgb, title, lines, border)
                     pen = ImageDraw.Draw(p)
-                    for arm, (a, b) in enumerate(zip(actual, target)):
-                        for transform, cross in ((b, True), (a, False)):
+                    for arm, (sim_tcp, reference_tcp) in enumerate(zip(actual, target)):
+                        # The reference circle shares the overlaid arm's color;
+                        # the white cross belongs to the XML replay arm.
+                        for transform, cross in ((reference_tcp, False), (sim_tcp, True)):
                             uv = pixel(transform[:3, 3])
                             if uv is None:
                                 continue
@@ -381,28 +463,13 @@ def render_bundle(args, bundle):
                                 pen.line((xx, yy-7, xx, yy+7), fill='white', width=2)
                             else:
                                 pen.ellipse((xx-5, yy-5, xx+5, yy+5), outline=colors[arm], width=2)
-                    canvas.paste(p, ((slot%3)*width, top+(slot//3)*panel_height))
+                    canvas.paste(p, ((slot%3)*width, top+camera_row_height+(slot//3-1)*panel_height))
                     frame_report[key] = dict(tcp_error_mm_deg=errors, max_joint_step_deg=jump,
-                                             max_gripper_difference=grip_error)
-                p = make_panel(None, 'Loss / generation / display guide', [
-                    'Red: TCP error >0.1 mm OR >0.1 deg.',
-                    'Amber: raw joint step >30 deg (if TCP passes).',
-                    'Prediction TCP errors compare against the matching action label.',
-                    'Label TCP errors compare against original physical FK.'])
-                pen = ImageDraw.Draw(p)
-                texts = ['Saved single-draw velocity losses (not generated error):',
-                         *[f'{cell}: {metadata["losses"][cell]:.6f}' for cell in CELLS],
-                         f'Loss draw time t={metadata["loss_draw_time"]:.6f}',
-                         '', f'Full flow generation: t=1 -> 0, {metadata["generation_steps"]} steps.',
-                         'All four predictions use the same initial epsilon.',
-                         'Input: ONLY first real image + first saved state.',
-                         'Later real images/states are sequence context.',
-                         'Grippers: saved/predicted opening, coupled fingers.',
-                         'No IK, dynamics, joint clipping or interpolation in replay.',
-                         'Original scene may occlude the overlaid virtual robot.']
-                for line, text in enumerate(texts):
-                    pen.text((12, header+14+28*line), text, font=small, fill='white')
-                canvas.paste(p, (2*width, top+3*panel_height))
+                                             max_gripper_difference=grip_error, border=border,
+                                             prediction_vs_label_tcp_error_mm_deg=label_errors,
+                                             tcp_marker_pixels=dict(
+                                                 real_reference_circle=[pixel(t[:3, 3]) for t in target],
+                                                 sim_xml_white_cross=[pixel(t[:3, 3]) for t in actual]))
                 video.append_data(np.asarray(canvas))
                 if index == 0:
                     canvas.save(destination/'comparison_preview.png')
@@ -410,11 +477,42 @@ def render_bundle(args, bundle):
                 print(f'Rendered {index+1}/{count}', flush=True)
     finally:
         renderer.close()
+        reference_renderer.close()
+    # Preserve exact RGB frames in the master. Use a standard, explicitly
+    # tagged YUV/BT.709 MP4 for players that misinterpret RGB H.264 4:4:4.
+    subprocess.run([
+        'ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(destination/'comparison_rgb_lossless.mp4'),
+        '-vf', 'scale=in_range=pc:out_range=tv:out_color_matrix=bt709,format=yuv420p,'
+               'setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '12', '-profile:v', 'high',
+        '-pix_fmt', 'yuv420p', '-color_range', 'tv', '-colorspace', 'bt709',
+        '-color_primaries', 'bt709', '-color_trc', 'bt709', '-movflags', '+faststart',
+        '-threads', '2', str(destination/'comparison.mp4'),
+    ], check=True)
     save_json(destination/'report.json', dict(
         status='complete', bundle=str(bundle), metadata=metadata,
-        panels=12, panel_image_size=[width, height], fps=30, frames=count,
-        original_pixels_unchanged=True, complete_predictions=True,
-        image_source='Original MCAP; shared raw cameras once; top repeated as overlay background only',
+        panels=9, panel_image_size=[width, height], fps=30, frames=count,
+        original_pixels_unchanged_in_master=True, complete_predictions=True,
+        lossless_master='comparison_rgb_lossless.mp4', playback='comparison.mp4',
+        playback_encoding='H.264 yuv420p, explicit BT.709 limited range; high-quality playback copy',
+        rendered_prediction_cells=list(rendered_cells), cross_predictions_displayed=False,
+        normal_borders=False, camera_annotation_notes=False,
+        render_model=str(ROOT/'abc_sim/models/yam_dishrack_base.xml'), render_base_mode='xml',
+        playback_mode='direct_qpos_fk_replay', physics_steps=0,
+        sim_camera='Original fixed XML top camera',
+        real_image_overlay=False,
+        reference_arm_overlay=True, reference_base_mode='per_sequence_real_calibration_6d',
+        tcp_markers=dict(real_reference='cyan/orange circle, matching the overlaid arm',
+                         sim_xml='white cross, matching the XML replay arm'),
+        reference_joint_source='Original MCAP state/action on the unchanged official 30 Hz clock',
+        reference_base_poses_world={side: transform.tolist() for side, transform in reference_bases.items()},
+        camera_from_reference_base={side: (camera_from_world@transform).tolist()
+                                    for side, transform in reference_bases.items()},
+        tcp_error_target='Original real FK; prediction-versus-label TCP errors also saved separately',
+        object_reconstruction=False,
+        camera_from_base={side: (camera_from_world@pose(virtual.data.body(f'{side}_arm'))).tolist()
+                          for side in ('left', 'right')},
+        image_source='First row: original MCAP. Lower rows: original simulation XML scene.',
         metrics=report_frames,
     ))
     print(destination/'comparison.mp4', flush=True)
@@ -423,6 +521,9 @@ def render_bundle(args, bundle):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--loss-run', type=Path)
+    parser.add_argument('--seven', action='store_true', help='Process the seven agreed cases in their original two loss runs')
+    parser.add_argument('--loss-root', type=Path, default=Path('/mnt/afs/L202500703/abc_storage/output'))
+    parser.add_argument('--bundle-root', type=Path, help='Extracted seven_chunk_bundles.zip, for local rendering without checkpoints')
     parser.add_argument('--chunk', default=DEFAULT_CHUNK)
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--export-only', action='store_true')
@@ -432,6 +533,19 @@ def main():
     parser.add_argument('--calibrations', type=Path, default=ROOT/'scripts/dishrack_joint_retarget_calibrations.json.gz')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.seven:
+        if args.loss_run or args.bundle:
+            parser.error('--seven uses --loss-root or --bundle-root, not --loss-run/--bundle')
+        if args.bundle_root and args.export_only:
+            parser.error('--bundle-root is for rendering, not --export-only')
+        if not args.export_only and args.raw_root is None:
+            parser.error('--raw-root is required for rendering; --export-only exports small prediction bundles')
+        if args.diffusion_steps < 1:
+            parser.error('--diffusion-steps must be positive')
+        seven_cases(args)
+        return
+    if args.bundle_root:
+        parser.error('--bundle-root requires --seven')
     if not (args.loss_run or args.bundle) or (args.loss_run and args.bundle):
         parser.error('Provide exactly one of --loss-run or --bundle')
     if args.bundle and args.export_only:
