@@ -41,10 +41,40 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False)+'\n')
 
 
+def verified_completed_bundle(job):
+    bundle, info = job.output/'bundle.npz', job.output/'bundle.json'
+    if not bundle.exists() and not info.exists():
+        return None
+    if not bundle.is_file() or not info.is_file():
+        raise ValueError(f'Incomplete bundle at {job.output}; use a new output directory')
+    saved = json.loads(info.read_text())
+    source = json.loads((job.loss_run/'input.json').read_text())
+    locations = json.loads((job.loss_run/'sampled_chunks.json').read_text())
+    episode, first = job.chunk.rsplit(':', 1)
+    selected = [r for r in locations if r['source_episode'] == episode and r['source_frame'] == int(first)]
+    if len(selected) != 1 or saved['chunk'] != selected[0]:
+        raise ValueError(f'Completed chunk source mapping differs: {job.chunk}')
+    if (saved['seed'] != source['seed'] or saved['generation_steps'] != job.diffusion_steps
+            or not saved.get('exact_saved_labels')):
+        raise ValueError(f'Completed chunk sampling settings differ: {job.chunk}')
+    for side in ('old', 'new'):
+        if Path(saved['checkpoints'][side]).resolve() != Path(source[f'{side}_checkpoint']).resolve():
+            raise ValueError(f'Completed chunk checkpoint differs: {job.chunk}')
+    row = selected[0]
+    with np.load(bundle) as arrays:
+        for key in ('old_state', 'new_state', 'old_action', 'new_action', *[f'{c}_prediction' for c in CELLS]):
+            if arrays[key].shape != (row['chunk_length'], 14) or not np.isfinite(arrays[key]).all():
+                raise ValueError(f'Invalid completed array: {job.chunk} / {key}')
+        rng = np.random.default_rng([source['seed'], 0, row['sample_id'], 0])
+        expected_noise = rng.standard_normal((row['chunk_length'], 14), dtype=np.float32)[None]
+        np.testing.assert_array_equal(arrays['noise'], expected_noise)
+    return bundle
+
+
 def seven_cases(args):
     """Preserve each selected chunk's original loss-run/RNG identity."""
     output = args.output
-    if (output/'manifest.json').exists():
+    if (output/'manifest.json').exists() and not args.resume:
         raise ValueError('Use a new output directory')
     jobs = []
     for number, (run, episode, first) in enumerate(SEVEN_CASES, start=1):
@@ -59,6 +89,7 @@ def seven_cases(args):
         for path in required:
             if not path.is_file():
                 raise FileNotFoundError(path)
+        job.completed_bundle = verified_completed_bundle(job) if args.resume else None
         jobs.append(job)
     if not args.export_only:
         records = {r['episode']: r for r in json.load(gzip.open(args.calibrations, 'rt'))['records']}
@@ -69,22 +100,34 @@ def seven_cases(args):
     output.mkdir(parents=True, exist_ok=True)
     manifest = dict(status='running', selected=7, completed=0, cases=[])
     save_json(output/'manifest.json', manifest)
-    for number, job in enumerate(jobs, start=1):
-        print(f'CASE {number}/7: {job.chunk}', flush=True)
-        try:
-            bundle = job.bundle or export_predictions(job)
-            if not args.export_only:
-                render_bundle(job, bundle)
-            manifest['cases'].append(dict(chunk=job.chunk, loss_run=str(job.loss_run),
-                                          directory=job.output.name,
-                                          bundle=(str(bundle) if args.bundle_root else f'{job.output.name}/bundle.npz'),
-                                          video=None if args.export_only else f'{job.output.name}/comparison.mp4'))
-            manifest['completed'] = number
-            save_json(output/'manifest.json', manifest)
-        except Exception as error:
-            manifest.update(status='failed', failed_case=job.chunk, error=f'{type(error).__name__}: {error}')
-            save_json(output/'manifest.json', manifest)
-            raise
+    prediction_session = {} if not args.bundle_root else None
+    try:
+        for number, job in enumerate(jobs, start=1):
+            print(f'CASE {number}/7: {job.chunk}', flush=True)
+            try:
+                bundle = job.bundle or job.completed_bundle
+                if job.completed_bundle:
+                    print('Reusing verified completed bundle; no model inference.', flush=True)
+                if bundle is None:
+                    bundle = export_predictions(job, prediction_session)
+                if not args.export_only:
+                    render_bundle(job, bundle)
+                manifest['cases'].append(dict(chunk=job.chunk, loss_run=str(job.loss_run),
+                                              directory=job.output.name,
+                                              bundle=(str(bundle) if args.bundle_root else f'{job.output.name}/bundle.npz'),
+                                              reused=job.completed_bundle is not None,
+                                              video=None if args.export_only else f'{job.output.name}/comparison.mp4'))
+                manifest['completed'] = number
+                save_json(output/'manifest.json', manifest)
+            except Exception as error:
+                manifest.update(status='failed', failed_case=job.chunk, error=f'{type(error).__name__}: {error}')
+                save_json(output/'manifest.json', manifest)
+                raise
+    finally:
+        if prediction_session:
+            prediction_session.clear()
+            import torch
+            torch.cuda.empty_cache()
     manifest['status'] = 'complete'
     save_json(output/'manifest.json', manifest)
     archive = output/('seven_chunk_bundles.zip' if args.export_only else 'seven_chunk_videos.zip')
@@ -98,7 +141,7 @@ def seven_cases(args):
     print(f'COMPLETE 7/7: {archive}', flush=True)
 
 
-def export_predictions(args):
+def export_predictions(args, session=None):
     import torch
     from abc_minimal.dataloader import decode_frame, read_state_action_rows
     from scripts.compare_chunk_val_loss import (
@@ -118,7 +161,17 @@ def export_predictions(args):
     if len(selected) != 1:
         raise ValueError(f'Expected one saved chunk: {args.chunk}')
     source_index, row = selected[0]
-    metadata = {s: checkpoint_metadata(Path(source[f'{s}_checkpoint'])) for s in ('old', 'new')}
+    # One session spans the entire seven-case run. Cache by actual input paths
+    # so different source loss runs can share the same loaded models safely.
+    if session is None:
+        session = {}
+    checkpoint_cache = session.setdefault('checkpoint_metadata', {})
+    metadata, checkpoint_keys = {}, {}
+    for side in ('old', 'new'):
+        checkpoint_keys[side] = str(Path(source[f'{side}_checkpoint']).resolve())
+        if checkpoint_keys[side] not in checkpoint_cache:
+            checkpoint_cache[checkpoint_keys[side]] = checkpoint_metadata(Path(checkpoint_keys[side]))
+        metadata[side] = checkpoint_cache[checkpoint_keys[side]]
     configs = {s: DiTConfig(**m['train']['model']) for s, m in metadata.items()}
     if asdict(configs['old']) != asdict(configs['new']):
         raise ValueError('Model architectures differ')
@@ -136,16 +189,27 @@ def export_predictions(args):
     text_configs = [ClipConfig(**metadata[s]['train'].get('clip', {})) for s in ('old', 'new')]
     if asdict(text_configs[0]) != asdict(text_configs[1]):
         raise ValueError('Text encoder configurations differ')
-    embedder = CLIPTextEmbedder(text_configs[0], device=device)
+    embedder_cache = session.setdefault('text_encoders', {})
+    embedder_key = (args.gpu_id, repr(asdict(text_configs[0])))
+    if embedder_key not in embedder_cache:
+        print('Loading text encoder once for this run...', flush=True)
+        embedder_cache[embedder_key] = CLIPTextEmbedder(text_configs[0], device=device)
+    embedder = embedder_cache[embedder_key]
+    dataset_cache = session.setdefault('datasets', {})
     batches, arrays, clocks = {}, {}, {}
     for side in ('old', 'new'):
         meta, config = metadata[side], configs[side]
-        prompt = PromptConfig(**meta['train'].get('prompt', {}))
-        labels = load_operator_label_maps(prompt.operator_label_map_path) if prompt.use_operator_id_as_prompt else {}
-        dataset = EpisodeDataset(Path(source['cache_roots'][side])/row['split'], meta['stats'],
-                                 train=False, mask_state_ratio=0., model_config=config,
-                                 default_task_name='load_the_plates_into_the_dish_rack',
-                                 prompt_config=prompt, operator_label_maps=labels)
+        dataset_root = Path(source['cache_roots'][side])/row['split']
+        dataset_key = (checkpoint_keys[side], str(dataset_root.resolve()))
+        if dataset_key not in dataset_cache:
+            prompt = PromptConfig(**meta['train'].get('prompt', {}))
+            labels = load_operator_label_maps(prompt.operator_label_map_path) if prompt.use_operator_id_as_prompt else {}
+            print(f'Opening {side} dataset once for this run...', flush=True)
+            dataset_cache[dataset_key] = EpisodeDataset(dataset_root, meta['stats'],
+                train=False, mask_state_ratio=0., model_config=config,
+                default_task_name='load_the_plates_into_the_dish_rack',
+                prompt_config=prompt, operator_label_maps=labels)
+        dataset = dataset_cache[dataset_key]
         index = row[f'{side}_dataset_index']
         ep = int(np.searchsorted(dataset.cum, index, side='right'))
         local = int(index - (dataset.cum[ep-1] if ep else 0))
@@ -182,11 +246,19 @@ def export_predictions(args):
     arrays['noise'] = noise.cpu().numpy()
     steps = args.diffusion_steps
     print(f'Generating four actual prediction chunks, {steps} flow steps, shared initial noise...', flush=True)
+    model_cache = session.setdefault('models', {})
     for model_side in ('old', 'new'):
-        model = DiTPolicy(configs[model_side])
-        load_pretrained(model, Path(source[f'{model_side}_checkpoint']))
-        model.img_backbone.set_bfloat16(metadata[model_side]['train'].get('dino_bf16', True))
-        model.to(device).eval()
+        dino_bf16 = metadata[model_side]['train'].get('dino_bf16', True)
+        model_key = (checkpoint_keys[model_side], args.gpu_id, dino_bf16)
+        if model_key not in model_cache:
+            print(f'Loading {model_side} model once; keeping it resident on {device}...', flush=True)
+            model = DiTPolicy(configs[model_side])
+            load_pretrained(model, Path(checkpoint_keys[model_side]))
+            model.img_backbone.set_bfloat16(dino_bf16)
+            model_cache[model_key] = model.to(device).eval()
+        else:
+            print(f'Reusing resident {model_side} model...', flush=True)
+        model = model_cache[model_key]
         with torch.inference_mode():
             for data_side in ('old', 'new'):
                 predicted = model.sample_actions(batches[data_side], num_steps=steps, noise=noise.clone())
@@ -196,8 +268,6 @@ def export_predictions(args):
                     raise ValueError('Invalid generated action chunk')
                 arrays[f'{model_side}_on_{data_side}_prediction'] = values
                 print(f'Generated {model_side}_on_{data_side}', flush=True)
-        del model
-        torch.cuda.empty_cache()
     with np.load(args.loss_run/'screen_draws.npz') as saved:
         losses = {cell: float(saved[cell][source_index, 0].mean()) for cell in CELLS}
     args.output.mkdir(parents=True, exist_ok=True)
@@ -522,6 +592,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--loss-run', type=Path)
     parser.add_argument('--seven', action='store_true', help='Process the seven agreed cases in their original two loss runs')
+    parser.add_argument('--resume', action='store_true', help='With --seven --export-only, verify and reuse completed bundles')
     parser.add_argument('--loss-root', type=Path, default=Path('/mnt/afs/L202500703/abc_storage/output'))
     parser.add_argument('--bundle-root', type=Path, help='Extracted seven_chunk_bundles.zip, for local rendering without checkpoints')
     parser.add_argument('--chunk', default=DEFAULT_CHUNK)
@@ -533,6 +604,8 @@ def main():
     parser.add_argument('--calibrations', type=Path, default=ROOT/'scripts/dishrack_joint_retarget_calibrations.json.gz')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.resume and not (args.seven and args.export_only):
+        parser.error('--resume requires --seven --export-only')
     if args.seven:
         if args.loss_run or args.bundle:
             parser.error('--seven uses --loss-root or --bundle-root, not --loss-run/--bundle')
