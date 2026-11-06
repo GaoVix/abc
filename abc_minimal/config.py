@@ -284,6 +284,7 @@ class SimEvalConfig:
     parallel_worlds: int = 0  # >0: step this many worlds together in MJWarp physics; 0: one CPU MuJoCo world at a time
     render_policy_cameras_only: bool = False  # Parallel eval: skip cameras absent from model.camera_keys.
     randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
+    disable_arm_control_limits: bool = False  # Eval ablation: allow raw arm PD targets beyond XML ctrlrange.
     compensate_arm_bases: bool = False
     # Testing-time compensation IK only; independent of training/data conversion.
     base_compensation_ik: Literal["pink", "pink-debug", "mink", "slsqp"] = "pink"

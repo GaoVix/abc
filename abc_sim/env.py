@@ -91,6 +91,7 @@ class MuJoCoYAMEnv(gym.Env):
         scene_xml: str | Path | None = None,
         max_episode_steps: int | None = None,
         terminate_on_success: bool = False,
+        disable_arm_control_limits: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -103,6 +104,7 @@ class MuJoCoYAMEnv(gym.Env):
         self._camera_width = camera_width
         self._physics_dt = physics_dt
         self._control_decimation = control_decimation
+        self._disable_arm_control_limits = bool(disable_arm_control_limits)
         self._scene_xml = Path(scene_xml) if scene_xml else _DEFAULT_SCENE_XML
         if max_episode_steps is not None and max_episode_steps < 1:
             raise ValueError(
@@ -206,6 +208,13 @@ class MuJoCoYAMEnv(gym.Env):
     def _bind_model(self, model: mujoco.MjModel) -> None:
         self.model = model
         self.model.opt.timestep = self._physics_dt
+        if self._disable_arm_control_limits:
+            # Apply to every newly compiled/cached model, before creating any
+            # MJWarp runtime. Keep gripper controls and physical limits intact.
+            for side in self.robot_names:
+                for joint in range(1, 7):
+                    actuator = self.model.actuator(f"{side}_joint{joint}").id
+                    self.model.actuator_ctrllimited[actuator] = False
         self.data = mujoco.MjData(self.model)
         self._arm_state_initialized = False
         if self._task_runtime is not None:
