@@ -175,9 +175,10 @@ def main():
     policy = WorldNoise(policy, config.policy_seed, index)
     env = VerifiedTrace(HistoricalCameraEnv(config), scene, source, history)
     try:
-        physics = resolved_physics(env)
-        if physics != history["resolved_physics"]:
-            raise ValueError("Physics settings differ from the historical run")
+        physics = resolved_physics(env.env)
+        if physics is None or physics != history["resolved_physics"]:
+            raise ValueError(f"Physics settings differ from history: current={physics}, historical={history['resolved_physics']}")
+        print("[physics verified] " + json.dumps(physics), flush=True)
         worlds = rollout_worlds(config, policy, env, config.prefix_length, None, output, config.model)
         worlds[0]["world_index"] = index
         with np.load(source / "new/trajectory.npz", allow_pickle=False) as old:
