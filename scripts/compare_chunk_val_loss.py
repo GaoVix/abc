@@ -287,16 +287,20 @@ def mean_rows(locations, losses):
 
 
 def pick_candidates(rows, count):
-    selected, origins = [], set()
-    for row in sorted(rows, key=lambda row: -row["gap_own_data"]):
-        key = (row["split"], row["source_episode"])
-        if row["gap_own_data"] <= 0 or key in origins:
-            continue
-        selected.append(row)
-        origins.add(key)
-        if len(selected) == count:
-            break
-    return selected
+    return sorted((row for row in rows if row["gap_own_data"] > 0),
+                  key=lambda row: -row["gap_own_data"])[:count]
+
+
+def print_ranked_chunks(rows):
+    print("\nRanked by new_on_new minus old_on_old (largest gap first):", flush=True)
+    print(f"{'Rank':>4}  {'Source episode':44}  {'Frames':>11}  {'old/old':>10}  {'new/new':>10}  "
+          f"{'gap':>10}  {'ratio':>8}  {'old/new':>10}  {'new/old':>10}", flush=True)
+    for rank, row in enumerate(rows, 1):
+        frames = f"{row['source_frame']}-{row['source_frame_last']}"
+        print(f"{rank:>4}  {row['source_episode']:44}  {frames:>11}  "
+              f"{row['old_on_old_loss']:10.6f}  {row['new_on_new_loss']:10.6f}  "
+              f"{row['gap_own_data']:10.6f}  {row['ratio_own_data']:7.2f}x  "
+              f"{row['old_on_new_loss']:10.6f}  {row['new_on_old_loss']:10.6f}", flush=True)
 
 
 def main():
@@ -427,7 +431,7 @@ def main():
                           "Screening, ranking and top_chunks use only new_on_new minus old_on_old; cross-evaluations do not select cases.",
                           "on_old_data/on_new_data compare weights on fixed inputs and labels; own_data also changes preprocessing.",
                           "Training splits use clean validation transforms; this is not held-out validation.",
-                          "Each candidate comes from a different source episode.",
+                          "Top chunks are ranked by gap across all sampled chunks, including repeated source episodes.",
                           "Default: one fixed noise/time draw per chunk; no confirmation or significance filtering."])
     save_json(args.output / "summary.json", summary)
     print(json.dumps(dict(
@@ -435,12 +439,9 @@ def main():
         screen_draws=args.screen_draws, seconds=summary["seconds"],
         screen_mean_losses=summary["screen_mean_losses"],
         primary_comparison="new_on_new vs old_on_old",
-        top_chunks=[{key: row[key] for key in (
-            "split", "source_episode", "source_frame", "source_frame_last",
-            "old_on_old_loss", "new_on_new_loss", "gap_own_data", "ratio_own_data",
-            "old_on_new_loss", "new_on_old_loss", "gap_on_old_data", "gap_on_new_data")}
-            for row in top],
         summary=str(args.output / "summary.json")), indent=2), flush=True)
+    print_ranked_chunks(top)
+    print(f"\nAll chunks ranked in {args.output / 'screen_chunks.csv'}", flush=True)
 
 
 if __name__ == "__main__":
