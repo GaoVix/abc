@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+cd "$(dirname "$0")" || exit 1
+
+uv run torchrun --standalone --nproc-per-node 4 train.py \
+  --load-pretrained \
+  --cache-root "${TRAIN_CACHE_ROOT:-cache/dishrack_real}" \
+  --output-dir "${TRAIN_OUTPUT_DIR:-output/dit_joint_baseline}" \
+  --pretrained-ckpt-name "$PWD/cache/abc_dit_xl_200k_model.pt" \
+  --mixture-preset load_the_plates_into_the_dish_rack \
+  --batch-size 90 \
+  --num-workers 16 \
+  --train-steps 100000 \
+  --log-every 5 \
+  --log-wandb \
+  --wandb-project abc-dishrack \
+  --val-every 1000 \
+  --ckpt-every 10000

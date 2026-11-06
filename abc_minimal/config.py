@@ -127,6 +127,10 @@ MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
     "tshirt": [
         MixtureComponent("train_real", "val_real", 1.0, "folding_tshirt_pile_and_stacking"),
     ],
+    "load_the_plates_into_the_dish_rack": [
+        MixtureComponent("train_real", "val_real", 0.8, "load_the_plates_into_the_dish_rack"),
+        MixtureComponent("train_sim", "val_sim", 0.2, "sim_load_the_plates_into_the_dish_rack"),
+    ],
     # Single-task sim finetuning: point --cache-root at a cache holding exactly
     # one task's episodes (prepare.py --sim-data <task> into a fresh root). The
     # component reads everything under train_sim/, and each episode's own
@@ -158,7 +162,9 @@ class TrainConfig:
     num_workers: int = 16
     train_steps: int = 75_000
 
-    mixture_preset: Literal["bottles", "tshirt", "sim_task"] = "bottles"
+    mixture_preset: Literal[
+        "bottles", "tshirt", "sim_task", "load_the_plates_into_the_dish_rack"
+    ] = "bottles"
     mixture: list[MixtureComponent] = field(default_factory=list)
 
     load_pretrained: bool = False
@@ -276,7 +282,13 @@ class SimEvalConfig:
     gpu_id: int | None = None
     camera_backend: Literal["mjwarp", "mujoco", "blender"] = "mjwarp"  # "mujoco" is the CPU/macOS fallback
     parallel_worlds: int = 0  # >0: step this many worlds together in MJWarp physics; 0: one CPU MuJoCo world at a time
+    render_policy_cameras_only: bool = False  # Parallel eval: skip cameras absent from model.camera_keys.
     randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
+    compensate_arm_bases: bool = False
+    # Testing-time compensation IK only; independent of training/data conversion.
+    base_compensation_ik: Literal["pink", "pink-debug", "mink", "slsqp"] = "pink"
+    base_compensation_reference: Literal["xml", "median"] = "xml"
+    deterministic_inference: bool = False  # Requires CPU MuJoCo physics and fast_inference=False.
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"
     vanilla_physics: bool = False

@@ -7,6 +7,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
+from ..arm_bases import disable_arm_collisions_except_eef, sample_training_arm_bases, set_median_arm_bases
 from ..assets.dishrack import (
     _DISHRACK_BASE_SCENE_XML,
     _DISHRACK_DEFAULT_VARIANTS,
@@ -29,6 +30,7 @@ from ..core import (
     _yaw_from_quat,
 )
 from ..requests import DishRackResetRequest
+
 
 class DishRackRandomizer(SceneRandomizer):
     min_clearance_m = 0.1
@@ -91,6 +93,9 @@ class DishRackRandomizer(SceneRandomizer):
             model = self._env_ref.model
             data = self._env_ref.data
 
+        if reset_request.arm_collision_mode == "eef_only":
+            disable_arm_collisions_except_eef(model)
+        arm_base_poses = self._randomize_arm_bases(model, data, reset_request, seed)
         nominals = self._read_nominals(model, data)
         for _ in range(self.max_tries):
             states = self._sample_once(nominals, rng)
@@ -111,10 +116,22 @@ class DishRackRandomizer(SceneRandomizer):
                     "plate_variant": plate_variants[0],
                     "plate_variants": list(plate_variants),
                     "plate_count": len(plate_variants),
+                    **({"arm_base_poses": arm_base_poses,
+                        "arm_base_source": reset_request.arm_base_source} if arm_base_poses else {}),
+                    **({"arm_collision_mode": "eef_only"}
+                       if reset_request.arm_collision_mode == "eef_only" else {}),
                 },
             )
 
         self._raise_sampling_failure(seed)
+
+    @staticmethod
+    def _randomize_arm_bases(model, data, request, seed):
+        if request.arm_base_source == "median":
+            return set_median_arm_bases(model, data)
+        if not request.randomize_arm_bases or request.arm_base_source == "xml":
+            return {}
+        return sample_training_arm_bases(model, data, seed)
 
     def apply(self, model: Any, data: Any, state: RandomizationState) -> None:
         dish_rack_variant = _dishrack_canonical_variant_name(
@@ -142,7 +159,12 @@ class DishRackRandomizer(SceneRandomizer):
         if self._env_ref is not None:
             model = self._env_ref.model
             data = self._env_ref.data
+        if state.metadata.get("arm_collision_mode") == "eef_only":
+            disable_arm_collisions_except_eef(model)
         self._apply_states(model, data, state.object_states)
+        for name, pose in state.metadata.get("arm_base_poses", {}).items():
+            model.body(name).pos[:] = pose["pos"]
+            model.body(name).quat[:] = pose["quat"]
         mujoco.mj_forward(model, data)
 
     def _refresh_collision_metadata(self) -> None:

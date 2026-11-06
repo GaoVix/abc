@@ -1,5 +1,6 @@
 <mujoco model="yam_dishrack">
   <compiler angle="radian" meshdir="assets" texturedir="assets"/>
+  <size memory="64M"/>
 
   <option integrator="implicitfast"/>
 
