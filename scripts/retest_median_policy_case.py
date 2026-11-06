@@ -1,7 +1,7 @@
 """Replay a saved median-policy case with its original low-resolution cameras.
 
 Clone the saved configuration and restore the saved scene, then optionally
-disable arm PD-target clamping, or all arm position/force limits. Verify the
+disable arm PD-target clamping, joint-position limits, or all arm limits. Verify the
 historical initial arrays and first policy observation before inference.
 Record physics first and render afterward.
 """
@@ -100,6 +100,11 @@ def remove_all_arm_limits(model):
     model.actuator_forcelimited[actuators] = False
 
 
+def remove_arm_joint_limits(model):
+    joints, _ = arm_indices(model)
+    model.jnt_limited[joints] = False
+
+
 def arm_limit_state(model):
     joints, actuators = arm_indices(model)
     return dict(
@@ -111,9 +116,10 @@ def arm_limit_state(model):
 
 class HistoricalCameraEnv(SimTaskEnv):
     """The pre-high-resolution adapter; native pixels go directly to policy."""
-    def __init__(self, config, *, disable_all_arm_limits=False):
+    def __init__(self, config, *, disable_all_arm_limits=False, disable_arm_joint_limits=False):
         import abc_sim
         self.disable_all_arm_limits = disable_all_arm_limits
+        self.disable_arm_joint_limits = disable_arm_joint_limits
         self.spec = task_spec(config.task)
         self.height, self.width = config.camera_height, config.camera_width
         self.camera_keys = tuple(config.model.camera_keys)
@@ -123,17 +129,20 @@ class HistoricalCameraEnv(SimTaskEnv):
             camera_backend=config.camera_backend, camera_gpu_id=config.gpu_id,
             camera_height=self.height, camera_width=self.width,
             disable_arm_control_limits=config.disable_arm_control_limits)
-        if disable_all_arm_limits:
+        self.original_force_limits = {key: value for key, value in arm_limit_state(self.env.model).items()
+                                      if key in ("actuator_force_limited", "joint_actuator_force_limited")}
+        if disable_all_arm_limits or disable_arm_joint_limits:
             # This override belongs only to this diagnostic env. Apply before
             # creating new data/renderer runtimes on every XML or cache reload.
             original_bind = self.env._bind_model
+            override = remove_all_arm_limits if disable_all_arm_limits else remove_arm_joint_limits
 
-            def bind_without_arm_limits(model):
-                remove_all_arm_limits(model)
+            def bind_with_limit_override(model):
+                override(model)
                 original_bind(model)
 
-            self.env._bind_model = bind_without_arm_limits
-            remove_all_arm_limits(self.env.model)
+            self.env._bind_model = bind_with_limit_override
+            override(self.env.model)
 
     def _camera_images(self, images):
         missing = set(self.camera_keys) - images.keys()
@@ -171,6 +180,12 @@ class VerifiedTrace(TraceScene):
         self.limit_state = arm_limit_state(native.model)
         if self.env.disable_all_arm_limits and any(any(row) for row in self.limit_state.values()):
             raise ValueError("An arm position or force limit was restored during model reload")
+        if self.env.disable_arm_joint_limits and not self.env.disable_all_arm_limits:
+            if any(self.limit_state["joint_position_limited"]):
+                raise ValueError("An arm joint-position limit was restored during model reload")
+            for key, expected in self.env.original_force_limits.items():
+                if self.limit_state[key] != expected:
+                    raise ValueError(f"Force limits changed in joint-position-only ablation: {key}")
         print("[arm limits] " + json.dumps(self.limit_state), flush=True)
         print("Verified: historical initial state, objects, median bases, camera pixels and policy state match exactly.", flush=True)
         return obs
@@ -181,8 +196,11 @@ def main():
     parser.add_argument("--source-case", type=Path, required=True)
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--disable-arm-control-limits", action="store_true")
-    parser.add_argument("--disable-all-arm-limits", action="store_true",
-                        help="Disable both arms' PD target, physical joint-position and actuator/joint force limits; grippers unchanged")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--disable-all-arm-limits", action="store_true",
+                       help="Disable both arms' PD target, physical joint-position and actuator/joint force limits; grippers unchanged")
+    modes.add_argument("--disable-arm-joint-limits", action="store_true",
+                       help="Disable physical arm joint-position limits, retaining original force limits; combine with --disable-arm-control-limits to remove target clamping too")
     parser.add_argument("--render-stride", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -199,7 +217,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     from dataclasses import asdict
     write_json(output / "historical_summary.json", history)
-    write_json(output / "replay_config.json", dict(asdict(config), disable_all_arm_limits=args.disable_all_arm_limits))
+    write_json(output / "replay_config.json", dict(asdict(config),
+        disable_all_arm_limits=args.disable_all_arm_limits, disable_arm_joint_limits=args.disable_arm_joint_limits))
     import torch
     from abc_minimal.determinism import configure_determinism
     from abc_minimal.eval_policy import build_summary, resolved_physics, rollout_worlds
@@ -211,7 +230,8 @@ def main():
         environment_seed=config.seed, policy_noise_stream=[config.policy_seed, index],
         deterministic_inference=True, native_camera_size=[config.camera_width, config.camera_height],
         disable_arm_control_limits=config.disable_arm_control_limits,
-        disable_all_arm_limits=args.disable_all_arm_limits), indent=2), flush=True)
+        disable_all_arm_limits=args.disable_all_arm_limits,
+        disable_arm_joint_limits=args.disable_arm_joint_limits), indent=2), flush=True)
     configure_determinism(config.policy_seed)
     torch.cuda.set_device(args.gpu_id)
     policy = DiTInferencePolicy(checkpoint, config, f"cuda:{args.gpu_id}")
@@ -219,7 +239,8 @@ def main():
     torch.manual_seed(config.policy_seed)
     torch.cuda.manual_seed_all(config.policy_seed)
     policy = WorldNoise(policy, config.policy_seed, index)
-    env = VerifiedTrace(HistoricalCameraEnv(config, disable_all_arm_limits=args.disable_all_arm_limits),
+    env = VerifiedTrace(HistoricalCameraEnv(config, disable_all_arm_limits=args.disable_all_arm_limits,
+                                           disable_arm_joint_limits=args.disable_arm_joint_limits),
                         scene, source, history)
     try:
         physics = resolved_physics(env.env)
@@ -240,6 +261,7 @@ def main():
         summary = build_summary(config=config, ckpt_path=checkpoint, device=f"cuda:{args.gpu_id}",
                                 worlds=worlds, out_dir=output, physics=physics)
         summary["arm_limit_ablation"] = dict(disable_all_arm_limits=args.disable_all_arm_limits,
+                                             disable_arm_joint_limits=args.disable_arm_joint_limits,
                                              limits=env.limit_state)
         write_json(output / "summary.json", summary)
         result = dict(status="rendering", source_case=str(source), world_index=index,
@@ -250,7 +272,8 @@ def main():
             historical=dict(success=original["success"], steps=original["steps"], max_reward=original["max_reward"]),
             retest=dict(success=worlds[0]["success"], steps=worlds[0]["steps"], max_reward=worlds[0]["max_reward"],
                         disable_arm_control_limits=config.disable_arm_control_limits,
-                        disable_all_arm_limits=args.disable_all_arm_limits, arm_limits=env.limit_state))
+                        disable_all_arm_limits=args.disable_all_arm_limits,
+                        disable_arm_joint_limits=args.disable_arm_joint_limits, arm_limits=env.limit_state))
         write_json(output / "comparison.json", result)
         print(json.dumps(result, indent=2), flush=True)
         del policy
@@ -263,6 +286,7 @@ def main():
         summary = build_summary(config=config, ckpt_path=checkpoint, device=f"cuda:{args.gpu_id}",
                                 worlds=worlds, out_dir=output, physics=physics)
         summary["arm_limit_ablation"] = dict(disable_all_arm_limits=args.disable_all_arm_limits,
+                                             disable_arm_joint_limits=args.disable_arm_joint_limits,
                                              limits=env.limit_state)
         write_json(output / "summary.json", summary)
         result.update(status="complete", video=str(video))
