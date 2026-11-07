@@ -393,6 +393,8 @@ class EpisodeDataset(Dataset):
         self.train = train
         self.mask_state_ratio = mask_state_ratio
         self.state_noise_std = None
+        self._state_noise_generator = None
+        self._state_noise_seed = None
         backbone = getattr(model_config, "backbone", None)
         self.image_size = getattr(backbone, "image_size", 224)
         # "auto" derives the image-normalization preset from the vision backbone
@@ -452,9 +454,16 @@ class EpisodeDataset(Dataset):
         if self.train and self.state_noise_std is not None:
             # Joint values and noise std are both in radians, before
             # normalization. Draw only for the 12 joints; never alter grippers.
+            # A private per-worker stream leaves the original masking/image/
+            # prompt RNG untouched. DataLoader assigns each worker its seed.
+            worker_seed = torch.initial_seed()
+            if self._state_noise_seed != worker_seed:
+                self._state_noise_generator = torch.Generator(device="cpu")
+                self._state_noise_generator.manual_seed(worker_seed ^ 0x524454)  # "RDT"
+                self._state_noise_seed = worker_seed
             state = state.copy()
             state[_STATE_JOINT_COLUMNS] += (
-                torch.randn(len(_STATE_JOINT_COLUMNS)).numpy()
+                torch.randn(len(_STATE_JOINT_COLUMNS), generator=self._state_noise_generator).numpy()
                 * self.state_noise_std[ep_idx, _STATE_JOINT_COLUMNS]
             )
         state = normalize(state, self.norm_stats["state"])
