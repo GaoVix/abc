@@ -40,6 +40,11 @@ class FlowConfig:
     num_diffusion_steps: int = 10
     # VLA policy only: independent noise/timestep draws per sample per step.
     num_diffusion_draws: int = 1
+    # RDT SNR formula, restricted to the 12 arm joints in train_real, before
+    # normalization: full_sequence_std * 10**(-SNR/20), in radians. Grippers
+    # and sim stay clean. IK segments share their complete final trajectory's
+    # std. None disables it; 40 dB means 1% of sequence std. Training only.
+    state_noise_snr: float | None = None
 
 
 @dataclass
@@ -406,6 +411,9 @@ def validate_train_config(
         errors.append(
             "flow probabilities must be in [0, 1] and prefix_noise_scale must be non-negative"
         )
+    snr = config.flow.state_noise_snr
+    if snr is not None and (not math.isfinite(snr) or snr < 0):
+        errors.append("flow.state_noise_snr must be finite and non-negative, or None")
     if config.policy == "vla":
         errors.extend(validate_vla_model_config(config.vla_model))
     else:
