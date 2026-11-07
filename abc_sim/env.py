@@ -94,6 +94,7 @@ class MuJoCoYAMEnv(gym.Env):
         terminate_on_success: bool = False,
         disable_arm_control_limits: bool = False,
         disable_all_arm_limits: bool = False,
+        disable_arm_joint_limits: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -108,6 +109,7 @@ class MuJoCoYAMEnv(gym.Env):
         self._control_decimation = control_decimation
         self._disable_arm_control_limits = bool(disable_arm_control_limits)
         self._disable_all_arm_limits = bool(disable_all_arm_limits)
+        self._disable_arm_joint_limits = bool(disable_arm_joint_limits)
         self._scene_xml = Path(scene_xml) if scene_xml else _DEFAULT_SCENE_XML
         if max_episode_steps is not None and max_episode_steps < 1:
             raise ValueError(
@@ -223,17 +225,22 @@ class MuJoCoYAMEnv(gym.Env):
                         self.model.jnt_limited[joint_id] = False
                         self.model.jnt_actfrclimited[joint_id] = False
                         self.model.actuator_forcelimited[actuator] = False
-            if self._disable_all_arm_limits:
-                names = [f"{side}_joint{joint}" for side in self.robot_names for joint in range(1, 7)]
-                joints = [self.model.joint(name).id for name in names]
-                actuators = [self.model.actuator(name).id for name in names]
-                limits = {
-                    "joint_position_limited": self.model.jnt_limited[joints].astype(bool).tolist(),
-                    "pd_target_limited": self.model.actuator_ctrllimited[actuators].astype(bool).tolist(),
-                    "actuator_force_limited": self.model.actuator_forcelimited[actuators].astype(bool).tolist(),
-                    "joint_actuator_force_limited": self.model.jnt_actfrclimited[joints].astype(bool).tolist(),
-                }
-                print("[arm limits] " + json.dumps(limits), flush=True)
+        if self._disable_arm_joint_limits:
+            for side in self.robot_names:
+                for joint in range(1, 7):
+                    joint_id = self.model.joint(f"{side}_joint{joint}").id
+                    self.model.jnt_limited[joint_id] = False
+        if self._disable_all_arm_limits or self._disable_arm_joint_limits:
+            names = [f"{side}_joint{joint}" for side in self.robot_names for joint in range(1, 7)]
+            joints = [self.model.joint(name).id for name in names]
+            actuators = [self.model.actuator(name).id for name in names]
+            limits = {
+                "joint_position_limited": self.model.jnt_limited[joints].astype(bool).tolist(),
+                "pd_target_limited": self.model.actuator_ctrllimited[actuators].astype(bool).tolist(),
+                "actuator_force_limited": self.model.actuator_forcelimited[actuators].astype(bool).tolist(),
+                "joint_actuator_force_limited": self.model.jnt_actfrclimited[joints].astype(bool).tolist(),
+            }
+            print("[arm limits] " + json.dumps(limits), flush=True)
         self.data = mujoco.MjData(self.model)
         self._arm_state_initialized = False
         if self._task_runtime is not None:
