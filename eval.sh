@@ -6,12 +6,12 @@ unset MUJOCO_GL
 
 GPU_ID=0
 seeds=(
-    186109139 2107183402 636244850 1004037165 1548170658
+    186109139	2107183402	636244850	1004037165	1548170658
 )
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_baseline_xml_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_dit_xml_three_stage_unfiltered_clean_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -19,7 +19,7 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_joint_baseline_20261022_070036/100000.pt  \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_xml_three_stage_unfiltered_clean_20261108_052820/100000.pt  \
     --policy dit \
     --task dishrack \
     --gpu-id "$GPU_ID" \
@@ -59,7 +59,7 @@ seeds=(
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_baseline_xml_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_dit_xml_three_stage_unfiltered_clean_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -67,7 +67,7 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_joint_baseline_20261022_070036/100000.pt  \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_xml_three_stage_unfiltered_clean_20261108_052820/100000.pt  \
     --policy dit \
     --task dishrack \
     --gpu-id "$GPU_ID" \
@@ -107,7 +107,7 @@ seeds=(
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_baseline_xml_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_dit_xml_three_stage_unfiltered_clean_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -115,7 +115,7 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_joint_baseline_20261022_070036/100000.pt  \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_xml_three_stage_unfiltered_clean_20261108_052820/100000.pt  \
     --policy dit \
     --task dishrack \
     --gpu-id "$GPU_ID" \
@@ -155,7 +155,7 @@ seeds=(
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_baseline_xml_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_dit_xml_three_stage_unfiltered_clean_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -163,7 +163,7 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_joint_baseline_20261022_070036/100000.pt  \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_xml_three_stage_unfiltered_clean_20261108_052820/100000.pt  \
     --policy dit \
     --task dishrack \
     --gpu-id "$GPU_ID" \
