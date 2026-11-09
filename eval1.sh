@@ -6,13 +6,13 @@ unset MUJOCO_GL
 
 GPU_ID=0
 seeds=(
-    22373076	1815032804	796088752	1800435190	857321548
+    809028483	1137129688	257568292	530360079	2137946100
 )
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    CHECKPOINT="/mnt/afs/L202500703/abc_storage/output/dit_xml_three_stage_real_joint_noise_snr40_20261107_113412/100000.pt"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_xml_three_stage_noise_snr40_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    CHECKPOINT="/mnt/afs/L202500703/abc_storage/output/dit_joint_baseline_20261022_070036/100000.pt"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_baseline_xml_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
