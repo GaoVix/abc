@@ -21,6 +21,7 @@ from abc_sim.task_eval import TaskEvalResult, make_task_evaluator
 SHARED_MODEL_FIELDS = (
     "geom_size", "geom_pos", "geom_quat", "geom_dataid", "geom_type",
     "body_mass", "body_inertia", "mesh_vert", "jnt_qposadr",
+    "geom_contype", "geom_conaffinity", "body_contype", "body_conaffinity",
 )
 
 
@@ -89,6 +90,7 @@ class BatchedWarpYAMEnv:
         camera_height: int,
         camera_width: int,
         gpu_id: int | None = None,
+        render_camera_names: tuple[str, ...] | None = None,
     ):
         if num_worlds < 1:
             raise ValueError(f"num_worlds must be >= 1, got {num_worlds}")
@@ -98,7 +100,10 @@ class BatchedWarpYAMEnv:
             )
         self.base_env = base_env
         self.num_worlds = num_worlds
-        self.camera_names = list(base_env.camera_names)
+        self.camera_names = list(
+            base_env.camera_names if render_camera_names is None else render_camera_names
+        )
+        self._render_camera_names = render_camera_names
         self.camera_height = camera_height
         self.camera_width = camera_width
         self.control_decimation = base_env._control_decimation
@@ -148,6 +153,7 @@ class BatchedWarpYAMEnv:
         }
         self._runtime.reset_from_mujoco()
         self._runtime.sync_model_from_mujoco(stacked)
+        self._runtime.refresh_geom_poses(stacked)
         self._runtime.load_state_batch(
             qpos=stacked["qpos"],
             qvel=stacked["qvel"],
@@ -192,6 +198,8 @@ class BatchedWarpYAMEnv:
             "mocap_pos": np.asarray(data.mocap_pos, dtype=np.float32),
             "mocap_quat": np.asarray(data.mocap_quat, dtype=np.float32),
             "time": np.float32(data.time),
+            "geom_xpos": np.asarray(data.geom_xpos, dtype=np.float32),
+            "geom_xmat": np.asarray(data.geom_xmat, dtype=np.float32),
         }
         for name in PER_EPISODE_MODEL_FIELDS:
             snapshot[name] = np.asarray(getattr(model, name), dtype=np.float32)
@@ -217,8 +225,15 @@ class BatchedWarpYAMEnv:
             runtime=self._runtime,
             cam_res=(self.camera_width, self.camera_height),
             gpu_id=self._gpu_id,
+            camera_names=self._render_camera_names,
         )
-        self._camera_index = {self.model.cam(i).name: i for i in range(self.model.ncam)}
+        self._camera_index = {name: i for i, name in enumerate(self._renderer.camera_names)}
+        if self._render_camera_names is not None:
+            print(
+                f"[render] cameras={','.join(self._renderer.camera_names)} "
+                f"({self._renderer.ncam}/{self.model.ncam})",
+                flush=True,
+            )
         self._evaluator = make_task_evaluator(self.model, self.base_env._task_spec)
         if hasattr(self._evaluator, "configure_from_randomization"):
             self._evaluator = PerWorldEvaluators(self.model, self.base_env._task_spec, self.num_worlds)

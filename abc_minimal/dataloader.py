@@ -17,6 +17,9 @@ from abc_minimal.dit import task_name_to_prompt
 from abc_minimal.operator import operator_label_for
 from abc_minimal.preprocess import augment_and_normalize, normalize, preset_for_backbone
 
+# Physical 14D state: left joints, left gripper, right joints, right gripper.
+_STATE_JOINT_COLUMNS = [*range(6), *range(7, 13)]
+
 # --- data-parallel placement ---------------------------------------------------
 
 @dataclass(frozen=True)
@@ -189,6 +192,83 @@ def read_state_action_rows(
         raw = f.read((end - start) * row_bytes)
     return np.frombuffer(raw, dtype=np.float64).reshape(-1, row_width)
 
+
+def full_sequence_state_stds(episodes, model_config):
+    """Compute raw state std once per complete source sequence.
+
+    IK export segments point back to the complete final-state NPZ. Validate
+    every retained slice against that trajectory; never substitute the segment
+    std or the original robot's unconverted joints when the result is missing.
+    Unsegmented episodes, including original sim, use their complete binary.
+    """
+    groups = {}
+    for index, (ep_dir, length, *_) in enumerate(episodes):
+        metadata_path = ep_dir / "episode_metadata.json"
+        metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+        conversion = metadata.get("sequence_ik")
+        if conversion is not None:
+            result = conversion.get("state_result")
+            if not result or "source_frame_range" not in metadata:
+                raise ValueError(f"missing full-sequence state provenance in {ep_dir}")
+            path = Path(result).expanduser()
+            if not path.is_absolute():
+                path = ep_dir / path
+            path = path.resolve()
+            if not path.is_file():
+                raise ValueError(
+                    f"full-sequence state result missing: {path}; retain the original "
+                    "IK upload bundle or repair sequence_ik.state_result in metadata"
+                )
+            key = ("ik", path)
+        else:
+            if "source_frame_range" in metadata:
+                raise ValueError(f"segmented episode lacks a full state result: {ep_dir}")
+            key = ("binary", ep_dir)
+        groups.setdefault(key, []).append((index, ep_dir, length, metadata))
+
+    stds = np.empty((len(episodes), model_config.state_dim), dtype=np.float64)
+    for (kind, path), members in groups.items():
+        if kind == "ik":
+            with np.load(path, allow_pickle=False) as result:
+                states = result["optimized_states"]
+                indices = result["frame_indices"]
+                base_mode = str(result["base_mode"])
+                solver = str(result["solver"])
+                camera_from_base = result["camera_from_base"]
+            if not np.array_equal(indices, np.arange(len(states))):
+                raise ValueError(f"state result is not a complete official sequence: {path}")
+        else:
+            states = read_state_action_rows(path, 0, members[0][2], model_config)[
+                :, : model_config.state_dim
+            ]
+        if (
+            states.ndim != 2 or states.shape[1] != model_config.state_dim
+            or not len(states) or not np.isfinite(states).all()
+        ):
+            raise ValueError(f"full-sequence state must have finite (T, state_dim) values: {path}")
+        std = np.std(states, axis=0)
+        for index, ep_dir, length, metadata in members:
+            if kind == "ik":
+                begin, end = metadata["source_frame_range"]
+                conversion = metadata["sequence_ik"]
+                if not (0 <= begin < end <= len(states) and end - begin == length):
+                    raise ValueError(f"invalid full-sequence frame range in {ep_dir}")
+                if base_mode != conversion.get("base_mode") or solver != conversion.get("state_solver"):
+                    raise ValueError(f"full-sequence base/solver mismatch in {ep_dir}")
+                np.testing.assert_allclose(
+                    camera_from_base, conversion["camera_from_base"], atol=1e-12, rtol=0,
+                    err_msg=f"full-sequence camera/base mismatch in {ep_dir}",
+                )
+                actual = read_state_action_rows(ep_dir, 0, length, model_config)[
+                    :, : model_config.state_dim
+                ]
+                np.testing.assert_array_equal(
+                    actual, states[begin:end], err_msg=f"full-sequence state mismatch in {ep_dir}"
+                )
+            stds[index] = std
+    return stds, len(groups)
+
+
 _KEYFRAME_CACHE: dict = {}
 
 
@@ -298,7 +378,12 @@ class EpisodeDataset(Dataset):
         prompt_config: PromptConfig | None = None,
         operator_label_maps=None,
         norm_preset="auto",
+        state_noise_snr=None,
     ):
+        if state_noise_snr is not None and (
+            not np.isfinite(state_noise_snr) or state_noise_snr < 0
+        ):
+            raise ValueError("state_noise_snr must be finite and non-negative, or None")
         self.episodes = scan_episodes(data_dir, default_task_name, model_config)
         if not self.episodes:
             raise ValueError(f"no episodes found in {data_dir}")
@@ -307,6 +392,9 @@ class EpisodeDataset(Dataset):
         self.norm_stats = norm_stats
         self.train = train
         self.mask_state_ratio = mask_state_ratio
+        self.state_noise_std = None
+        self._state_noise_generator = None
+        self._state_noise_seed = None
         backbone = getattr(model_config, "backbone", None)
         self.image_size = getattr(backbone, "image_size", 224)
         # "auto" derives the image-normalization preset from the vision backbone
@@ -325,6 +413,27 @@ class EpisodeDataset(Dataset):
         self._subtask_cache = {}
         self._operator_cache = {}
         self.cum = np.cumsum([usable for _, _, usable, _, _, _ in self.episodes])
+        if self.train and state_noise_snr is not None and Path(data_dir).name == "train_real":
+            if model_config.state_dim != 14:
+                raise ValueError("real joint state noise requires the 14D bimanual state layout")
+            print(
+                f"[state noise] {Path(data_dir).name}: computing full-sequence std "
+                f"for {len(self.episodes)} training episodes (SNR={state_noise_snr:g} dB)",
+                flush=True,
+            )
+            # Compute once per dataset, before DataLoader workers are created.
+            stds, sequence_count = full_sequence_state_stds(self.episodes, model_config)
+            self.state_noise_std = stds * (10.0 ** (-state_noise_snr / 20.0))
+            self.state_noise_std[:, [6, 13]] = 0.0
+            print(
+                f"[state noise] {Path(data_dir).name}: {sequence_count} full-sequence "
+                f"noise scales ready for {len(self.episodes)} training episodes; "
+                "12 joint angles only (rad); grippers and action labels unchanged",
+                flush=True,
+            )
+        elif self.train and state_noise_snr is not None:
+            print(f"[state noise] {Path(data_dir).name}: disabled; only train_real joints get noise",
+                  flush=True)
 
     def __len__(self):
         return int(self.cum[-1])
@@ -341,7 +450,23 @@ class EpisodeDataset(Dataset):
         rows = read_state_action_rows(
             ep_dir, k, k + self.model_config.chunk_length, self.model_config
         )
-        state = normalize(rows[0, : self.model_config.state_dim], self.norm_stats["state"])
+        state = rows[0, : self.model_config.state_dim]
+        if self.train and self.state_noise_std is not None:
+            # Joint values and noise std are both in radians, before
+            # normalization. Draw only for the 12 joints; never alter grippers.
+            # A private per-worker stream leaves the original masking/image/
+            # prompt RNG untouched. DataLoader assigns each worker its seed.
+            worker_seed = torch.initial_seed()
+            if self._state_noise_seed != worker_seed:
+                self._state_noise_generator = torch.Generator(device="cpu")
+                self._state_noise_generator.manual_seed(worker_seed ^ 0x524454)  # "RDT"
+                self._state_noise_seed = worker_seed
+            state = state.copy()
+            state[_STATE_JOINT_COLUMNS] += (
+                torch.randn(len(_STATE_JOINT_COLUMNS), generator=self._state_noise_generator).numpy()
+                * self.state_noise_std[ep_idx, _STATE_JOINT_COLUMNS]
+            )
+        state = normalize(state, self.norm_stats["state"])
         state = state.astype(np.float32)
         actions = normalize(rows[:, self.model_config.state_dim :], self.norm_stats["actions"])
         actions = actions.astype(np.float32)
@@ -482,7 +607,8 @@ def build_train_loader(config, components, norm_stats, data_scope, resume_step,
                        model_config=model_config,
                        prompt_config=prompt_config,
                        operator_label_maps=operator_label_maps,
-                       norm_preset=norm_preset)
+                       norm_preset=norm_preset,
+                       state_noise_snr=config.flow.state_noise_snr)
         for c in components
     ]
     component_weights = [c.weight for c in components]

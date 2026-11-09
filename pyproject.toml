@@ -33,6 +33,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+inference-ik = [
+    "pin==3.7.0",
+    "pin-pink==3.5.0",
+    "daqp>=0.10.3",
+    # Pin 3.7 wheels link against these cmeel library ABI versions.
+    "cmeel-urdfdom>=4,<5",
+    "cmeel-tinyxml2>=10,<11",
+]
 deploy = [
     "dynamixel-sdk",
     "evdev; sys_platform == 'linux'",
@@ -59,7 +67,8 @@ override-dependencies = [
 include = ["abc_minimal*", "abc_sim*", "deploy*"]
 
 [tool.setuptools.package-data]
-abc_sim = ["models/*.xml", "models/assets_manifest.json"]
+abc_minimal = ["dishrack_median_base_poses.json"]
+abc_sim = ["models/*.xml", "models/assets_manifest.json", "models/dishrack_training_base_poses.json.gz"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }

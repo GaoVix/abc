@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from abc_minimal.base_compensation import BaseCompensatedEnv
 from abc_minimal.config import (
     SimEvalConfig,
     validate_model_config,
@@ -296,9 +297,18 @@ def validate_rtc_config(config: SimEvalConfig) -> list[str]:
 
 
 def validate_batched_config(config: SimEvalConfig) -> list[str]:
+    if config.world_indices is not None:
+        if not config.world_indices or len(set(config.world_indices)) != len(config.world_indices):
+            return ["world_indices must be nonempty and contain no duplicates"]
+        if any(index < 0 or index >= config.num_worlds for index in config.world_indices):
+            return ["world_indices must be original indices in [0, num_worlds)"]
+        if config.parallel_worlds:
+            return ["world_indices requires --parallel-worlds 0"]
     if config.parallel_worlds < 0:
         return ["parallel_worlds must be >= 0"]
     if config.parallel_worlds == 0:
+        if config.render_policy_cameras_only:
+            return ["--render-policy-cameras-only requires --parallel-worlds > 0"]
         return []
     errors = []
     if config.num_worlds % config.parallel_worlds:
@@ -383,6 +393,9 @@ def _make_env(config: SimEvalConfig, camera_keys: tuple[str, ...]) -> SimTaskEnv
         prompt=config.prompt,
         camera_backend=config.camera_backend,
         gpu_id=config.gpu_id,
+        disable_arm_control_limits=config.disable_arm_control_limits,
+        disable_all_arm_limits=config.disable_all_arm_limits,
+        disable_arm_joint_limits=config.disable_arm_joint_limits,
     )
 
 
@@ -496,9 +509,19 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     config_errors = (
         model_errors + validate_rtc_config(config) + validate_batched_config(config)
     )
+    if config.deterministic_inference:
+        if config.fast_inference:
+            config_errors.append("--deterministic-inference requires --no-fast-inference")
+        if config.parallel_worlds:
+            config_errors.append("--deterministic-inference requires --parallel-worlds 0 (CPU MuJoCo physics)")
     if config_errors:
         raise ValueError("Invalid sim eval config:\n  - " + "\n  - ".join(config_errors))
 
+    if config.deterministic_inference:
+        from abc_minimal.determinism import configure_determinism
+
+        configure_determinism(config.policy_seed)
+        print("[determinism] PyTorch deterministic algorithms enabled; TF32 off; math attention", flush=True)
     require_mjwarp()
     options = reset_options(config)
     config = replace(
@@ -529,11 +552,34 @@ def run_eval(config: SimEvalConfig) -> dict[str, Any]:
     if config.parallel_worlds:
         from abc_minimal.batched_eval import make_batched_env, rollout_batched_worlds
 
-        env = make_batched_env(config)
+        env = make_batched_env(config, tuple(model_config.camera_keys))
         rollout = rollout_batched_worlds
     else:
         env = _make_env(config, tuple(model_config.camera_keys))
         rollout = rollout_worlds
+    if config.disable_all_arm_limits:
+        print(
+            "[control] arm PD target, physical joint, actuator force and joint "
+            "actuator force limits disabled; gripper limits retained",
+            flush=True,
+        )
+    elif config.disable_arm_joint_limits:
+        print(
+            "[control] arm physical joint limits disabled; force-limit settings retained; "
+            "PD target clamping " + ("disabled" if config.disable_arm_control_limits else "retained"),
+            flush=True,
+        )
+    elif config.disable_arm_control_limits:
+        print(
+            "[control] arm actuator target clamping disabled; "
+            "XML physical joint limits and actuator force limits retained",
+            flush=True,
+        )
+    if config.compensate_arm_bases:
+        env = BaseCompensatedEnv(
+            env, out_dir, ik_backend=config.base_compensation_ik,
+            reference=config.base_compensation_reference,
+        )
     physics = resolved_physics(env)
     if physics is not None:
         print(
@@ -562,8 +608,7 @@ def rollout_worlds(
     out_dir: Path,
     model_config: Any,
 ) -> list[dict[str, Any]]:
-    """Roll out the worlds one at a time in CPU MuJoCo; returns their records."""
-    rng = np.random.default_rng(config.policy_seed)
+    """Roll out independent worlds one at a time in CPU MuJoCo."""
     worlds = []
     fast_inference_ready = False
     rtc_warmup_ready = False
@@ -573,7 +618,12 @@ def rollout_worlds(
         return generator.standard_normal(action_shape, dtype=np.float32)
 
     try:
-        for world_index in range(config.num_worlds):
+        indices = config.world_indices if config.world_indices is not None else range(config.num_worlds)
+        for world_index in indices:
+            # Match batched eval: previous episodes must not affect this
+            # world's initial arm pose or diffusion-noise stream.
+            rng = np.random.default_rng([config.policy_seed, world_index])
+            env.forget_arm_state()
             video = None
             video_path = None
             t0 = time.perf_counter()
@@ -581,18 +631,11 @@ def rollout_worlds(
             try:
                 obs = env.reset(seed=seed, options=options)
             except RandomizationSamplingError:
-                # The carried arm pose from the previous episode can block a
-                # seed that places fine from init_q; retry from init_q before
-                # resampling so the run keeps its world count.
+                seed = int(config.seed + world_index + 100_000)
+                print(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
+                # A failed reset may already have initialized the arm state.
                 env.forget_arm_state()
-                try:
-                    obs = env.reset(seed=seed, options=options)
-                    print(f"world={world_index:03d} unplaceable from the carried "
-                          "arm pose, placed from init_q")
-                except RandomizationSamplingError:
-                    seed = int(config.seed + world_index + 100_000)
-                    print(f"world={world_index:03d} unplaceable seed, resampled -> {seed}")
-                    obs = env.reset(seed=seed, options=options)
+                obs = env.reset(seed=seed, options=options)
             if config.fast_inference and not fast_inference_ready:
                 warmup_rng = np.random.default_rng(config.policy_seed)
                 warmup_noise = sample_noise(warmup_rng)

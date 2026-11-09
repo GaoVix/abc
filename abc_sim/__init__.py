@@ -334,6 +334,7 @@ def make_batched_env(
     camera_height: int = 480,
     camera_width: int = 640,
     camera_gpu_id: int | None = None,
+    render_camera_names: tuple[str, ...] | None = None,
     **kwargs,
 ):
     """Create ``num_worlds`` copies of a task scene stepped together in MJWarp.
@@ -350,6 +351,7 @@ def make_batched_env(
         camera_height=camera_height,
         camera_width=camera_width,
         gpu_id=camera_gpu_id,
+        render_camera_names=render_camera_names,
     )
 
 

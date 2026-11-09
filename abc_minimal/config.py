@@ -40,6 +40,11 @@ class FlowConfig:
     num_diffusion_steps: int = 10
     # VLA policy only: independent noise/timestep draws per sample per step.
     num_diffusion_draws: int = 1
+    # RDT SNR formula, restricted to the 12 arm joints in train_real, before
+    # normalization: full_sequence_std * 10**(-SNR/20), in radians. Grippers
+    # and sim stay clean. IK segments share their complete final trajectory's
+    # std. None disables it; 40 dB means 1% of sequence std. Training only.
+    state_noise_snr: float | None = None
 
 
 @dataclass
@@ -127,6 +132,10 @@ MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
     "tshirt": [
         MixtureComponent("train_real", "val_real", 1.0, "folding_tshirt_pile_and_stacking"),
     ],
+    "load_the_plates_into_the_dish_rack": [
+        MixtureComponent("train_real", "val_real", 0.8, "load_the_plates_into_the_dish_rack"),
+        MixtureComponent("train_sim", "val_sim", 0.2, "sim_load_the_plates_into_the_dish_rack"),
+    ],
     # Single-task sim finetuning: point --cache-root at a cache holding exactly
     # one task's episodes (prepare.py --sim-data <task> into a fresh root). The
     # component reads everything under train_sim/, and each episode's own
@@ -158,7 +167,9 @@ class TrainConfig:
     num_workers: int = 16
     train_steps: int = 75_000
 
-    mixture_preset: Literal["bottles", "tshirt", "sim_task"] = "bottles"
+    mixture_preset: Literal[
+        "bottles", "tshirt", "sim_task", "load_the_plates_into_the_dish_rack"
+    ] = "bottles"
     mixture: list[MixtureComponent] = field(default_factory=list)
 
     load_pretrained: bool = False
@@ -276,7 +287,17 @@ class SimEvalConfig:
     gpu_id: int | None = None
     camera_backend: Literal["mjwarp", "mujoco", "blender"] = "mjwarp"  # "mujoco" is the CPU/macOS fallback
     parallel_worlds: int = 0  # >0: step this many worlds together in MJWarp physics; 0: one CPU MuJoCo world at a time
+    world_indices: tuple[int, ...] | None = None  # CPU eval subset; retain original world seeds/noise streams.
+    render_policy_cameras_only: bool = False  # Parallel eval: skip cameras absent from model.camera_keys.
     randomization: str | None = None  # JSON reset request for the task randomizer, applied to every world
+    disable_arm_control_limits: bool = False  # Eval ablation: allow raw arm PD targets beyond XML ctrlrange.
+    disable_all_arm_limits: bool = False  # Also disable physical arm joint limits and actuator/joint force limits; keep grippers unchanged.
+    disable_arm_joint_limits: bool = False  # Disable physical arm angle constraints only; keep all force-limit settings unchanged.
+    compensate_arm_bases: bool = False
+    # Testing-time compensation IK only; independent of training/data conversion.
+    base_compensation_ik: Literal["pink", "pink-debug", "mink", "slsqp"] = "pink"
+    base_compensation_reference: Literal["xml", "median"] = "xml"
+    deterministic_inference: bool = False  # Requires CPU MuJoCo physics and fast_inference=False.
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"
     vanilla_physics: bool = False
@@ -390,6 +411,9 @@ def validate_train_config(
         errors.append(
             "flow probabilities must be in [0, 1] and prefix_noise_scale must be non-negative"
         )
+    snr = config.flow.state_noise_snr
+    if snr is not None and (not math.isfinite(snr) or snr < 0):
+        errors.append("flow.state_noise_snr must be finite and non-negative, or None")
     if config.policy == "vla":
         errors.extend(validate_vla_model_config(config.vla_model))
     else:
