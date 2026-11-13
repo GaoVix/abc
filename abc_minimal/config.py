@@ -122,6 +122,8 @@ class DiTConfig:
     vision_pool_num_queries: int = 12
     vision_pool_num_heads: int = 8
     vision_pool_mlp_ratio: int = 4
+    # Plücker CNN + late fusion; retain the image encoder and camera embeddings.
+    use_cape: bool = False
 
 
 MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
@@ -679,5 +681,3 @@ def validate_vla_checkpoint_config(
             + "\n".join(f"  - {problem}" for problem in problems)
         )
     return True
-
-

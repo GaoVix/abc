@@ -319,6 +319,8 @@ cases. Bundled license texts live under `assets/third_party/`.
 
 | Project | License | License file | Inclusion | What we use/adapt |
 | --- | --- | --- | --- | --- |
+| [CamPose](https://github.com/ripl/CamPoseOpensource) | MIT | [`assets/third_party/campose/LICENSE`](assets/third_party/campose/LICENSE) | Adapted (`abc_minimal/cape.py`) | ACT-style Plücker geometry CNN and late fusion for optional DiT camera conditioning |
+| [librealsense](https://github.com/realsenseai/librealsense) | Apache 2.0 | [`assets/third_party/librealsense/LICENSE`](assets/third_party/librealsense/LICENSE) | Adapted (`abc_minimal/camera_rays.py`) | Brown/Inverse-Brown pixel-to-ray inversion; no RealSense runtime dependency |
 | [DINOv3](https://github.com/facebookresearch/dinov3) | DINOv3 License (Meta) | [`assets/third_party/dinov3/LICENSE.md`](assets/third_party/dinov3/LICENSE.md) | Adapted (`abc_minimal/dit.py`); pretrained weights downloaded by the user | ViT-B/16 vision backbone (`DinoRope`, `DinoAttention`, `DinoMlp`, etc.) |
 | [OpenAI CLIP](https://github.com/openai/CLIP) | MIT | [`assets/third_party/clip/LICENSE`](assets/third_party/clip/LICENSE) | Adapted (`abc_minimal/dit.py`); ViT-B/32 text weights + BPE vocab downloaded at runtime | CLIP text encoder + BPE tokenizer (`CLIPBPETokenizer`, `CLIPTextTower`, `CLIPTextEmbedder`) |
 | [openpi](https://github.com/Physical-Intelligence/openpi) | Apache 2.0 | [`assets/third_party/openpi/LICENSE`](assets/third_party/openpi/LICENSE) | Adapted (`deploy/client/websocket_client_policy.py`, `deploy/client/msgpack_numpy.py`) | Websocket inference client skeleton + msgpack NumPy serialization |

@@ -145,15 +145,25 @@ def _rotate(img_hwc, angle_deg):
     return out.squeeze(0).permute(1, 2, 0)
 
 
-def augment_and_normalize(images, train, norm_preset="imagenet", image_size=224):
+def augment_and_normalize(images, train, norm_preset="imagenet", image_size=224, *, plucker_maps=None):
     """Apply augmentations, optionally followed by backbone normalization.
 
     ``norm_preset=None`` is the VLA path: Gemma/SigLIP owns normalization and
     therefore receives resized images in raw [0, 1] space.
+    With ``plucker_maps``, return (images, maps) after identical spatial
+    augmentation; color augmentation and normalization apply only to RGB.
     """
     out = {}
+    out_plucker = {}
     for cam, img in images.items():
         x = img.permute(1, 2, 0)
+        if plucker_maps is not None:
+            rays = plucker_maps[cam]
+            if rays.shape != (6, *img.shape[-2:]):
+                raise ValueError(f"{cam}: Plücker map must align with the unaugmented RGB image")
+            # One sampling grid for RGB and rays, including rotation, crop,
+            # resize, and padding. Photometric augmentation stays RGB-only.
+            x = torch.cat((x, rays.permute(1, 2, 0)), dim=-1)
         if train and "top" in cam:
             angle = (torch.rand(1) * 10 - 5).item()
             x = _rotate(x, angle)
@@ -170,6 +180,11 @@ def augment_and_normalize(images, train, norm_preset="imagenet", image_size=224)
                     align_corners=False,
                 ).squeeze(0).permute(1, 2, 0)
         x = resize_with_pad(x, image_size, image_size)
+        if plucker_maps is not None:
+            from abc_minimal.cape import normalize_plucker
+
+            out_plucker[cam] = normalize_plucker(x[..., 3:].permute(2, 0, 1))
+            x = x[..., :3]
         if train:
             b = 0.7 + torch.rand(1).item() * 0.6
             x = x * b
@@ -182,4 +197,4 @@ def augment_and_normalize(images, train, norm_preset="imagenet", image_size=224)
             x = torch.clamp(x, 0, 1)
         x = x.permute(2, 0, 1)
         out[cam] = x if norm_preset is None else normalize_image(x, preset=norm_preset)
-    return out
+    return (out, out_plucker) if plucker_maps is not None else out

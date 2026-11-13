@@ -198,6 +198,7 @@ def export_episode(job):
 
     # Per-camera mp4s are intermediates that get vstacked into combined.mp4.
     # Keep them in a tempdir so the output dir only carries the trainer-needed files.
+    source_camera_resolutions = {}
     with tempfile.TemporaryDirectory() as work:
         mp4s = []
         for cam_key, topic in active_cams:
@@ -207,6 +208,7 @@ def export_episode(job):
                 tmp.write(b"".join(data for _, data in msgs))
             try:
                 width, height = probe(tmp.name, "-show_entries", "stream=width,height")
+                source_camera_resolutions[cam_key] = [width, height]
                 (n_frames,) = probe(tmp.name, "-count_frames", "-show_entries", "stream=nb_read_frames")
                 if n_frames > 0 and n_frames != len(cam_ts):  # h264 chunks != frames; respace timestamps
                     cam_ts = np.linspace(cam_ts[0], cam_ts[-1], n_frames, dtype=np.int64)
@@ -243,6 +245,8 @@ def export_episode(job):
 
     meta = {"task_name": task_name, "cameras": [k for k, _ in active_cams],
             "camera_resolutions": {k: [OUT_W, OUT_H] for k, _ in active_cams},
+            "source_camera_resolutions": source_camera_resolutions,
+            "camera_topics": dict(active_cams),
             "alignment": "fixed_clock_30hz_causal", "t0_ns": int(t0), "tick_ns": TICK_NS,
             "num_steps": num_steps, "top_camera_timestamps_ns": top_camera_timestamps}
     # operator_id is optional conditioning/filtering signal (see the dataloader's

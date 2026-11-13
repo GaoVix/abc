@@ -89,6 +89,8 @@ def batch_to_device(batch, device, embedder, camera_keys):
         "state_is_masked": batch["state_is_masked"].to(device, non_blocking=True),
     }
     if embedder is not None:  # DiT path
+        if "plucker" in batch:
+            out["plucker"] = {cam: rays.to(device, non_blocking=True) for cam, rays in batch["plucker"].items()}
         out["task_vec_clip"] = embedder.encode(batch["prompt"]).to(
             device, non_blocking=True
         )
@@ -216,7 +218,7 @@ def _build_dit_model(config, cache_root, device, resume_ckpt, rank, distributed)
         if rank == 0:
             print(f"resuming from {config.resume_from}")
     elif config.load_pretrained:
-        ckpt = load_pretrained(model, checkpoint_path)
+        ckpt = load_pretrained(model, checkpoint_path, initialize_cape=config.model.use_cape)
         ckpt_norm_stats = ckpt.get("norm_stats") if isinstance(ckpt, dict) else None
         if rank == 0:
             print(f"loaded pretrained checkpoint {checkpoint_path}")
@@ -500,7 +502,7 @@ def main(config: TrainConfig):
             model_state, optimizer_state = fsdp_state_dicts(model, optimizer) if fsdp else (None, None)
             if data_scope.checkpoint_writer:
                 path = output_dir / f"{global_step}.pt"
-                model_config = asdict(config.vla_model) if is_vla else None
+                model_config = asdict(config.vla_model if is_vla else config.model)
                 save_checkpoint(path, module=module, optimizer=optimizer, scheduler=scheduler,
                                 global_step=global_step, norm_stats=norm_stats,
                                 batch_size=config.batch_size, data_world=data_scope.world,

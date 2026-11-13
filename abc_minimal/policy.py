@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from abc_minimal.checkpointing import model_state_dict
+from abc_minimal.cape import observation_plucker
 from abc_minimal.config import (
     FlowConfig,
     VLAModelConfig,
@@ -104,6 +105,8 @@ class InferencePolicy:
             replay_warmups = self.fast_inference_replay_warmups
         m = self.model_config
         if warmup_obs is None:
+            if getattr(m, "use_cape", False):
+                raise ValueError("CaPE warmup requires warmup_obs with real camera calibration")
             warmup_obs = {
                 "state": np.zeros(m.state_dim, dtype=np.float32),
                 "images": {
@@ -275,6 +278,8 @@ class DiTInferencePolicy(InferencePolicy):
             "images": images,
             "task_vec_clip": task_vec,
         }
+        if m.use_cape:
+            batch["plucker"] = observation_plucker(obs, m.camera_keys, self.device)
         noise_t = None
         if noise is not None:
             noise_arr = np.asarray(noise, dtype=np.float32).reshape(

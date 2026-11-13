@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from abc_minimal.config import DiTConfig, PromptConfig, VLAModelConfig
+from abc_minimal.camera_parameters import episode_plucker, require_camera_parameters
 from abc_minimal.dit import task_name_to_prompt
 from abc_minimal.operator import operator_label_for
 from abc_minimal.preprocess import augment_and_normalize, normalize, preset_for_backbone
@@ -389,6 +390,10 @@ class EpisodeDataset(Dataset):
             raise ValueError(f"no episodes found in {data_dir}")
         self.model_config = model_config
         self.camera_keys = tuple(model_config.camera_keys)
+        self.use_cape = getattr(model_config, "use_cape", False)
+        if self.use_cape:
+            for ep_dir, *_ in self.episodes:
+                require_camera_parameters(ep_dir)
         self.norm_stats = norm_stats
         self.train = train
         self.mask_state_ratio = mask_state_ratio
@@ -451,6 +456,8 @@ class EpisodeDataset(Dataset):
             ep_dir, k, k + self.model_config.chunk_length, self.model_config
         )
         state = rows[0, : self.model_config.state_dim]
+        # Check cached poses against this exact row, before input augmentation.
+        geometry_state = state.copy() if self.use_cape else None
         if self.train and self.state_noise_std is not None:
             # Joint values and noise std are both in radians, before
             # normalization. Draw only for the 12 joints; never alter grippers.
@@ -475,20 +482,30 @@ class EpisodeDataset(Dataset):
         if state_is_masked:
             state = np.zeros_like(state)
 
+        raw_images = decode_frame(ep_dir, k, length, source_cameras, self.camera_keys)
+        plucker = None
+        if self.use_cape:
+            plucker = episode_plucker(ep_dir, k, geometry_state, length, raw_images)
         images = augment_and_normalize(
-            decode_frame(ep_dir, k, length, source_cameras, self.camera_keys),
+            raw_images,
             self.train,
             norm_preset=self.norm_preset,
             image_size=self.image_size,
+            plucker_maps=plucker,
         )
+        if plucker is not None:
+            images, plucker = images
         prompt = self.build_prompt(ep_dir, k, task_name, prompt_timeline)
-        return {
+        sample = {
             "state": torch.from_numpy(state),
             "actions": torch.from_numpy(actions),
             "images": images,
             "state_is_masked": state_is_masked,
             "prompt": prompt,
         }
+        if plucker is not None:
+            sample["plucker"] = plucker
+        return sample
 
     def build_prompt(self, ep_dir, frame_idx, task_name, prompt_timeline):
         """Compose the text prompt for one frame: the episode's prompt at that
@@ -581,7 +598,7 @@ class GlobalStepSampler(Sampler):
         return self.count
 
 def collate(samples, camera_keys):
-    return {
+    batch = {
         "state": torch.stack([s["state"] for s in samples]),
         "actions": torch.stack([s["actions"] for s in samples]),
         "images": {
@@ -590,6 +607,11 @@ def collate(samples, camera_keys):
         "state_is_masked": torch.tensor([s["state_is_masked"] for s in samples]),
         "prompt": [s["prompt"] for s in samples],
     }
+    if "plucker" in samples[0]:
+        batch["plucker"] = {
+            cam: torch.stack([sample["plucker"][cam] for sample in samples]) for cam in camera_keys
+        }
+    return batch
 
 
 # --- loader construction -------------------------------------------------------

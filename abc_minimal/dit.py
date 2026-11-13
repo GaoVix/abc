@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from abc_minimal.config import ClipConfig, DiTConfig
+from abc_minimal.cape import PluckerLateFusion
 from abc_minimal.preprocess import NORM_PRESETS, preset_for_backbone
 
 # CLIP ViT-B/32 text encoder.
@@ -823,6 +824,9 @@ class DiTPolicy(nn.Module):
         else:
             self.img_backbone = DinoVisionBackbone(config)
 
+        if config.use_cape:
+            self.cape = PluckerLateFusion(config.vit_embed_dim)
+
         self.apool_queries = nn.ParameterDict(
             {
                 cam: nn.Parameter(
@@ -865,7 +869,7 @@ class DiTPolicy(nn.Module):
         pos = get_1d_sincos_pos_embed(H, config.chunk_length)
         self.pos_embed.data.copy_(torch.from_numpy(pos).float().unsqueeze(0))
 
-    def build_vision_tokens(self, images):
+    def build_vision_tokens(self, images, plucker=None):
         """images: dict cam -> (B, 3, 224, 224), already ImageNet-normalized.
         Returns (B, num_cameras * queries, hidden)."""
         batch_size = images[self.camera_keys[0]].shape[0]
@@ -891,6 +895,13 @@ class DiTPolicy(nn.Module):
         for index, cam in enumerate(self.camera_keys):
             tokens = all_tokens[index]
             tokens = tokens.to(self.apool_queries[cam].dtype)
+            if self.config.use_cape:
+                if plucker is None or cam not in plucker:
+                    raise ValueError(f"CaPE requires image-aligned Plücker maps for camera {cam!r}")
+                image = images[cam]
+                if plucker[cam].shape[-2:] != image.shape[-2:]:
+                    raise ValueError(f"CaPE {cam}: Plücker map and image sizes differ")
+                tokens = self.cape(tokens, plucker[cam], (image.shape[-2] // 16, image.shape[-1] // 16))
             queries = self.apool_queries[cam].expand(tokens.shape[0], -1, -1)
             pooled.append(self.apool[cam](tokens, queries))
         tokens_by_camera = torch.stack(pooled, dim=1)  # (B, Nc, K, vit_dim)
@@ -967,7 +978,7 @@ class DiTPolicy(nn.Module):
         if prefix_noise_scale > 0.0 and prefix_mask_expanded is not None:
             x_t = x_t + prefix_mask_expanded.float() * torch.randn_like(x_t) * prefix_noise_scale
 
-        vision_tokens = self.build_vision_tokens(batch["images"])
+        vision_tokens = self.build_vision_tokens(batch["images"], batch.get("plucker"))
         t_cond = t_per_pos.squeeze(-1) if prefix_mask_expanded is not None else t[:, 0, 0]
         c = self.compute_cond(state, batch["task_vec_clip"], t_cond)
         v_t = self.predict_velocity(x_t, c, vision_tokens)
@@ -996,7 +1007,7 @@ class DiTPolicy(nn.Module):
                 dtype=model_dtype,
             )
         x_t = noise.to(device=state.device, dtype=model_dtype)
-        vision_tokens = self.build_vision_tokens(batch["images"])
+        vision_tokens = self.build_vision_tokens(batch["images"], batch.get("plucker"))
         dt = -1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((B,), 1.0 + i * dt, device=state.device, dtype=model_dtype)
@@ -1027,7 +1038,7 @@ class DiTPolicy(nn.Module):
         prefix_t_mask = prefix_pos.view(1, self.chunk_length).expand(B, self.chunk_length)
         x_t = torch.where(prefix_mask, action_prefix, x_t)
 
-        vision_tokens = self.build_vision_tokens(batch["images"])
+        vision_tokens = self.build_vision_tokens(batch["images"], batch.get("plucker"))
         dt = -1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((B,), 1.0 + i * dt, device=state.device, dtype=model_dtype)
@@ -1044,12 +1055,19 @@ class DiTPolicy(nn.Module):
         return x_t
 
 
-def load_pretrained(model, ckpt_path):
-    """Load a production checkpoint (model-only, compile prefixes stripped)."""
+def load_pretrained(model, ckpt_path, *, initialize_cape=False):
+    """Load weights strictly; training may explicitly initialize a new CaPE branch.
+
+    Only a wholly absent CaPE branch may be initialized. Partial CaPE
+    checkpoints, missing parent tensors, and inference loads remain strict.
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
     sd = ckpt["model"] if "model" in ckpt else ckpt
     sd = {k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k: v for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
+    if initialize_cape and model.config.use_cape and not any(k.startswith("cape.") for k in sd):
+        missing = [k for k in missing if not k.startswith("cape.")]
+        print("load_pretrained: initialized CaPE late fusion from the RGB-only parent (identity fusion)")
     if missing:
         raise RuntimeError(
             f"checkpoint is missing model keys — wrong checkpoint for "

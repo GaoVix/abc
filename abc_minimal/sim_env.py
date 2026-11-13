@@ -49,6 +49,7 @@ class SimTaskEnv:
         disable_arm_control_limits: bool = False,
         disable_all_arm_limits: bool = False,
         disable_arm_joint_limits: bool = False,
+        camera_geometry: bool = False,
     ):
         self.spec = task_spec(task)
         self.height = height
@@ -56,6 +57,7 @@ class SimTaskEnv:
         self.render_width = 1024
         self.render_height = round(height * self.render_width / width)
         self.camera_keys = tuple(camera_keys)
+        self.camera_geometry = camera_geometry
         self.prompt = prompt
         self.randomization: Any = None
         if self.spec.evaluator_name is None:
@@ -125,11 +127,18 @@ class SimTaskEnv:
         # the observation matches what the native env hands the rollout loop.
         # The prompt is the env's own: task randomizers rewrite it per episode
         # for the prompt-varying tasks (put_relative, count_into_opaque_box).
-        return {
+        result = {
             "state": np.asarray(obs["state"], dtype=np.float32),
             "images": self._camera_images(obs["images"]),
             "prompt": obs["prompt"],
         }
+        if self.camera_geometry:
+            from abc_minimal.cape import mujoco_camera_geometry
+
+            # K describes the PIL-resized RGB, not the high-resolution render.
+            result.update(mujoco_camera_geometry(self.env.model, self.env.data, self.camera_keys,
+                                                 self.height, self.width))
+        return result
 
     def _camera_images(self, images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         missing = [name for name in self.camera_keys if name not in images]

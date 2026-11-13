@@ -628,6 +628,9 @@ class MuJoCoYAMEnv(gym.Env):
 
     def get_obs(self) -> dict[str, Any]:
         """Return observation dict with state, images, and metadata."""
+        # mj_step leaves derived poses before integration; refresh before RGB.
+        mujoco.mj_kinematics(self.model, self.data)
+        mujoco.mj_camlight(self.model, self.data)
         state = self.get_state()
 
         if self._render_cameras_flag:

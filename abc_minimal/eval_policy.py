@@ -297,6 +297,8 @@ def validate_rtc_config(config: SimEvalConfig) -> list[str]:
 
 
 def validate_batched_config(config: SimEvalConfig) -> list[str]:
+    if config.policy != "vla" and config.model.use_cape and config.parallel_worlds:
+        return ["CaPE currently requires --parallel-worlds 0 so geometry comes from each rendered MuJoCo world"]
     if config.world_indices is not None:
         if not config.world_indices or len(set(config.world_indices)) != len(config.world_indices):
             return ["world_indices must be nonempty and contain no duplicates"]
@@ -396,6 +398,7 @@ def _make_env(config: SimEvalConfig, camera_keys: tuple[str, ...]) -> SimTaskEnv
         disable_arm_control_limits=config.disable_arm_control_limits,
         disable_all_arm_limits=config.disable_all_arm_limits,
         disable_arm_joint_limits=config.disable_arm_joint_limits,
+        camera_geometry=config.policy != "vla" and config.model.use_cape,
     )
 
 

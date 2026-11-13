@@ -209,6 +209,7 @@ def run_sim_task_viewer(cfg: VizPolicyConfig) -> None:
         prompt=sim.prompt,
         camera_backend=sim.camera_backend,
         gpu_id=sim.gpu_id,
+        camera_geometry=getattr(model_config, "use_cape", False),
     )
     # The gym env underneath owns the MjModel/MjData viser streams; the object
     # itself outlives a model swap, only its .model/.data are replaced.
