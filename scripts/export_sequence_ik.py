@@ -28,13 +28,44 @@ def save_json(path, value):
     temporary.replace(path)
 
 
-def load_solution(path, stream):
+def load_solution(path, stream, base_mode='median'):
     with np.load(path, allow_pickle=False) as data:
         values = {key: data[key] for key in (
             f'optimized_{stream}', 'frame_indices', 'errors', 'valid_mask', 'optimized_mask',
             'camera_from_base')}
-        if str(data['base_mode']) != 'median' or str(data['solver']) != 'trust-constr':
-            raise ValueError(f'Expected final median-base equality IK: {path}')
+        solver = str(data['solver'])
+        identity_sim = False
+        hybrid_framewise = False
+        if solver in ('trust-constr+SLSQP-inequality-fallback',
+                      'trust-constr+SLSQP-inequality+grid-restart',
+                      'trust-constr-equality-inequality',
+                      'trust-constr-equality-inequality+grid-restart'):
+            hybrid_framewise = (base_mode == 'xml'
+                and str(data['optimization_scope']) == 'causal_framewise_smooth'
+                and bool(data['inequality_fallback'])
+                and bool(data['previous_frame_warm_start'])
+                and float(data['reference_weight']) == 0.
+                and float(data['fallback_position_tolerance_mm']) <= .1
+                and float(data['fallback_rotation_tolerance_deg']) <= .1
+                and str(data['fallback_initialization']) == 'same_as_equality_initial')
+            if solver.startswith('trust-constr-equality-inequality'):
+                hybrid_framewise = (hybrid_framewise and int(data['solver_policy_version'])==2
+                    and str(data['inequality_solver'])=='trust-constr'
+                    and float(data['fallback_objective_scale'])==1.
+                    and bool(data['shared_solver_options']) and bool(data['analytic_inequality_hessian']))
+            if solver.endswith('+grid-restart'):
+                hybrid_framewise = (hybrid_framewise and bool(data['grid_fallback'])
+                    and bool(data['grid_restart_preserves_history'])
+                    and float(data['grid_distance_limit']) == .5
+                    and int(data['grid_candidate_k']) == 100
+                    and np.array_equal(data['grid_neighborhoods'],[1,2,3,4]))
+        if solver == 'identity':
+            identity_sim = (base_mode == 'xml' and path.parent.parent.name == 'sim'
+                            and bool(data['identity_source_verified'])
+                            and float(data['source_clip_margin_deg']) == 10.)
+        if str(data['base_mode']) != base_mode or not (solver == 'trust-constr' or identity_sim or hybrid_framewise):
+            raise ValueError(f'Expected final {base_mode}-base equality IK: {path}')
+        values['solver'] = solver
     return values
 
 
@@ -134,7 +165,8 @@ def export_episode(job, args, settings):
         metadata = json.loads((source / 'episode_metadata.json').read_text())
         if 'joint_conversion' in metadata or 'sequence_ik' in metadata:
             raise ValueError('Use the original official dataset as --source-root')
-        state, action = load_solution(state_path, 'states'), load_solution(action_path, 'actions')
+        state = load_solution(state_path, 'states', args.base_mode)
+        action = load_solution(action_path, 'actions', args.base_mode)
         indices = state['frame_indices']
         original = np.memmap(source / 'states_actions.bin', dtype=np.float64, mode='r').reshape(-1, 28)
         if len(indices) != len(original) or not np.array_equal(indices, np.arange(len(original))):
@@ -142,7 +174,8 @@ def export_episode(job, args, settings):
         np.testing.assert_array_equal(state['optimized_states'][:, [6, 13]], original[:, [6, 13]])
         np.testing.assert_array_equal(action['optimized_actions'][:, [6, 13]], original[:, [20, 27]])
         rows, intervals, counts = select_frames(state, action, args)
-        conversion = dict(signature=signature, source_episode=source.name, base_mode='median',
+        conversion = dict(signature=signature, source_episode=source.name, base_mode=args.base_mode,
+                          action_solver=action['solver'], state_solver=state['solver'],
                           camera_from_base=state['camera_from_base'].tolist(),
                           action_result=str(action_path), state_result=str(state_path),
                           timing='unchanged official frame indices; no interpolation or timeoffset',
@@ -194,6 +227,7 @@ def main():
     parser.add_argument('--action-results', type=Path, required=True)
     parser.add_argument('--state-results', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--base-mode', choices=('median', 'xml'), default='median')
     parser.add_argument('--position-tolerance-mm', type=float, default=.1)
     parser.add_argument('--rotation-tolerance-deg', type=float, default=.1)
     parser.add_argument('--jump-threshold-deg', type=float, default=30., help='Split at larger raw joint steps; 0 disables')
@@ -219,6 +253,8 @@ def main():
     settings = dict(source_root=str(args.source_root), action_results=str(args.action_results),
                     state_results=str(args.state_results), filters=filters,
                     script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    if args.base_mode != 'median':
+        settings['base_mode'] = args.base_mode
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / 'export.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
