@@ -8,6 +8,7 @@ Distortion inversion and direction-table resize/letterbox run offline only.
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
+import os
 from pathlib import Path
 
 from abc_minimal.camera_geometry import CameraGeometry
@@ -45,7 +46,10 @@ def main():
     for root in args.data_dirs:
         if not root.is_dir():
             parser.error(f"Data directory does not exist: {root}")
-    episodes = sorted({path.parent.resolve() for root in args.data_dirs for path in root.rglob("states_actions.bin")})
+    # Calibrated subsets can link entire episodes to the official export.
+    episodes = sorted({Path(directory).resolve() for root in args.data_dirs
+                       for directory, _, files in os.walk(root, followlinks=True)
+                       if "states_actions.bin" in files})
     if not episodes:
         parser.error("No processed states_actions.bin found in the input directories")
     jobs = [(episode, args.overwrite) for episode in episodes]
