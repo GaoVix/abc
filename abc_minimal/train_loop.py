@@ -429,6 +429,7 @@ def main(config: TrainConfig):
             wandb = _wandb
             wandb.init(project=config.wandb_project, config=asdict(config))
         except Exception as e:  # noqa: BLE001 - optional logging must not stop training
+            wandb = None
             print(f"wandb disabled: {e}")
 
     if data_scope.checkpoint_writer:

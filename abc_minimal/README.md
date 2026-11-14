@@ -115,6 +115,11 @@ training. The fusion projection starts at
 Training can initialize the new branch from an RGB-only parent; inference
 and resume require all CaPE weights. Defaults leave existing runs unchanged.
 
+`train_cape.sh` defaults to batch size 64 per GPU to leave memory for the
+additional CaPE branch. `BATCH_SIZE` overrides it. Set `SKIP_CAMERA_PREPARE=1`
+when relaunching after successful camera preprocessing, so the existing camera
+files are reused.
+
 Before training, run offline preprocessing on the **final processed state
 directories**. Supply the **complete three-camera** `calibrations.json.gz` to
 `scripts.prepare_camera_parameters` with `--calibration-path`; the smaller
