@@ -7,11 +7,12 @@ name = "abc-minimal"
 version = "0.1.0"
 description = "Minimal end-to-end release for the abc dataset and the ABC-DiT policy."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "torch==2.11.0+cu128 ; sys_platform == 'linux'",
-    "torchcodec==0.11.0+cpu ; sys_platform == 'linux'",
+    # Includes TorchCodec #1834: decoder metadata must not leak on torch 2.11.
+    "torchcodec==0.18.0.dev20261108+cpu ; sys_platform == 'linux'",
     "mujoco~=3.8.0",
     "mujoco-warp==3.8.0.3",
     "warp-lang==1.13.0",
@@ -81,5 +82,5 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+url = "https://download.pytorch.org/whl/nightly/cpu"
 explicit = true
