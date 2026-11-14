@@ -120,6 +120,15 @@ additional CaPE branch. `BATCH_SIZE` overrides it. Set `SKIP_CAMERA_PREPARE=1`
 when relaunching after successful camera preprocessing, so the existing camera
 files are reused.
 
+`python -m scripts.probe_cape_batch --cache-root DATA --pretrained-ckpt-name CKPT
+--output-dir LOGS` probes the per-GPU batch limit with four fresh DDP workers
+per trial. It reuses the normal compiled training loop and existing camera
+files, runs five complete updates, and skips validation, W&B and checkpoint
+writes. The default search starts at 64 and searches up to 89 (90 already
+failed on the current four-H100 setup). Per-rank memory peaks and trial logs
+are saved with `summary.json`. A short-run limit is not a guarantee for a long
+run; leave headroom below that limit.
+
 Before training, run offline preprocessing on the **final processed state
 directories**. Supply the **complete three-camera** `calibrations.json.gz` to
 `scripts.prepare_camera_parameters` with `--calibration-path`; the smaller
