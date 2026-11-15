@@ -113,6 +113,7 @@ class SimRenderCameraProvider(CameraProvider):
 
     def reset(self) -> None:
         self._runtime.reset_from_mujoco()
+        self._runtime.refresh_geom_poses()
         self._needs_renderer_reset = True
 
     def close(self) -> None:

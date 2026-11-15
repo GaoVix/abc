@@ -53,6 +53,7 @@ X264_STRICT_FFMPEG_ARGS = [
     "-bf", "0",
     "-pix_fmt", "yuv420p",
     "-movflags", "+faststart",
+    "-use_editlist", "0",
     "-c:v", "libx264", "-preset", "fast", "-crf", "18",
     "-x264-params", X264_STRICT_PARAMS,
     "-threads", "1",
@@ -210,7 +211,10 @@ def export_episode(job):
                 if n_frames > 0 and n_frames != len(cam_ts):  # h264 chunks != frames; respace timestamps
                     cam_ts = np.linspace(cam_ts[0], cam_ts[-1], n_frames, dtype=np.int64)
                 mp4 = str(Path(work) / f"{cam_key}.mp4")
-                encode_aligned(tmp.name, width, height, floor_indices(cam_ts, ticks), mp4)
+                needed = floor_indices(cam_ts, ticks)
+                if cam_key == "top":
+                    top_camera_timestamps = cam_ts[needed].tolist()
+                encode_aligned(tmp.name, width, height, needed, mp4)
                 mp4s.append(mp4)
             finally:
                 os.unlink(tmp.name)
@@ -240,7 +244,7 @@ def export_episode(job):
     meta = {"task_name": task_name, "cameras": [k for k, _ in active_cams],
             "camera_resolutions": {k: [OUT_W, OUT_H] for k, _ in active_cams},
             "alignment": "fixed_clock_30hz_causal", "t0_ns": int(t0), "tick_ns": TICK_NS,
-            "num_steps": num_steps}
+            "num_steps": num_steps, "top_camera_timestamps_ns": top_camera_timestamps}
     # operator_id is optional conditioning/filtering signal (see the dataloader's
     # operator prompting); persist it in the metadata when the MCAP carried one.
     if operator_id:

@@ -159,6 +159,20 @@ class WarpReplayRuntime:
                 values = np.repeat(np.asarray(getattr(self.mjm, name))[None], self.nworld, axis=0)
             self._copy_field(target, np.ascontiguousarray(values, dtype=np.float32), dtype=target.dtype)
 
+    def refresh_geom_poses(self, per_world: dict[str, np.ndarray] | None = None) -> None:
+        """Refresh caches once after changing fixed-body poses and CPU mj_forward.
+
+        Copy the CPU results exactly instead of recalculating unchanged XML
+        geometry in float32. MJWarp forward skips fixed geometry afterward.
+        """
+        for name, shape in (("geom_xpos", (3,)), ("geom_xmat", (3, 3))):
+            target = getattr(self.d_warp, name)
+            values = None if per_world is None else per_world.get(name)
+            if values is None:
+                values = np.repeat(np.asarray(getattr(self.mjd, name))[None], self.nworld, axis=0)
+            values = np.asarray(values, dtype=np.float32).reshape(self.nworld, self.mjm.ngeom, *shape)
+            self._copy_field(target, np.ascontiguousarray(values), dtype=target.dtype)
+
     def sync_from_mujoco(self) -> None:
         """Copy the current MuJoCo state into the persistent Warp data."""
         self.sync_model_from_mujoco()
@@ -367,6 +381,7 @@ class RendererWrapper:
         runtime: WarpReplayRuntime,
         cam_res: tuple[int, int],
         gpu_id: int | None = None,
+        camera_names: tuple[str, ...] | None = None,
     ):
         try:
             import mujoco as mj
@@ -388,7 +403,20 @@ class RendererWrapper:
         self.m_warp = runtime.m_warp
         self.d_warp = runtime.d_warp
         self.nworld = runtime.nworld
-        self.ncam = self.mjm.ncam
+        available_names = tuple(self.mjm.cam(i).name for i in range(self.mjm.ncam))
+        self.camera_names = available_names
+        camera_options = {}
+        if camera_names is not None:
+            if backend != "mjwarp":
+                raise ValueError("Selecting rendered cameras requires the MJWarp backend")
+            missing = set(camera_names) - set(available_names)
+            if missing or not camera_names:
+                raise ValueError(
+                    f"Invalid render camera selection: {camera_names}; missing: {sorted(missing)}"
+                )
+            self.camera_names = tuple(name for name in available_names if name in camera_names)
+            camera_options["cam_active"] = [name in camera_names for name in available_names]
+        self.ncam = len(self.camera_names)
         self.width, self.height = cam_res
         self._render_width, self._render_height = cam_res
         self._madrona_crop: tuple[slice, slice] | None = None
@@ -438,6 +466,7 @@ class RendererWrapper:
                 render_depth=[False] * self.ncam,
                 use_textures=True,
                 use_shadows=True,
+                **camera_options,
             )
             self._bg = None
         else:
@@ -565,6 +594,17 @@ class RendererWrapper:
 
     def close(self) -> None:
         """Release renderer-owned state so another renderer can be created later."""
+        try:
+            self._wp.synchronize()
+        except Exception:
+            pass
+        if self._rc is not None:
+            # Cached Warp kernels can retain the RenderContext through a
+            # closure. Release its GPU resources even if that object survives.
+            for field in dataclasses.fields(self._rc):
+                resource = getattr(self._rc, field.name)
+                if isinstance(resource, (self._wp.array, self._wp.Bvh, dict, list)):
+                    setattr(self._rc, field.name, None)
         if self._madrona is not None:
             self._madrona = None
             RendererWrapper._madrona_created = False

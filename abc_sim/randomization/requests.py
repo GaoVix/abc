@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,17 @@ class DishRackResetRequest:
     cycle_dish_rack: int = 0
     randomize_variants: bool | None = None
     randomize_scales: bool | None = None
+    randomize_arm_bases: bool = False
+    # Fixed median poses are applied even when randomize_arm_bases is false.
+    # Both training names select paired, complete calibrated 6D poses.
+    arm_base_source: Literal["median", "xml", "training", "training_6d"] = "median"
+    arm_collision_mode: Literal["full", "eef_only"] = "eef_only"
+
+    def __post_init__(self):
+        if self.arm_base_source not in ("median", "xml", "training", "training_6d"):
+            raise ValueError("arm_base_source must be 'median', 'xml', 'training' or 'training_6d'")
+        if self.arm_collision_mode not in ("full", "eef_only"):
+            raise ValueError("arm_collision_mode must be 'full' or 'eef_only'")
 
     @classmethod
     def from_value(cls, value: Any | None) -> "DishRackResetRequest":
@@ -58,6 +69,9 @@ class DishRackResetRequest:
             cycle_dish_rack=_int_value("cycle_dish_rack"),
             randomize_variants=randomize_variants,
             randomize_scales=randomize_scales,
+            randomize_arm_bases=bool(value.get("randomize_arm_bases", False)),
+            arm_base_source=str(value.get("arm_base_source", "median")),
+            arm_collision_mode=str(value.get("arm_collision_mode", "eef_only")),
         )
 
 

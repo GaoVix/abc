@@ -1,0 +1,130 @@
+{
+  "status": "complete",
+  "source": "/home/ps/Documents/projects/abc/scripts/dishrack_joint_retarget_calibrations.json.gz",
+  "source_sha256": "eb1fb3a7f9626e38b9f772f16298d37f3a0197ffe141b5e0760459d7e342517e",
+  "episode_count": 1261,
+  "splits": {
+    "train": 1240,
+    "val": 21
+  },
+  "calibration_quality": "accepted",
+  "weighting": "Equal weight per sequence, both train and val",
+  "excluded": {
+    "needs_review": 86,
+    "missing": 11
+  },
+  "frame": "Calibrated top camera, OpenCV coordinates: x right, y down, z forward",
+  "transform": "T_camera_from_base = left_base_to_camera @ optimized base_poses[side]",
+  "position_method": "Component-wise median of camera-frame x, y, z",
+  "orientation_method": "SO(3) geodesic median, minimizing sum of shortest angular distances",
+  "poses": {
+    "left": {
+      "T_camera_from_base": [
+        [
+          0.006414728572974433,
+          -0.9999626131632848,
+          -0.005798580256426433,
+          -0.2883708663811113
+        ],
+        [
+          -0.8451491704755838,
+          -0.0023220004540407332,
+          -0.5345254792414711,
+          0.33503518911797503
+        ],
+        [
+          0.5344920307186702,
+          0.008329501158327979,
+          -0.8451324680242063,
+          0.9531651846645143
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "position_m": [
+        -0.2883708663811113,
+        0.33503518911797503,
+        0.9531651846645143
+      ],
+      "position_mm": [
+        -288.37086638111134,
+        335.03518911797505,
+        953.1651846645143
+      ],
+      "quaternion_xyzw": [
+        0.6807843265402086,
+        -0.677568398576334,
+        0.1941486568694594,
+        0.19934910339322306
+      ],
+      "euler_xyz_deg": [
+        179.4353195174469,
+        -32.30946874497571,
+        -89.56513024063176
+      ],
+      "rotation_median_diagnostics": {
+        "iterations": 31,
+        "stationarity_residual_norm": 2.661256561084883e-09,
+        "sum_angular_distances_rad": 44.56257698734784
+      }
+    },
+    "right": {
+      "T_camera_from_base": [
+        [
+          -0.027756181150815226,
+          -0.999612587669697,
+          0.0020661510631870827,
+          0.3155635757321078
+        ],
+        [
+          -0.8490097169913294,
+          0.022483259401730925,
+          -0.5278986678340624,
+          0.3284899255434162
+        ],
+        [
+          0.527647699570676,
+          -0.016406633383094116,
+          -0.8493048495792349,
+          0.9529734397882825
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "position_m": [
+        0.3155635757321078,
+        0.3284899255434162,
+        0.9529734397882825
+      ],
+      "position_mm": [
+        315.5635757321078,
+        328.48992554341623,
+        952.9734397882826
+      ],
+      "quaternion_xyzw": [
+        0.670646219892927,
+        -0.6891197809763883,
+        0.19746396644062025,
+        0.19067133284246024
+      ],
+      "euler_xyz_deg": [
+        -178.89331381573774,
+        -31.84665671129959,
+        -91.8724707084784
+      ],
+      "rotation_median_diagnostics": {
+        "iterations": 27,
+        "stationarity_residual_norm": 5.649230681417667e-09,
+        "sum_angular_distances_rad": 35.97927710587319
+      }
+    }
+  }
+}

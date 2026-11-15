@@ -1,0 +1,93 @@
+--- a/_pyceres/core/cost_functions.h
++++ b/_pyceres/core/cost_functions.h
+@@ -22,54 +22,32 @@
+                 double** jacobians) const override {
+     pybind11::gil_scoped_acquire gil;
+ 
+-    // Resize the vectors passed to python to the proper size. And set the
+-    // pointer values
+-    if (!cached_flag) {
+-      parameters_vec.reserve(this->parameter_block_sizes().size());
+-      jacobians_vec.reserve(this->parameter_block_sizes().size());
+-      residuals_wrap = py::array_t<double>(num_residuals(), residuals, no_copy);
+-      for (size_t idx = 0; idx < parameter_block_sizes().size(); ++idx) {
+-        parameters_vec.emplace_back(py::array_t<double>(
+-            this->parameter_block_sizes()[idx], parameters[idx], no_copy));
+-        jacobians_vec.emplace_back(py::array_t<double>(
+-            this->parameter_block_sizes()[idx] * num_residuals(),
+-            jacobians[idx],
+-            no_copy));
+-      }
+-      cached_flag = true;
+-    }
+-
+-    // Check if the pointers have changed and if they have then change them
+-    auto info = residuals_wrap.request(true);
+-    if (info.ptr != residuals) {
+-      residuals_wrap = py::array_t<double>(num_residuals(), residuals, no_copy);
+-    }
+-    info = parameters_vec[0].request(true);
+-    if (info.ptr != parameters) {
+-      for (size_t idx = 0; idx < parameters_vec.size(); ++idx) {
+-        parameters_vec[idx] = py::array_t<double>(
+-            this->parameter_block_sizes()[idx], parameters[idx], no_copy);
++    py::list parameter_views;
++    py::list jacobian_views;
++    const py::object owner = py::none();
++    auto residual_view = py::array_t<double>(num_residuals(), residuals, owner);
++    for (size_t idx = 0; idx < parameter_block_sizes().size(); ++idx) {
++      const auto size = parameter_block_sizes()[idx];
++      parameter_views.append(py::array_t<double>(size, parameters[idx], owner));
++      if (jacobians) {
++        if (jacobians[idx]) {
++          jacobian_views.append(py::array_t<double>(size * num_residuals(),
++                                                    jacobians[idx], owner));
++        } else {
++          jacobian_views.append(py::none());
++        }
+       }
+     }
++    py::object jacobian_argument = py::none();
+     if (jacobians) {
+-      info = jacobians_vec[0].request(true);
+-      if (info.ptr != jacobians) {
+-        for (size_t idx = 0; idx < jacobians_vec.size(); ++idx) {
+-          jacobians_vec[idx] = py::array_t<double>(
+-              this->parameter_block_sizes()[idx] * num_residuals(),
+-              jacobians[idx],
+-              no_copy);
+-        }
+-      }
++      jacobian_argument = jacobian_views;
+     }
+ 
+     pybind11::function overload = pybind11::get_overload(
+         static_cast<const ceres::CostFunction*>(this), "Evaluate");
+     if (overload) {
+       auto o = overload.operator()<pybind11::return_value_policy::reference>(
+-          parameters_vec,
+-          residuals_wrap,
+-          jacobians ? &jacobians_vec : nullptr);  // nullptr gets cast to None
++          parameter_views, residual_view, jacobian_argument);
+       return pybind11::detail::cast_safe<bool>(std::move(o));
+     }
+     pybind11::pybind11_fail("Tried to call pure virtual function \"" PYBIND11_STRINGIFY(
+@@ -77,18 +55,6 @@
+                              "Evaluate \"");
+   }
+ 
+- private:
+-  // Vectors used to pass double pointers to python as pybind does not wrap
+-  // double pointers(**) like Ceres uses.
+-  // Mutable so they can be modified by the const function.
+-  mutable std::vector<py::array_t<double>> parameters_vec;
+-  mutable std::vector<py::array_t<double>> jacobians_vec;
+-  // Flag used to determine if the vectors need to be resized.
+-  mutable bool cached_flag = false;
+-  // Buffer to contain the residuals pointer.
+-  mutable py::array_t<double> residuals_wrap;
+-  // Dummy variable for pybind11 to avoid a copy.
+-  mutable py::str no_copy;
+ };
+ 
+ void BindCostFunctions(py::module& m) {
