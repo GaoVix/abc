@@ -29,6 +29,7 @@ from abc_minimal.checkpointing import (
     save_checkpoint,
     update_last,
 )
+from abc_minimal.cape import validate_cape_checkpoint
 from abc_minimal.config import (
     TrainConfig,
     validate_train_config,
@@ -213,6 +214,8 @@ def _build_dit_model(config, cache_root, device, resume_ckpt, rank, distributed)
     model = DiTPolicy(config.model)
     ckpt_norm_stats = None
     if resume_ckpt is not None:
+        if config.model.use_cape:
+            validate_cape_checkpoint(resume_ckpt)
         model.load_state_dict(resume_ckpt["model"])
         ckpt_norm_stats = resume_ckpt.get("norm_stats")
         if rank == 0:

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import torch
 
+from abc_minimal.cape import CAMERA_REFERENCE_FRAME
+
 
 def model_state_dict(ckpt) -> dict[str, torch.Tensor]:
     """Return model weights from current, released-VLA, or bare checkpoints.
@@ -134,6 +136,8 @@ def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_sta
         payload["data_world"] = int(data_world)
     if model_config is not None:
         payload["model_config"] = model_config
+        if model_config.get("use_cape"):
+            payload["camera_reference_frame"] = CAMERA_REFERENCE_FRAME
     if train_config is not None:
         # Plain dict so eval-side readers (resolve_trained_max_prefix) need
         # no import of this repo's dataclasses to interpret it.

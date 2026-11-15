@@ -1,7 +1,7 @@
 """Per-frame camera parameters and fixed directions beside states_actions.bin.
 
-camera_parameters.json v4 stores fixed OpenCV calibration and camera order.
-camera_parameters.npy stores camera-to-world matrices and the exact source
+camera_parameters.json v4 stores calibration, camera order and reference_frame.
+camera_parameters.npy stores camera-to-left-base matrices and the exact source
 state in each row. The NPY is memory-mapped, so sampling reads only that frame.
 camera_directions.npy stores fixed camera-space unit directions after the
 RGB exporter's resize/letterbox.
@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from abc_minimal.cape import validate_camera_matrices
+from abc_minimal.cape import CAMERA_REFERENCE_FRAME, validate_camera_matrices
 from abc_minimal.camera_rays import (
     cached_camera_directions,
     camera_calibration,
@@ -40,6 +40,8 @@ def load_camera_parameters(episode):
     metadata = json.loads((episode / "camera_parameters.json").read_text())
     if metadata.get("version") != 4 or metadata.get("convention") != "opencv":
         raise ValueError(f"Unsupported CaPE camera parameter format: {episode}; regenerate with --overwrite")
+    if metadata.get("reference_frame") != CAMERA_REFERENCE_FRAME:
+        raise ValueError(f"CaPE camera reference frame is not left_arm: {episode}; regenerate with --overwrite")
     frames = np.load(episode / "camera_parameters.npy", mmap_mode="r", allow_pickle=False)
     expected = np.dtype([("state", "<f8", (14,)),
                          ("camera_to_world", "<f4", (len(metadata["camera_keys"]), 4, 4))])
@@ -153,6 +155,7 @@ def prepare_camera_parameters(episode, geometry, camera_keys=("top", "left", "ri
     width, height = next(iter(sizes))
     directions = torch.stack([cached_camera_directions(fixed[cam], height, width) for cam in camera_keys])
     description = {"version": 4, "convention": "opencv", "camera_keys": list(camera_keys),
+                   "reference_frame": CAMERA_REFERENCE_FRAME,
                    "cameras": fixed, "ray_image_size": [height, width]}
     dtype = np.dtype([("state", "<f8", (14,)), ("camera_to_world", "<f4", (len(camera_keys), 4, 4))])
     temporary = output.with_suffix(".npy.tmp")

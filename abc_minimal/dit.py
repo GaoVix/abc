@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from abc_minimal.config import ClipConfig, DiTConfig
-from abc_minimal.cape import PluckerLateFusion
+from abc_minimal.cape import PluckerLateFusion, validate_cape_checkpoint
 from abc_minimal.preprocess import NORM_PRESETS, preset_for_backbone
 
 # CLIP ViT-B/32 text encoder.
@@ -1077,6 +1077,8 @@ def load_pretrained(model, ckpt_path, *, initialize_cape=False):
     extra = [k for k in unexpected if not k.startswith("img_backbone.")]
     if extra:
         raise RuntimeError(f"unexpected checkpoint keys: {extra[:8]}")
+    if model.config.use_cape and any(k.startswith("cape.") for k in sd):
+        validate_cape_checkpoint(ckpt)
     if unexpected and os.environ.get("RANK", "0") == "0":
         print(f"load_pretrained: ignored {len(unexpected)} extra img_backbone keys "
               f"bundled in the checkpoint (e.g. {unexpected[:3]})")

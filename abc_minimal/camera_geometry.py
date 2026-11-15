@@ -1,7 +1,8 @@
 """Offline fixed camera calibration + FK of the processed dataset state.
 
-Calibration contains camera-to-link mounts. State/image alignment belongs
-to the dataset; this module does not read timestamps or apply time offsets.
+Calibration contains camera-to-link mounts. All output poses use the left
+arm base as their reference frame. State/image alignment belongs to the
+dataset; this module does not read timestamps or apply time offsets.
 """
 
 import copy
@@ -130,7 +131,7 @@ def state_fk(model_path):
 
 
 class CameraGeometry:
-    """Offline camera parameters from fixed calibration and current-state FK."""
+    """Offline camera-to-left-base parameters from calibration and state FK."""
 
     def __init__(self, calibration_path=None, model_dir=None):
         self.calibrations = load_calibrations(str(Path(calibration_path).expanduser().resolve())) if calibration_path else {}
@@ -153,22 +154,23 @@ class CameraGeometry:
             camera_from_base = conversion.get("camera_from_base")
             bases = self.world_from_top @ np.asarray(camera_from_base) if camera_from_base is not None else None
             fk.update(state, bases)
-            world_from_reference = np.eye(4)
+            world_from_top = self.world_from_top
         else:
             fk = state_fk(str(self.model_dir / record["model_name"]))
             fk.update(state, [record["base_poses"][side] for side in ("left", "right")])
             top_mount = np.asarray(record["cameras"]["top"]["T_reference_from_camera"])
             top_reference = pose(fk.data.body(record["cameras"]["top"]["reference_body"]))
-            world_from_reference = self.world_from_top @ np.linalg.inv(top_reference @ top_mount)
-        poses = {"top": self.world_from_top}
+            world_from_top = top_reference @ top_mount
+        left_base_from_world = np.linalg.inv(pose(fk.data.body("left_arm")))
+        poses = {"top": left_base_from_world @ world_from_top}
         for cam, view in (("left", "left-wrist"), ("right", "right-wrist")):
             camera = record["cameras"][view]
             mount = np.asarray(camera["T_reference_from_camera"])
-            poses[cam] = world_from_reference @ pose(fk.data.body(camera["reference_body"])) @ mount
+            poses[cam] = left_base_from_world @ pose(fk.data.body(camera["reference_body"])) @ mount
         return record, poses
 
     def camera_parameters(self, episode, state, metadata):
-        """Return fixed intrinsics and current camera-to-world poses, without rays."""
+        """Return intrinsics and current camera-to-left-base poses, without rays."""
         original = metadata.get("sequence_ik", {}).get("source_episode", episode.name)
         if original not in self.calibrations:
             is_sim = (metadata.get("render_backend") is not None
@@ -187,6 +189,7 @@ class CameraGeometry:
         camera_from_base = metadata.get("sequence_ik", {}).get("camera_from_base")
         bases = self.world_from_top @ np.asarray(camera_from_base) if camera_from_base is not None else None
         fk.update(state, bases)
+        left_base_from_world = np.linalg.inv(pose(fk.data.body("left_arm")))
         cameras, poses = {}, {}
         for cam in ("top", "left", "right"):
             resolution = metadata.get("source_camera_resolutions", {}).get(cam)
@@ -207,5 +210,5 @@ class CameraGeometry:
                             "distortion_model": "none", "D": [0.] * 5, "pixel_center": .5}
             transform = pose(fk.data.camera(cam))
             transform[:3, :3] @= np.diag([1., -1., -1.])
-            poses[cam] = transform
+            poses[cam] = left_base_from_world @ transform
         return cameras, poses

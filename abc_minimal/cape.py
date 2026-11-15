@@ -4,7 +4,8 @@ Reference: https://github.com/ripl/CamPoseOpensource
 Architecture adapted from CamPose (MIT, Copyright (c) 2025 RIPL);
 see assets/third_party/campose/LICENSE.
 Camera matrices use OpenCV axes (right, down, forward), pixel centers at
-(u + .5, v + .5), and metric camera-to-world poses. Ray channels are [m, d],
+(u + .5, v + .5), and metric camera-to-left-base poses. The snippet's "world"
+is the left_arm body frame, shared by all three cameras. Ray channels are [m, d],
 where d is a unit direction and m = camera_center cross d, matching the
 released ACT implementation. Geometric features are fused after DINO/CLIP;
 the image encoder, CLS token, pooling, and camera ID embeddings are retained.
@@ -15,6 +16,17 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+CAMERA_REFERENCE_FRAME = "left_arm"
+
+
+def validate_cape_checkpoint(ckpt):
+    """Reject weights trained with the former top-anchored camera frame."""
+    if ckpt.get("camera_reference_frame") != CAMERA_REFERENCE_FRAME:
+        raise ValueError("CaPE checkpoint reference frame is not left_arm; "
+                         "old top-anchored weights require their original code, "
+                         "or retraining with left-base camera parameters")
 
 
 def validate_camera_matrices(intrinsics, camera_to_world):
@@ -129,15 +141,17 @@ def observation_plucker(obs, camera_keys, device):
 
 
 def mujoco_camera_geometry(model, data, camera_keys, height, width):
-    """Read poses refreshed before RGB by MuJoCoYAMEnv.get_obs, in OpenCV axes."""
+    """Read current OpenCV camera poses relative to the actual left arm base."""
     intrinsics, poses = {}, {}
+    base = data.body(CAMERA_REFERENCE_FRAME)
+    base_rotation = base.xmat.reshape(3, 3)
     for cam in camera_keys:
         index = model.camera(cam).id
         focal = height / (2 * np.tan(np.deg2rad(model.cam_fovy[index]) / 2))
         intrinsics[cam] = np.array([[focal, 0, width / 2], [0, focal, height / 2], [0, 0, 1]], dtype=np.float32)
         pose = np.eye(4, dtype=np.float32)
-        pose[:3, :3] = data.cam_xmat[index].reshape(3, 3) @ np.diag([1, -1, -1])
-        pose[:3, 3] = data.cam_xpos[index]
+        pose[:3, :3] = base_rotation.T @ data.cam_xmat[index].reshape(3, 3) @ np.diag([1, -1, -1])
+        pose[:3, 3] = base_rotation.T @ (data.cam_xpos[index] - base.xpos)
         poses[cam] = pose
     return {"camera_intrinsics": intrinsics, "camera_to_world": poses}
 

@@ -140,13 +140,18 @@ defaults and the three camera mounts, then compiles that small tree with
 MuJoCo. It discards task objects, render geometry, assets, lights and actuators.
 Original robot variants retain their own link parameters.
 For `sequence_ik`/`joint_conversion` episodes, FK uses the target YAM model;
-sequence-IK metadata supplies the target bases when available. Real camera
-geometry is expressed in the simulation world by anchoring the calibrated
-top camera to the target robot configuration's top camera.
+sequence-IK metadata supplies the target bases when available.
+All three camera poses are expressed in the **left arm base frame**
+(`left_arm`): `T_left_base_from_camera = inverse(T_world_from_left_base)
+@ T_world_from_camera`. Original real episodes use their own calibrated
+bases and camera mounts, including the top camera. The top pose is not
+replaced by a shared reference pose. Right-wrist geometry includes the full
+right-base-to-left-base translation and rotation. Sim training and evaluation
+use the same left-base convention, including randomized bases at evaluation.
 
 Only **fixed** camera-to-link/base transforms, intrinsics and distortion
-parameters are read from the calibration bundle. Offline preprocessing computes each wrist pose as
-`T_world_from_link(state) @ T_link_from_camera` from the exact row in the final
+parameters are read from the calibration bundle. Offline preprocessing computes each camera pose as
+`inverse(T_world_from_left_base) @ T_world_from_link(state) @ T_link_from_camera` from the exact row in the final
 `states_actions.bin`, before normalization, noise, or masking. It writes three
 files **in that same episode directory**, without creating a separate output
 root or timestamped directory:
@@ -154,7 +159,7 @@ root or timestamped directory:
 ```text
 episode_.../
   states_actions.bin
-  camera_parameters.json   # v4: K, D, distortion model, pixel centers, image sizes, camera order
+  camera_parameters.json   # v4: reference_frame="left_arm", K, D, distortion, sizes, camera order
   camera_parameters.npy    # per row: source state (14 float64) + poses (3x4x4 float32)
   camera_directions.npy    # fixed camera-space directions (3 cameras, 3, 224, 224), float32
 ```
@@ -166,7 +171,12 @@ against that frame's 14 raw state values (112 bytes), so changed alignment/conve
 reuse old poses. Regenerate with `--overwrite` after changing states,
 calibration or bases. The fixed direction table is about 1.72 MiB for three
 224x224 cameras, independent of episode length. Missing files raise an error. Old v1/v2/v3
-sidecars must be regenerated with `--overwrite` before training.
+sidecars, and v4 sidecars without `reference_frame="left_arm"`, must be
+regenerated with `--overwrite` before training. The NPY field retains the
+snippet's name `camera_to_world`, but its reference is now the left arm base.
+New CaPE checkpoints record `camera_reference_frame="left_arm"`. Earlier
+top-anchored checkpoints are rejected for inference/resume; retain their
+original code to evaluate them, or retrain for the new coordinate convention.
 
 The expensive pixel-to-ray inversion runs **offline**, using K, the recorded
 `distortion_model`, and five coefficients `D=[k1,k2,p1,p2,k3]`. Brown-Conrady
@@ -195,7 +205,7 @@ random sampling switches between episodes.
 
 At training time workers load that small table once and, for each sampled
 frame, only rotate directions by its saved camera rotation and compute
-`moment = camera_position cross world_direction`. Moving wrist cameras do
+`moment = camera_position cross ray_direction` in the left-base frame. Moving wrist cameras do
 not require solving distortion again. The resulting six channels still
 undergo the same random spatial augmentation as RGB.
 
@@ -254,12 +264,14 @@ uv run python train.py \
 
 Evaluate CaPE-trained weights with `--model.use-cape --parallel-worlds 0`.
 The sequential simulator and viewer already run FK for their actual state;
-they provide current camera poses and intrinsics. Sim inference renders at
+they provide current camera poses relative to the actual left base, and intrinsics. Sim inference renders at
 1024x768 by default and uses Pillow's bicubic resize to 224x168. Its supplied
 K describes that resized 224x168 RGB, then RGB and rays receive 28 zero rows
 above and below. The high-resolution render's K is not passed to the policy.
 Other inference callers
-supply `camera_intrinsics` and `camera_to_world` per camera in the observation.
+supply `camera_intrinsics` and `camera_to_world` per camera in the observation;
+all `camera_to_world` matrices must map OpenCV camera coordinates into the
+current **left arm base frame**, not the simulator's world frame.
 For distorted RGB they additionally supply `camera_distortion[cam]` with
 `{"distortion_model": "inverse_brown_conrady", "D": [k1,k2,p1,p2,k3]}`,
 and optionally `pixel_center`. K and distortion must describe the supplied
