@@ -6,12 +6,12 @@ unset MUJOCO_GL
 
 GPU_ID=0
 seeds=(
-    1719700662	320068298	1523341385	1106746985	1412186067
+    2107183402	2137946100	796088752	1815032804	1548170658
 )
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_baseline_xml_random6d_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_leftbase_random6d_direct_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -19,8 +19,9 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_joint_baseline_20261022_070036/100000.pt  \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_cape_leftbase_bs88_20261115_192055/100000.pt \
     --policy dit \
+    --model.use-cape \
     --task dishrack \
     --gpu-id "$GPU_ID" \
     --num-worlds 100 \
@@ -46,7 +47,7 @@ for seed in "${seeds[@]}"; do
 
     EVAL_PID=$!
     echo "$EVAL_PID" > "$EVAL_OUTPUT_DIR/eval.pid"
-    printf 'PID=%s\nPOLICY_SEED=%s\nLOG=%s\nOUTPUT=%s\n' \
-    "$EVAL_PID" "$POLICY_SEED" "$EVAL_OUTPUT_DIR/eval.log" "$EVAL_OUTPUT_DIR"
+    printf 'PID=%s\nPOLICY_SEED=%s\nOUTPUT=%s\n' \
+    "$EVAL_PID" "$POLICY_SEED" "$EVAL_OUTPUT_DIR"
 
 done
