@@ -58,6 +58,7 @@ class SimTaskEnv:
         self.render_height = round(height * self.render_width / width)
         self.camera_keys = tuple(camera_keys)
         self.camera_geometry = camera_geometry
+        self.raw_camera_images: dict[str, np.ndarray] = {}
         self.prompt = prompt
         self.randomization: Any = None
         if self.spec.evaluator_name is None:
@@ -147,11 +148,13 @@ class SimTaskEnv:
                 f"Cameras missing from the {self.spec.name} scene: {', '.join(missing)} "
                 f"(scene has {', '.join(images)})"
             )
-        selected = {name: images[name] for name in self.camera_keys}
+        # Retain only the latest render for debug video, before Pillow resize.
+        self.raw_camera_images = {name: images[name] for name in self.camera_keys}
+        resized_images = {}
 
-        for name, image in selected.items():
+        for name, image in self.raw_camera_images.items():
             resized = Image.fromarray(image.transpose(1, 2, 0)).resize(
                 (self.width, self.height),
             )
-            selected[name] = np.asarray(resized).transpose(2, 0, 1).copy()
-        return selected
+            resized_images[name] = np.asarray(resized).transpose(2, 0, 1).copy()
+        return resized_images

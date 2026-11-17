@@ -671,7 +671,7 @@ def rollout_worlds(
 
                 video_path = out_dir / f"world_{world_index:03d}.mp4"
                 video = imageio.get_writer(str(video_path), fps=config.video_fps, macro_block_size=1)
-                video.append_data(video_frame(obs["images"], model_config.camera_keys))
+                video.append_data(video_frame(env.raw_camera_images, model_config.camera_keys))
             final_eval = env.evaluate_vanilla() if config.vanilla_physics else env.evaluate()
             # Best instantaneous progress fraction over the episode; the
             # production dishrack eval aggregated this, not the final state.
@@ -753,7 +753,8 @@ def rollout_worlds(
                         max_reward = max(max_reward, float(final_eval.get("reward", 0.0)))
                         steps += 1
                         if video is not None and steps % config.video_every_n_actions == 0:
-                            video.append_data(video_frame(render_fn(), model_config.camera_keys))
+                            render_fn()
+                            video.append_data(video_frame(env.raw_camera_images, model_config.camera_keys))
                         if rollout_over(final_eval):
                             break
                     steps_s = time.perf_counter() - t_steps

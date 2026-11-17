@@ -268,6 +268,9 @@ they provide current camera poses relative to the actual left base, and intrinsi
 1024x768 by default and uses Pillow's bicubic resize to 224x168. Its supplied
 K describes that resized 224x168 RGB, then RGB and rays receive 28 zero rows
 above and below. The high-resolution render's K is not passed to the policy.
+Sequential eval (`--parallel-worlds 0 --save-video`) records the same raw
+frames before Pillow resize: by default, three 1024x768 views side by side
+in a 3072x768 video. Policy RGB and camera parameters remain unchanged.
 Other inference callers
 supply `camera_intrinsics` and `camera_to_world` per camera in the observation;
 all `camera_to_world` matrices must map OpenCV camera coordinates into the
