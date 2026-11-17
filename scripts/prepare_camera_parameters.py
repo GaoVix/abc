@@ -17,12 +17,12 @@ from abc_minimal.camera_parameters import prepare_camera_parameters
 GEOMETRY = None
 
 
-def initialize(calibration_path, model_dir):
+def initialize(calibration_path, model_dir, reference_frame, source_root):
     global GEOMETRY
     # Each worker handles offline inversions; avoid CPU thread oversubscription.
     import torch
     torch.set_num_threads(1)
-    GEOMETRY = CameraGeometry(calibration_path, model_dir)
+    GEOMETRY = CameraGeometry(calibration_path, model_dir, reference_frame=reference_frame, source_root=source_root)
 
 
 def prepare(job):
@@ -38,6 +38,9 @@ def main():
     parser.add_argument("--calibration-path", type=Path,
                         help="Complete accepted three-camera calibrations.json.gz; omit for sim-only data")
     parser.add_argument("--model-dir", type=Path, help="Original robot XMLs for unretargeted real states; mesh assets are not needed")
+    parser.add_argument("--reference-frame", choices=("left_arm", "top"), default="left_arm")
+    parser.add_argument("--source-root", type=Path,
+                        help="Original exported dataset, required for top-relative poses on converted real data")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true", help="Regenerate after changing calibration, bases or states")
     args = parser.parse_args()
@@ -54,12 +57,12 @@ def main():
         parser.error("No processed states_actions.bin found in the input directories")
     jobs = [(episode, args.overwrite) for episode in episodes]
     if args.workers == 1:
-        initialize(args.calibration_path, args.model_dir)
+        initialize(args.calibration_path, args.model_dir, args.reference_frame, args.source_root)
         for job in jobs:
             print(prepare(job), flush=True)
     else:
         with ProcessPoolExecutor(max_workers=args.workers, initializer=initialize,
-                                 initargs=(args.calibration_path, args.model_dir),
+                                 initargs=(args.calibration_path, args.model_dir, args.reference_frame, args.source_root),
                                  mp_context=multiprocessing.get_context("spawn")) as pool:
             for result in pool.map(prepare, jobs, chunksize=1):
                 print(result, flush=True)

@@ -1,7 +1,7 @@
 """Offline fixed camera calibration + FK of the processed dataset state.
 
-Calibration contains camera-to-link mounts. All output poses use the left
-arm base as their reference frame. State/image alignment belongs to the
+Calibration contains camera-to-link mounts. Output poses use either the left
+arm base or the sequence's top camera. State/image alignment belongs to the
 dataset; this module does not read timestamps or apply time offsets.
 """
 
@@ -130,10 +130,26 @@ def state_fk(model_path):
     return StateFK(model_path)
 
 
-class CameraGeometry:
-    """Offline camera-to-left-base parameters from calibration and state FK."""
+@lru_cache(maxsize=16)
+def original_states(path):
+    """Memory-map the original RGB-aligned states, without time-offset lookup."""
+    path = Path(path)
+    if not path.is_file() or not path.stat().st_size or path.stat().st_size % (28 * 8):
+        raise ValueError(f"Original states missing or invalid: {path}")
+    metadata = json.loads((path.parent / "episode_metadata.json").read_text())
+    if metadata.get("sequence_ik") or metadata.get("joint_conversion"):
+        raise ValueError(f"--source-root must contain original, unconverted states: {path}")
+    return np.memmap(path, dtype=np.float64, mode="r").reshape(-1, 28)[:, :14]
 
-    def __init__(self, calibration_path=None, model_dir=None):
+
+class CameraGeometry:
+    """Offline calibrated camera poses in the selected reference frame."""
+
+    def __init__(self, calibration_path=None, model_dir=None, *, reference_frame="left_arm", source_root=None):
+        if reference_frame not in ("left_arm", "top"):
+            raise ValueError(f"Unsupported camera reference frame: {reference_frame}")
+        self.reference_frame = reference_frame
+        self.source_root = Path(source_root).expanduser().resolve() if source_root else None
         self.calibrations = load_calibrations(str(Path(calibration_path).expanduser().resolve())) if calibration_path else {}
         self.model_dir = Path(model_dir).expanduser() if model_dir else ROOT / "abc_sim/models"
         self.target_model = ROOT / "abc_sim/models/yam_dishrack_base.xml"
@@ -142,13 +158,22 @@ class CameraGeometry:
         self.world_from_top = pose(target.data.camera("top"))
         self.world_from_top[:3, :3] @= np.diag([1., -1., -1.])
 
-    def camera_poses(self, episode, state, metadata):
+    def camera_poses(self, episode, state, metadata, *, frame_index=0):
         original = metadata.get("sequence_ik", {}).get("source_episode", episode.name)
         record = self.calibrations.get(original)
         if record is None:
             raise ValueError(f"CaPE calibration missing for {original}; pass the complete three-camera --calibration-path")
         conversion = metadata.get("sequence_ik", {})
         retargeted = bool(conversion or metadata.get("joint_conversion"))
+        if retargeted and self.reference_frame == "top":
+            if self.source_root is None:
+                raise ValueError("Top-relative CaPE on converted RGB requires --source-root with original states")
+            source = self.source_root / episode.parent.name / original / "states_actions.bin"
+            states = original_states(str(source))
+            begin, end = metadata.get("source_frame_range", (0, len(states)))
+            if not 0 <= begin <= begin + frame_index < end <= len(states):
+                raise ValueError(f"Invalid original RGB frame interval: {episode}")
+            return self.camera_poses(Path(original), states[begin + frame_index], {})
         if retargeted:
             fk = state_fk(str(self.target_model))
             camera_from_base = conversion.get("camera_from_base")
@@ -161,16 +186,17 @@ class CameraGeometry:
             top_mount = np.asarray(record["cameras"]["top"]["T_reference_from_camera"])
             top_reference = pose(fk.data.body(record["cameras"]["top"]["reference_body"]))
             world_from_top = top_reference @ top_mount
-        left_base_from_world = np.linalg.inv(pose(fk.data.body("left_arm")))
-        poses = {"top": left_base_from_world @ world_from_top}
+        reference_from_world = np.linalg.inv(world_from_top if self.reference_frame == "top"
+                                            else pose(fk.data.body("left_arm")))
+        poses = {"top": reference_from_world @ world_from_top}
         for cam, view in (("left", "left-wrist"), ("right", "right-wrist")):
             camera = record["cameras"][view]
             mount = np.asarray(camera["T_reference_from_camera"])
-            poses[cam] = left_base_from_world @ pose(fk.data.body(camera["reference_body"])) @ mount
+            poses[cam] = reference_from_world @ pose(fk.data.body(camera["reference_body"])) @ mount
         return record, poses
 
-    def camera_parameters(self, episode, state, metadata):
-        """Return intrinsics and current camera-to-left-base poses, without rays."""
+    def camera_parameters(self, episode, state, metadata, *, frame_index=0):
+        """Return intrinsics and current camera-to-reference poses, without rays."""
         original = metadata.get("sequence_ik", {}).get("source_episode", episode.name)
         if original not in self.calibrations:
             is_sim = (metadata.get("render_backend") is not None
@@ -178,7 +204,7 @@ class CameraGeometry:
             if not is_sim:
                 raise ValueError(f"CaPE calibration missing for {original}; pass the complete three-camera --calibration-path")
             return self.sim_camera_parameters(episode, state, metadata)
-        record, poses = self.camera_poses(episode, state, metadata)
+        record, poses = self.camera_poses(episode, state, metadata, frame_index=frame_index)
         cameras = {cam: record["cameras"][view]["recorded_intrinsics"] for cam, view in (
             ("top", "top"), ("left", "left-wrist"), ("right", "right-wrist"))}
         return cameras, poses
@@ -189,7 +215,12 @@ class CameraGeometry:
         camera_from_base = metadata.get("sequence_ik", {}).get("camera_from_base")
         bases = self.world_from_top @ np.asarray(camera_from_base) if camera_from_base is not None else None
         fk.update(state, bases)
-        left_base_from_world = np.linalg.inv(pose(fk.data.body("left_arm")))
+        if self.reference_frame == "top":
+            reference = pose(fk.data.camera("top"))
+            reference[:3, :3] @= np.diag([1., -1., -1.])
+        else:
+            reference = pose(fk.data.body("left_arm"))
+        reference_from_world = np.linalg.inv(reference)
         cameras, poses = {}, {}
         for cam in ("top", "left", "right"):
             resolution = metadata.get("source_camera_resolutions", {}).get(cam)
@@ -210,5 +241,5 @@ class CameraGeometry:
                             "distortion_model": "none", "D": [0.] * 5, "pixel_center": .5}
             transform = pose(fk.data.camera(cam))
             transform[:3, :3] @= np.diag([1., -1., -1.])
-            poses[cam] = left_base_from_world @ transform
+            poses[cam] = reference_from_world @ transform
         return cameras, poses

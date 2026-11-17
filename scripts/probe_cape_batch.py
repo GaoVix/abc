@@ -51,9 +51,13 @@ def main():
     parser.add_argument("--num-gpus", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--start-batch", type=int, default=64)
-    # Batch 90 already ran out of memory on the current four-H100 model.
+    # The previous all-three-view CaPE run hit OOM at batch 90 on four H100s.
     parser.add_argument("--max-batch", type=int, default=89)
     parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--cape-camera-keys", nargs="+", choices=("top", "left", "right"))
+    parser.add_argument("--cape-reference-frame", choices=("left_arm", "top", "top_average"), default="left_arm")
+    parser.add_argument("--state-noise-snr", type=float)
+    parser.add_argument("--single-trial", action="store_true", help="Test start-batch once, without searching smaller batches")
     args = parser.parse_args()
     if not 1 <= args.start_batch <= args.max_batch or args.steps < 3 or args.num_gpus < 1:
         parser.error("Require 1 <= start-batch <= max-batch, steps >= 3 and num-gpus >= 1")
@@ -73,6 +77,11 @@ def main():
                    "--load-pretrained", "--model.use-cape",
                    "--mixture-preset", "load_the_plates_into_the_dish_rack",
                    "--batch-size", str(candidate), "--num-workers", str(args.num_workers)]
+        if args.cape_camera_keys is not None:
+            command += ["--model.cape-camera-keys", *args.cape_camera_keys]
+        command += ["--model.cape-reference-frame", args.cape_reference_frame]
+        if args.state_noise_snr is not None:
+            command += ["--flow.state-noise-snr", str(args.state_noise_snr)]
         print(f"Testing batch={candidate} per GPU for {args.steps} updates; log={log_path}", flush=True)
         with log_path.open("w") as stream:
             completed = subprocess.run(command, cwd=ROOT, env=environment,
@@ -93,6 +102,8 @@ def main():
             print(f"OOM batch={candidate}", flush=True)
         else:
             raise RuntimeError(f"Trial failed for a reason other than CUDA OOM; inspect {log_path}")
+        if args.single_trial:
+            break
         candidate = (lower + upper) // 2
     summary = {"num_gpus": args.num_gpus, "steps_per_trial": args.steps,
                "searched_max_batch": args.max_batch, "largest_passing_batch_per_gpu": lower,

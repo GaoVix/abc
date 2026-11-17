@@ -157,7 +157,8 @@ def augment_and_normalize(images, train, norm_preset="imagenet", image_size=224,
     out_plucker = {}
     for cam, img in images.items():
         x = img.permute(1, 2, 0)
-        if plucker_maps is not None:
+        has_rays = plucker_maps is not None and cam in plucker_maps
+        if has_rays:
             rays = plucker_maps[cam]
             if rays.shape != (6, *img.shape[-2:]):
                 raise ValueError(f"{cam}: Plücker map must align with the unaugmented RGB image")
@@ -180,7 +181,7 @@ def augment_and_normalize(images, train, norm_preset="imagenet", image_size=224,
                     align_corners=False,
                 ).squeeze(0).permute(1, 2, 0)
         x = resize_with_pad(x, image_size, image_size)
-        if plucker_maps is not None:
+        if has_rays:
             from abc_minimal.cape import normalize_plucker
 
             out_plucker[cam] = normalize_plucker(x[..., 3:].permute(2, 0, 1))

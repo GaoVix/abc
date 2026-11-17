@@ -4,8 +4,8 @@ Reference: https://github.com/ripl/CamPoseOpensource
 Architecture adapted from CamPose (MIT, Copyright (c) 2025 RIPL);
 see assets/third_party/campose/LICENSE.
 Camera matrices use OpenCV axes (right, down, forward), pixel centers at
-(u + .5, v + .5), and metric camera-to-left-base poses. The snippet's "world"
-is the left_arm body frame, shared by all three cameras. Ray channels are [m, d],
+(u + .5, v + .5), and metric camera poses in a shared reference frame
+(left_arm, top or top_average, as recorded in the checkpoint). Ray channels are [m, d],
 where d is a unit direction and m = camera_center cross d, matching the
 released ACT implementation. Geometric features are fused after DINO/CLIP;
 the image encoder, CLS token, pooling, and camera ID embeddings are retained.
@@ -21,12 +21,24 @@ from torch.nn import functional as F
 CAMERA_REFERENCE_FRAME = "left_arm"
 
 
-def validate_cape_checkpoint(ckpt):
-    """Reject weights trained with the former top-anchored camera frame."""
-    if ckpt.get("camera_reference_frame") != CAMERA_REFERENCE_FRAME:
-        raise ValueError("CaPE checkpoint reference frame is not left_arm; "
-                         "old top-anchored weights require their original code, "
-                         "or retraining with left-base camera parameters")
+def validate_cape_checkpoint(ckpt, camera_keys=None, reference_frame=CAMERA_REFERENCE_FRAME):
+    """Do not silently change the geometry frame or conditioned views of trained weights."""
+    if ckpt.get("camera_reference_frame") != reference_frame:
+        raise ValueError(f"CaPE checkpoint reference frame differs: "
+                         f"saved={ckpt.get('camera_reference_frame')!r}, requested={reference_frame!r}")
+    if camera_keys is not None:
+        saved = ckpt.get("model_config", {})
+        saved_keys = saved.get("cape_camera_keys")
+        if saved_keys is None:
+            saved_keys = saved.get("camera_keys", ("top", "left", "right"))
+        if tuple(saved_keys) != tuple(camera_keys):
+            raise ValueError(f"CaPE cameras differ from checkpoint: saved={saved_keys}, "
+                             f"requested={camera_keys}; set --model.cape-camera-keys accordingly")
+    if reference_frame == "top_average":
+        average = ckpt.get("camera_average_pose")
+        if average is None or np.shape(average) != (4, 4):
+            raise ValueError("CaPE top_average checkpoint requires one saved 4x4 camera_average_pose")
+        validate_camera_matrices(np.eye(3), average)
 
 
 def validate_camera_matrices(intrinsics, camera_to_world):
@@ -103,7 +115,8 @@ def resize_pad_plucker(rays, target_h=224, target_w=224):
     return normalize_plucker(rays)
 
 
-def observation_plucker(obs, camera_keys, device):
+def observation_plucker(obs, camera_keys, device, reference_frame=CAMERA_REFERENCE_FRAME,
+                        reference_from_top=None):
     """Make rays; optional camera_distortion uses cached calibrated directions.
 
     camera_distortion[cam] supplies distortion_model/D (and optionally the
@@ -112,11 +125,27 @@ def observation_plucker(obs, camera_keys, device):
     """
     if "camera_intrinsics" not in obs or "camera_to_world" not in obs:
         raise ValueError("CaPE inference requires per-camera camera_intrinsics and camera_to_world in the observation")
+    source_frame = obs.get("camera_reference_frame", CAMERA_REFERENCE_FRAME)
+    target_frame = "top" if reference_frame == "top_average" else reference_frame
+    reference_from_source = None
+    if source_frame != target_frame:
+        if target_frame != "top" or "top" not in obs["camera_to_world"]:
+            raise ValueError(f"Cannot convert CaPE observation frame {source_frame!r} to {reference_frame!r}")
+        reference_from_source = torch.linalg.inv(torch.as_tensor(
+            obs["camera_to_world"]["top"], device=device, dtype=torch.float32))
+    if reference_frame == "top_average":
+        if reference_from_top is None:
+            raise ValueError("CaPE inference requires the fixed training average pose")
+        average_from_top = torch.as_tensor(reference_from_top, device=device, dtype=torch.float32)
+        reference_from_source = (average_from_top if reference_from_source is None
+                                 else average_from_top @ reference_from_source)
     batch_size = 1 if np.ndim(obs["state"]) == 1 else len(obs["state"])
     result = {}
     for cam in camera_keys:
         k = torch.as_tensor(obs["camera_intrinsics"][cam], device=device, dtype=torch.float32)
         pose = torch.as_tensor(obs["camera_to_world"][cam], device=device, dtype=torch.float32)
+        if reference_from_source is not None:
+            pose = reference_from_source @ pose
         validate_camera_matrices(k, pose)
         height, width = obs["images"][cam].shape[-2:]
         distortion = obs.get("camera_distortion", {}).get(cam)
@@ -153,7 +182,8 @@ def mujoco_camera_geometry(model, data, camera_keys, height, width):
         pose[:3, :3] = base_rotation.T @ data.cam_xmat[index].reshape(3, 3) @ np.diag([1, -1, -1])
         pose[:3, 3] = base_rotation.T @ (data.cam_xpos[index] - base.xpos)
         poses[cam] = pose
-    return {"camera_intrinsics": intrinsics, "camera_to_world": poses}
+    return {"camera_intrinsics": intrinsics, "camera_to_world": poses,
+            "camera_reference_frame": CAMERA_REFERENCE_FRAME}
 
 
 # Copied from CamPose's ACT models/backbone.py, including checkpoint loading.

@@ -895,7 +895,7 @@ class DiTPolicy(nn.Module):
         for index, cam in enumerate(self.camera_keys):
             tokens = all_tokens[index]
             tokens = tokens.to(self.apool_queries[cam].dtype)
-            if self.config.use_cape:
+            if self.config.use_cape and cam in self.config.cape_cameras:
                 if plucker is None or cam not in plucker:
                     raise ValueError(f"CaPE requires image-aligned Plücker maps for camera {cam!r}")
                 image = images[cam]
@@ -1078,7 +1078,7 @@ def load_pretrained(model, ckpt_path, *, initialize_cape=False):
     if extra:
         raise RuntimeError(f"unexpected checkpoint keys: {extra[:8]}")
     if model.config.use_cape and any(k.startswith("cape.") for k in sd):
-        validate_cape_checkpoint(ckpt)
+        validate_cape_checkpoint(ckpt, model.config.cape_cameras, model.config.cape_reference_frame)
     if unexpected and os.environ.get("RANK", "0") == "0":
         print(f"load_pretrained: ignored {len(unexpected)} extra img_backbone keys "
               f"bundled in the checkpoint (e.g. {unexpected[:3]})")

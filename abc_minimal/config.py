@@ -124,6 +124,13 @@ class DiTConfig:
     vision_pool_mlp_ratio: int = 4
     # Plücker CNN + late fusion; retain the image encoder and camera embeddings.
     use_cape: bool = False
+    # None applies CaPE to every RGB view; a subset keeps the other views RGB-only.
+    cape_camera_keys: tuple[str, ...] | None = None
+    cape_reference_frame: Literal["left_arm", "top", "top_average"] = "left_arm"
+
+    @property
+    def cape_cameras(self):
+        return self.camera_keys if self.cape_camera_keys is None else self.cape_camera_keys
 
 
 MIXTURE_PRESETS: dict[str, list[MixtureComponent]] = {
@@ -371,6 +378,12 @@ def validate_model_config(model: DiTConfig) -> list[str]:
     errors = []
     if min(model_dims) <= 0 or not model.camera_keys:
         errors.append("model dimensions and camera_keys must be positive/non-empty")
+    if model.use_cape and (
+        not model.cape_cameras
+        or len(set(model.cape_cameras)) != len(model.cape_cameras)
+        or not set(model.cape_cameras).issubset(model.camera_keys)
+    ):
+        errors.append("cape_camera_keys must be a nonempty subset of camera_keys without duplicates")
     if (
         model.hidden_size % model.num_heads
         or model.vit_embed_dim % model.vit_num_heads

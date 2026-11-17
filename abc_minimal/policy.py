@@ -197,6 +197,10 @@ class DiTInferencePolicy(InferencePolicy):
         self.action_dim = self.model_config.action_dim
         self.model = DiTPolicy(self.model_config).to(self.device)
         ckpt = load_pretrained(self.model, checkpoint)
+        self.cape_reference_from_top = None
+        if self.model_config.use_cape and self.model_config.cape_reference_frame == "top_average":
+            self.cape_reference_from_top = torch.linalg.inv(torch.tensor(
+                ckpt["camera_average_pose"], dtype=torch.float32, device=self.device))
         self.model.eval()
         self.norm_preset = preset_for_backbone(self.model_config.vision_backbone)
         self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
@@ -279,7 +283,8 @@ class DiTInferencePolicy(InferencePolicy):
             "task_vec_clip": task_vec,
         }
         if m.use_cape:
-            batch["plucker"] = observation_plucker(obs, m.camera_keys, self.device)
+            batch["plucker"] = observation_plucker(obs, m.cape_cameras, self.device, m.cape_reference_frame,
+                                                   self.cape_reference_from_top)
         noise_t = None
         if noise is not None:
             noise_arr = np.asarray(noise, dtype=np.float32).reshape(

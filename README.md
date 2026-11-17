@@ -171,6 +171,40 @@ uv run train.py --load-pretrained
 `--model.vision-backbone clip` when the parent is a CLIP-DiT checkpoint; DINOv3
 is the default.
 
+For the filtered three-stage IK dishrack experiment, `bash train_cape_wrist_noise.sh`
+starts a fresh finetune from the released parent. It retains all three RGB views
+and their learned camera embeddings, with CaPE on `left` and `right` only
+(`--model.use-cape --model.cape-camera-keys left right`). The launcher uses the
+existing filtered XML-base export, 4 GPUs, batch 88 per GPU, 100k updates, and
+40 dB noise on the 12 real-data joint-state inputs. Grippers, action targets,
+sim states, and validation inputs receive no added noise. Checkpoints are saved
+at 30k, 60k, 90k, and 100k. A five-update memory check must pass before the full
+run; it does not change the training initialization.
+
+Camera poses are computed offline from the original RGB-aligned clean states,
+each sequence's calibrated bases and camera-to-link mounts. `SOURCE_ROOT` points
+to the original export (`dishrack_original_1261` by default); converted segments
+map back through `sequence_ik.source_episode` and `source_frame_range`. The model
+still receives the filtered IK states and actions. No timestamp offset is applied.
+
+Both wrists are expressed in each sequence's own top-camera frame. The launcher
+uniformly samples 100,000 training real frames and 25,000 training sim frames,
+without replacement (or all available frames if a split is smaller), using seed 0.
+Each selected frame contributes both wrists with equal weight. One shared reference
+uses arithmetic mean translation and the SO(3) geodesic/Karcher rotation mean,
+following the supplied Log/Exp iteration; it does not use the chordal rotation mean.
+`camera_average.json` saves that reference in the dataset root. All splits use
+`inverse(top_from_average) @ top_from_camera` to generate CaPE. The checkpoint
+embeds the same average, and inference needs no external average file.
+Use `PREPARE_ONLY=1 bash train_cape_wrist_noise.sh` to preprocess and time the
+average calculation without launching the GPU probe or training.
+
+At inference, use `--model.use-cape --model.cape-camera-keys left right
+--model.cape-reference-frame top_average`. Camera poses come from the current
+simulated scene, first transformed into its top frame and then into the saved
+average frame. Intrinsics, distortion inversion, and RGB/ray resize and padding
+follow the existing CaPE path. The checkpoint validates the reference and views.
+
 #### ABC-VLA Finetuning
 
 The same weights-only path works for VLA checkpoints and needs no Gemma base:

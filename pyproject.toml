@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
+    "scipy",
     "torch==2.11.0+cu128 ; sys_platform == 'linux'",
     # Includes TorchCodec #1834: decoder metadata must not leak on torch 2.11.
     "torchcodec==0.18.0.dev20261108+cpu ; sys_platform == 'linux'",

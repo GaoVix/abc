@@ -30,6 +30,7 @@ from abc_minimal.checkpointing import (
     update_last,
 )
 from abc_minimal.cape import validate_cape_checkpoint
+from abc_minimal.camera_parameters import load_camera_average
 from abc_minimal.config import (
     TrainConfig,
     validate_train_config,
@@ -215,7 +216,7 @@ def _build_dit_model(config, cache_root, device, resume_ckpt, rank, distributed)
     ckpt_norm_stats = None
     if resume_ckpt is not None:
         if config.model.use_cape:
-            validate_cape_checkpoint(resume_ckpt)
+            validate_cape_checkpoint(resume_ckpt, config.model.cape_cameras, config.model.cape_reference_frame)
         model.load_state_dict(resume_ckpt["model"])
         ckpt_norm_stats = resume_ckpt.get("norm_stats")
         if rank == 0:
@@ -319,6 +320,9 @@ def main(config: TrainConfig):
     components = validate_train_config(
         config, cache_root, cache_root / config.pretrained_ckpt_name
     )
+    camera_average_pose = None
+    if not is_vla and config.model.use_cape and config.model.cape_reference_frame == "top_average":
+        camera_average_pose = load_camera_average(cache_root / "camera_average.json")
 
     distributed, rank, world, local_rank, local_world, device = _distributed_context()
     data_scope = data_parallel_scope(cache_root, rank, world, local_rank, local_world)
@@ -330,6 +334,10 @@ def main(config: TrainConfig):
         resume_ckpt, resume_step = load_checkpoint(config.resume_from)
         check_topology(resume_ckpt, batch_size=config.batch_size,
                        data_world=data_scope.world, rank=rank)
+        if camera_average_pose is not None:
+            validate_cape_checkpoint(resume_ckpt, config.model.cape_cameras, "top_average")
+            if not np.array_equal(resume_ckpt["camera_average_pose"], camera_average_pose):
+                raise ValueError("CaPE training average differs from resume checkpoint")
 
     torch.manual_seed(config.seed + rank)
     np.random.seed(config.seed + rank)
@@ -511,7 +519,8 @@ def main(config: TrainConfig):
                                 global_step=global_step, norm_stats=norm_stats,
                                 batch_size=config.batch_size, data_world=data_scope.world,
                                 model_config=model_config, train_config=asdict(config),
-                                model_state=model_state, optimizer_state=optimizer_state)
+                                model_state=model_state, optimizer_state=optimizer_state,
+                                camera_average_pose=camera_average_pose)
                 update_last(output_dir, path)
                 print(f"[rank {rank}] saved {path}")
 

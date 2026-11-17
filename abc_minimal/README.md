@@ -139,15 +139,32 @@ not needed. FK copies only the arm joint/link hierarchy, its original joint/came
 defaults and the three camera mounts, then compiles that small tree with
 MuJoCo. It discards task objects, render geometry, assets, lights and actuators.
 Original robot variants retain their own link parameters.
-For `sequence_ik`/`joint_conversion` episodes, FK uses the target YAM model;
+In the default `left_arm` mode, `sequence_ik`/`joint_conversion` FK uses the target YAM model;
 sequence-IK metadata supplies the target bases when available.
-All three camera poses are expressed in the **left arm base frame**
+In that mode, all three camera poses are expressed in the **left arm base frame**
 (`left_arm`): `T_left_base_from_camera = inverse(T_world_from_left_base)
 @ T_world_from_camera`. Original real episodes use their own calibrated
 bases and camera mounts, including the top camera. The top pose is not
 replaced by a shared reference pose. Right-wrist geometry includes the full
 right-base-to-left-base translation and rotation. Sim training and evaluation
 use the same left-base convention, including randomized bases at evaluation.
+
+For the wrist-only experiment, `train_cape_wrist_noise.sh` instead prepares
+`--reference-frame top --source-root ORIGINAL_EXPORT`. Each converted real
+segment uses its original RGB-aligned state, calibrated bases and mounts, mapped
+through `source_episode` and `[begin,end)` `source_frame_range`. Sim uses the
+actual arm/camera model. Both domains store camera-to-top poses in the sidecars.
+`scripts.average_camera_pose` samples 100,000 `train_real` frames and 25,000
+`train_sim` frames with seed 0, taking both wrists at each frame. It computes
+arithmetic translation and geodesic/Karcher rotation means using the supplied
+Log/Exp iteration (tolerance 1e-10, at most 100 iterations, first rotation as
+initialization). It fails if the iteration does not converge. The saved
+`camera_average.json` is shared by training and validation. The model uses
+`--model.cape-reference-frame top_average --model.cape-camera-keys left right`;
+the rays use `inverse(top_from_average) @ top_from_camera`. Model joint noise
+does not affect the clean camera geometry. The checkpoint embeds this fixed
+average; inference converts live camera poses into the same frame. There is no
+per-batch mean calculation or training-time FK.
 
 Only **fixed** camera-to-link/base transforms, intrinsics and distortion
 parameters are read from the calibration bundle. Offline preprocessing computes each camera pose as
@@ -171,12 +188,11 @@ against that frame's 14 raw state values (112 bytes), so changed alignment/conve
 reuse old poses. Regenerate with `--overwrite` after changing states,
 calibration or bases. The fixed direction table is about 1.72 MiB for three
 224x224 cameras, independent of episode length. Missing files raise an error. Old v1/v2/v3
-sidecars, and v4 sidecars without `reference_frame="left_arm"`, must be
-regenerated with `--overwrite` before training. The NPY field retains the
-snippet's name `camera_to_world`, but its reference is now the left arm base.
-New CaPE checkpoints record `camera_reference_frame="left_arm"`. Earlier
-top-anchored checkpoints are rejected for inference/resume; retain their
-original code to evaluate them, or retrain for the new coordinate convention.
+sidecars must be regenerated with `--overwrite` before training. The NPY field
+retains the snippet's name `camera_to_world`; its actual reference is recorded
+as `left_arm` or `top` in the manifest. The model checks this convention.
+New CaPE checkpoints record their selected `camera_reference_frame`; loading a
+different frame or a different set of conditioned cameras is rejected.
 
 The expensive pixel-to-ray inversion runs **offline**, using K, the recorded
 `distortion_model`, and five coefficients `D=[k1,k2,p1,p2,k3]`. Brown-Conrady

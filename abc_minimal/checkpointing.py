@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from abc_minimal.cape import CAMERA_REFERENCE_FRAME
+from abc_minimal.cape import CAMERA_REFERENCE_FRAME, validate_cape_checkpoint
 
 
 def model_state_dict(ckpt) -> dict[str, torch.Tensor]:
@@ -119,7 +119,8 @@ def restore_training_state(ckpt, *, optimizer, scheduler, resume_step, rank, sou
 
 def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_stats,
                     batch_size=None, data_world=None, model_config=None,
-                    train_config=None, model_state=None, optimizer_state=None) -> None:
+                    train_config=None, model_state=None, optimizer_state=None,
+                    camera_average_pose=None) -> None:
     """Write the checkpoint via tmp file + rename so a crash mid-write can
     never leave a truncated file where resume looks. ``model_state`` and
     ``optimizer_state`` carry the gathered dicts of an FSDP run."""
@@ -137,7 +138,11 @@ def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_sta
     if model_config is not None:
         payload["model_config"] = model_config
         if model_config.get("use_cape"):
-            payload["camera_reference_frame"] = CAMERA_REFERENCE_FRAME
+            payload["camera_reference_frame"] = model_config.get("cape_reference_frame", CAMERA_REFERENCE_FRAME)
+            if payload["camera_reference_frame"] == "top_average":
+                if camera_average_pose is not None:
+                    payload["camera_average_pose"] = torch.as_tensor(camera_average_pose).tolist()
+                validate_cape_checkpoint(payload, reference_frame="top_average")
     if train_config is not None:
         # Plain dict so eval-side readers (resolve_trained_max_prefix) need
         # no import of this repo's dataclasses to interpret it.

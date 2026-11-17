@@ -13,7 +13,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from abc_minimal.config import DiTConfig, PromptConfig, VLAModelConfig
-from abc_minimal.camera_parameters import episode_plucker, require_camera_parameters
+from abc_minimal.camera_parameters import episode_plucker, load_camera_average, require_camera_parameters
 from abc_minimal.dit import task_name_to_prompt
 from abc_minimal.operator import operator_label_for
 from abc_minimal.preprocess import augment_and_normalize, normalize, preset_for_backbone
@@ -391,6 +391,12 @@ class EpisodeDataset(Dataset):
         self.model_config = model_config
         self.camera_keys = tuple(model_config.camera_keys)
         self.use_cape = getattr(model_config, "use_cape", False)
+        self.cape_cameras = model_config.cape_cameras if self.use_cape else ()
+        self.cape_reference_from_top = None
+        if self.use_cape and model_config.cape_reference_frame == "top_average":
+            # Use the dataset root before resolving a split symlink (notably train_sim).
+            average = load_camera_average(Path(data_dir).parent / "camera_average.json")
+            self.cape_reference_from_top = np.linalg.inv(average)
         if self.use_cape:
             for ep_dir, *_ in self.episodes:
                 require_camera_parameters(ep_dir)
@@ -485,7 +491,10 @@ class EpisodeDataset(Dataset):
         raw_images = decode_frame(ep_dir, k, length, source_cameras, self.camera_keys)
         plucker = None
         if self.use_cape:
-            plucker = episode_plucker(ep_dir, k, geometry_state, length, raw_images)
+            plucker = episode_plucker(ep_dir, k, geometry_state, length,
+                                      {cam: raw_images[cam] for cam in self.cape_cameras},
+                                      reference_frame=self.model_config.cape_reference_frame,
+                                      reference_from_top=self.cape_reference_from_top)
         images = augment_and_normalize(
             raw_images,
             self.train,
@@ -609,7 +618,8 @@ def collate(samples, camera_keys):
     }
     if "plucker" in samples[0]:
         batch["plucker"] = {
-            cam: torch.stack([sample["plucker"][cam] for sample in samples]) for cam in camera_keys
+            cam: torch.stack([sample["plucker"][cam] for sample in samples])
+            for cam in samples[0]["plucker"]
         }
     return batch
 

@@ -2,6 +2,7 @@
 
 import gzip
 import json
+from dataclasses import asdict, replace
 from pathlib import Path
 import shutil
 import tempfile
@@ -22,11 +23,15 @@ from abc_minimal.cape import (
     validate_camera_matrices,
 )
 from abc_minimal.config import DiTConfig
-from abc_minimal.camera_geometry import CameraGeometry
+from abc_minimal.checkpointing import save_checkpoint
+from abc_minimal.camera_geometry import CameraGeometry, state_fk
 from abc_minimal.camera_parameters import (
+    average_camera_pose,
     clear_camera_parameter_caches,
     episode_plucker,
     exported_intrinsics,
+    geodesic_rotation_mean,
+    load_camera_average,
     load_camera_directions,
     load_camera_parameters,
     prepare_camera_parameters,
@@ -139,7 +144,7 @@ class GeometryTests(unittest.TestCase):
     def test_mujoco_axes_and_moving_camera_pose(self):
         import mujoco
 
-        model = mujoco.MjModel.from_xml_string('''<mujoco><worldbody><body>
+        model = mujoco.MjModel.from_xml_string('''<mujoco><worldbody><body name="left_arm"/><body>
           <joint name="slide" type="slide" axis="1 0 0"/>
           <geom type="sphere" size=".1" mass="1"/>
           <camera name="top" pos="0 0 1" fovy="60"/>
@@ -154,6 +159,75 @@ class GeometryTests(unittest.TestCase):
         second = mujoco_camera_geometry(model, data, ("top",), 3, 3)
         self.assertAlmostEqual(float(second["camera_to_world"]["top"][0, 3]), .7, places=6)
         self.assertEqual(float(first["camera_to_world"]["top"][0, 3]), 0)
+
+    def test_top_relative_inference_rebases_all_cameras_before_making_rays(self):
+        k, top = calibration()
+        wrist = top.clone()
+        wrist[0, 3] += .4
+        wrist[:3, :3] = torch.tensor([[0., -1, 0], [1., 0, 0], [0, 0, 1.]])
+        obs = {"state": np.zeros((2, 14)), "images": {"left": torch.zeros(2, 3, 224, 224)},
+               "camera_intrinsics": {"left": k}, "camera_to_world": {"top": top, "left": wrist},
+               "camera_reference_frame": "left_arm"}
+        actual = observation_plucker(obs, ("left",), "cpu", "top")["left"]
+        expected = plucker_raymap(k, torch.linalg.inv(top) @ wrist, 224, 224)
+        torch.testing.assert_close(actual, expected[None].expand_as(actual))
+
+
+class CameraAverageTests(unittest.TestCase):
+    def test_geodesic_mean_matches_angular_average_and_differs_from_chordal(self):
+        from scipy.spatial.transform import Rotation
+
+        rotations = Rotation.from_rotvec(np.deg2rad([[0., 0., angle] for angle in (0., 10., 80.)]))
+        actual = Rotation.from_matrix(geodesic_rotation_mean(rotations.as_matrix()))
+        expected = Rotation.from_rotvec([0., 0., np.deg2rad(30.)])
+        self.assertLess((expected.inv() * actual).magnitude(), 1e-10)
+        self.assertGreater((rotations.mean().inv() * actual).magnitude(), np.deg2rad(.5))
+        with self.assertRaisesRegex(ValueError, "did not converge"):
+            geodesic_rotation_mean(rotations.as_matrix(), max_iter=1)
+
+    def test_geodesic_mean_handles_angle_wraparound(self):
+        from scipy.spatial.transform import Rotation
+
+        rotations = Rotation.from_rotvec(np.deg2rad([[0., 0., angle] for angle in (170., -170., 180.)]))
+        actual = Rotation.from_matrix(geodesic_rotation_mean(rotations.as_matrix()))
+        expected = Rotation.from_rotvec([0., 0., np.pi])
+        self.assertLess((expected.inv() * actual).magnitude(), 1e-10)
+
+    def test_sampled_real_sim_average_pools_both_wrists_and_excludes_top(self):
+        from scipy.spatial.transform import Rotation
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for split, count, angles, positions in (
+                    ("train_real", 10, [0., 10.], [1., 3.]),
+                    ("train_sim", 5, [80., 90.], [5., 7.])):
+                episode = root / split / "episode_test"
+                episode.mkdir(parents=True)
+                np.zeros((count, 28)).tofile(episode / "states_actions.bin")
+                dtype = np.dtype([("state", "<f8", (14,)), ("camera_to_world", "<f4", (3, 4, 4))])
+                frames = np.zeros(count, dtype=dtype)
+                frames["camera_to_world"] = np.eye(4)
+                frames["camera_to_world"][:, 0, 0, 3] = 1000.  # Top is not part of the mean.
+                frames["camera_to_world"][:, 1:, :3, :3] = Rotation.from_rotvec(
+                    np.deg2rad([[0., 0., angle] for angle in angles])).as_matrix()
+                frames["camera_to_world"][:, 1:, 0, 3] = positions
+                np.save(episode / "camera_parameters.npy", frames)
+                np.save(episode / "camera_directions.npy", np.zeros((3, 3, 1, 1), np.float32))
+                (episode / "camera_parameters.json").write_text(json.dumps({
+                    "version": 4, "convention": "opencv", "reference_frame": "top",
+                    "camera_keys": ["top", "left", "right"]}))
+            dirs = [root / "train_real", root / "train_sim"]
+            result = average_camera_pose(dirs, real_frames=6, sim_frames=2, seed=5)
+            average = np.asarray(result["top_from_average"])
+            # 12 real poses average to 5 degrees; 4 sim poses to 85 degrees.
+            expected = Rotation.from_rotvec([0., 0., np.deg2rad(25.)])
+            actual = Rotation.from_matrix(average[:3, :3])
+            self.assertLess((expected.inv() * actual).magnitude(), 1e-8)
+            np.testing.assert_allclose(average[:3, 3], [3., 0., 0.])
+            self.assertEqual(result["rotation_mean"], "geodesic")
+            self.assertEqual(result["num_poses"], 16)
+            self.assertEqual(result["sampled_frames"], {"train_real": 6, "train_sim": 2})
+            self.assertEqual(result, average_camera_pose(dirs, real_frames=6, sim_frames=2, seed=5))
 
 
 class FrozenBatchNormTests(unittest.TestCase):
@@ -349,7 +423,8 @@ class PolicyTests(unittest.TestCase):
         torch.save({"model": partial}, path)
         with self.assertRaisesRegex(RuntimeError, "missing model keys"):
             load_pretrained(self.cape, path, initialize_cape=True)
-        torch.save({"model": self.cape.state_dict()}, path)
+        torch.save({"model": self.cape.state_dict(), "camera_reference_frame": "left_arm",
+                    "model_config": asdict(self.cape.config)}, path)
         load_pretrained(self.cape, path)
         with self.assertRaisesRegex(RuntimeError, "unexpected checkpoint keys"):
             load_pretrained(self.base, path)
@@ -361,6 +436,61 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires per-camera"):
             observation_plucker({"state": np.zeros(14), "images": data["images"]},
                                 self.cape.camera_keys, "cpu")
+
+    def test_wrist_only_fusion_keeps_top_rgb_and_validates_checkpoint_views(self):
+        config = replace(tiny_config(True), cape_camera_keys=("left", "right"))
+        model = DiTPolicy(config).eval()
+        load_pretrained(model, self.parent, initialize_cape=True)
+        data = batch(config)
+        wrists = {cam: data["plucker"][cam] for cam in config.cape_cameras}
+        with torch.no_grad():
+            model.cape.fusion.weight[:, 32:] = torch.eye(32)
+        actual = model.build_vision_tokens(data["images"], wrists)
+        # Top rays are ignored, but top RGB is still encoded.
+        extra = dict(wrists, top=torch.full_like(data["plucker"]["top"], float("nan")))
+        torch.testing.assert_close(actual, model.build_vision_tokens(data["images"], extra))
+        changed_rgb = dict(data["images"], top=torch.zeros_like(data["images"]["top"]))
+        self.assertFalse(torch.allclose(actual, model.build_vision_tokens(changed_rgb, wrists)))
+        self.assertFalse(torch.allclose(actual, model.build_vision_tokens(
+            data["images"], {cam: torch.zeros_like(value) for cam, value in wrists.items()})))
+        model(data | {"plucker": wrists}).backward()
+        self.assertGreater(model.cape.plucker_encoder[0].weight.grad.abs().sum().item(), 0)
+        path = Path(self.temp.name) / "wrists.pt"
+        torch.save({"model": model.state_dict(), "model_config": asdict(config),
+                    "camera_reference_frame": "left_arm"}, path)
+        load_pretrained(model, path)
+        with self.assertRaisesRegex(ValueError, "CaPE cameras differ"):
+            load_pretrained(self.cape, path)
+
+    def test_checkpoint_records_top_reference_and_rejects_left_base_load(self):
+        config = replace(tiny_config(True), cape_reference_frame="top")
+        model = DiTPolicy(config)
+        optimizer = torch.optim.SGD(model.parameters(), lr=.01)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.)
+        path = Path(self.temp.name) / "top.pt"
+        save_checkpoint(path, module=model, optimizer=optimizer, scheduler=scheduler,
+                        global_step=2, norm_stats={}, model_config=asdict(config))
+        checkpoint = load_pretrained(model, path)
+        self.assertEqual(checkpoint["camera_reference_frame"], "top")
+        with self.assertRaisesRegex(ValueError, "checkpoint reference frame differs"):
+            load_pretrained(self.cape, path)
+
+    def test_checkpoint_preserves_average_and_requires_it_for_top_average(self):
+        config = replace(tiny_config(True), cape_camera_keys=("left", "right"),
+                         cape_reference_frame="top_average")
+        model = DiTPolicy(config)
+        optimizer = torch.optim.SGD(model.parameters(), lr=.01)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.)
+        path = Path(self.temp.name) / "average.pt"
+        _, average = calibration()
+        save_checkpoint(path, module=model, optimizer=optimizer, scheduler=scheduler,
+                        global_step=2, norm_stats={}, model_config=asdict(config),
+                        camera_average_pose=average)
+        checkpoint = load_pretrained(model, path)
+        np.testing.assert_array_equal(checkpoint["camera_average_pose"], average.numpy())
+        with self.assertRaisesRegex(ValueError, "requires one saved 4x4"):
+            save_checkpoint(path, module=model, optimizer=optimizer, scheduler=scheduler,
+                            global_step=2, norm_stats={}, model_config=asdict(config))
 
 
 class FixedCalibrationTests(unittest.TestCase):
@@ -476,11 +606,9 @@ class FixedCalibrationTests(unittest.TestCase):
         # rotate with that joint, independently of every temporal field.
         expected = np.array([[0., -1, 0, .1], [1., 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
         expected[:3, 3] += expected[:3, :3] @ np.array([.52, .03, .04])
-        anchor = self.geometry.world_from_top @ np.linalg.inv(
-            np.asarray(record["cameras"]["top"]["T_reference_from_camera"]))
-        np.testing.assert_allclose(moved["left"], anchor @ expected, atol=1e-12)
+        np.testing.assert_allclose(moved["left"], expected, atol=1e-12)
 
-    def test_retargeted_state_uses_target_bases_without_time_lookup(self):
+    def test_retargeted_state_uses_target_bases_and_calibrated_mounts(self):
         bases = np.stack([np.eye(4), np.eye(4)])
         bases[:, 0, 3] = [.3, -.3]
         conversion = {"source_episode": "episode_test", "camera_from_base":
@@ -493,9 +621,48 @@ class FixedCalibrationTests(unittest.TestCase):
         _, same = self.geometry.camera_poses(self.episode, state, metadata)
         for cam in poses:
             np.testing.assert_array_equal(poses[cam], same[cam])
-        # At zero left joint angles the six .1m links plus fixed mount
-        # are added to the target left base, rather than the original base.
-        np.testing.assert_allclose(poses["left"][:3, 3], [.92, .03, .04], atol=1e-12)
+        np.testing.assert_allclose(poses["top"], np.linalg.inv(bases[0]) @ self.geometry.world_from_top, atol=1e-12)
+        # Six .1m links and the calibrated mount, expressed relative to left base.
+        np.testing.assert_allclose(poses["left"][:3, 3], [.62, .03, .04], atol=1e-12)
+        expected_right = [-.5 + .52*np.cos(.4) - .03*np.sin(.4),
+                          .52*np.sin(.4) + .03*np.cos(.4), .04]
+        np.testing.assert_allclose(poses["right"][:3, 3], expected_right, atol=1e-12)
+
+    def test_top_relative_converted_episode_uses_original_frame_and_calibration(self):
+        root = self.episode.parent
+        source = root / "source/train_real/episode_test"
+        source.mkdir(parents=True)
+        original = np.zeros((4, 28))
+        original[1, 0], original[2, 7] = .5, -.4
+        original.tofile(source / "states_actions.bin")
+        (source / "episode_metadata.json").write_text("{}")
+        episode = root / "converted/train_real/episode_segment"
+        episode.mkdir(parents=True)
+        converted = np.zeros((2, 28))
+        converted[:, :14] = 1.2  # Deliberately unrelated to physical RGB joints.
+        converted.tofile(episode / "states_actions.bin")
+        metadata = {"sequence_ik": {"source_episode": "episode_test", "state_time_offset_s": 1000},
+                    "source_frame_range": [1, 3],
+                    "camera_resolutions": {cam: [32, 32] for cam in ("top", "left", "right")}}
+        (episode / "episode_metadata.json").write_text(json.dumps(metadata))
+        geometry = CameraGeometry(root / "calibrations.json.gz", root / "abc_sim/models",
+                                  reference_frame="top", source_root=root / "source")
+        prepare_camera_parameters(episode, geometry)
+        saved, frames = load_camera_parameters(str(episode.resolve()))
+        self.assertEqual(saved["reference_frame"], "top")
+        self.assertEqual(saved["pose_source"], "original_rgb_state")
+        np.testing.assert_array_equal(frames["state"], converted[:, :14])
+        for index in range(2):
+            _, left_frame = self.geometry.camera_poses(self.episode, original[index + 1, :14], {})
+            for camera_index, cam in enumerate(saved["camera_keys"]):
+                expected = np.linalg.inv(left_frame["top"]) @ left_frame[cam]
+                np.testing.assert_allclose(frames["camera_to_world"][index, camera_index], expected, atol=1e-7)
+        np.testing.assert_allclose(frames["camera_to_world"][:, 0], np.broadcast_to(np.eye(4), (2, 4, 4)), atol=1e-7)
+        images = {cam: torch.zeros(3, 32, 32) for cam in ("left", "right")}
+        rays = episode_plucker(episode, 0, converted[0, :14], 2, images, reference_frame="top")
+        self.assertEqual(set(rays), {"left", "right"})
+        with self.assertRaisesRegex(ValueError, "reference frame differs from model"):
+            episode_plucker(episode, 0, converted[0, :14], 2, images)
 
     def test_sim_fixed_mounts_use_current_state_and_export_letterbox(self):
         episode = self.episode.parent / "episode_sim"
@@ -528,8 +695,40 @@ class FixedCalibrationTests(unittest.TestCase):
         for cam in ("top", "right"):
             torch.testing.assert_close(first[cam], moved[cam], atol=0, rtol=0)
         self.assertFalse(torch.allclose(first["left"], moved["left"]))
+
         self.assertEqual(float(first["top"][:, :28].abs().sum()), 0.)
         torch.testing.assert_close(first["top"][3:, 28:196].norm(dim=0), torch.ones(168, 224))
+
+    def test_top_relative_sim_offline_rays_match_inference(self):
+        episode = self.episode.parent / "episode_sim_top"
+        episode.mkdir()
+        rows = np.zeros((2, 28))
+        rows[:, 0], rows[:, 7] = [.2, .6], [-.3, -.5]
+        rows.tofile(episode / "states_actions.bin")
+        metadata = {"task_name": "sim_test", "image_width": 224, "image_height": 168}
+        (episode / "episode_metadata.json").write_text(json.dumps(metadata))
+        self.geometry.reference_frame = "top"
+        prepare_camera_parameters(episode, self.geometry)
+        images = {cam: torch.zeros(3, 168, 224) for cam in ("top", "left", "right")}
+        fk = state_fk(str(self.geometry.target_model))
+        for index in range(2):
+            maps = episode_plucker(episode, index, rows[index, :14], 2,
+                                   {cam: images[cam] for cam in ("left", "right")}, reference_frame="top")
+            _, expected = augment_and_normalize(images, False, plucker_maps=maps)
+            fk.update(rows[index, :14])
+            obs = {"state": rows[index, :14], "images": images,
+                   **mujoco_camera_geometry(fk.model, fk.data, tuple(images), 168, 224)}
+            actual = observation_plucker(obs, ("left", "right"), "cpu", "top")
+            for cam in actual:
+                torch.testing.assert_close(actual[cam][0], expected[cam], atol=1e-6, rtol=1e-5)
+            average_from_top = np.array([[0., -1, 0, .2], [1, 0, 0, -.1], [0, 0, 1, .3], [0, 0, 0, 1]])
+            maps = episode_plucker(episode, index, rows[index, :14], 2,
+                                   {cam: images[cam] for cam in ("left", "right")},
+                                   reference_frame="top_average", reference_from_top=average_from_top)
+            _, expected = augment_and_normalize(images, False, plucker_maps=maps)
+            actual = observation_plucker(obs, ("left", "right"), "cpu", "top_average", average_from_top)
+            for cam in actual:
+                torch.testing.assert_close(actual[cam][0], expected[cam], atol=1e-6, rtol=1e-5)
 
     def test_sim_uses_each_actual_source_resolution(self):
         episode = self.episode.parent / "episode_sim_sizes"
@@ -699,11 +898,47 @@ class FixedCalibrationTests(unittest.TestCase):
 
 
 class DatasetTests(unittest.TestCase):
+    def test_split_symlink_uses_dataset_root_average_and_matches_inference(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "dataset"
+            root.mkdir()
+            episode = Path(folder) / "original_sim" / "episode_test"
+            episode.mkdir(parents=True)
+            (root / "train_sim").symlink_to(episode.parent, target_is_directory=True)
+            config = replace(tiny_config(True), cape_camera_keys=("left", "right"),
+                             cape_reference_frame="top_average")
+            rows = np.zeros((8, 28))
+            rows.tofile(episode / "states_actions.bin")
+            (episode / "episode_metadata.json").write_text(json.dumps({
+                "task_name": "sim_test", "cameras": config.camera_keys,
+                "camera_resolutions": {cam: [32, 32] for cam in config.camera_keys}}))
+            k, wrist = calibration()
+            poses = {"top": torch.eye(4), "left": wrist, "right": wrist}
+            cameras = {cam: {"K": k.numpy(), "height": 32, "width": 32} for cam in poses}
+            geometry = Mock(reference_frame="top")
+            geometry.camera_parameters.return_value = (cameras, {cam: pose.numpy() for cam, pose in poses.items()})
+            prepare_camera_parameters(episode, geometry)
+            average = np.array([[0., -1, 0, .2], [1, 0, 0, -.1], [0, 0, 1, .3], [0, 0, 0, 1]])
+            average_path = root / "camera_average.json"
+            average_path.write_text(json.dumps({"reference_frame": "top", "camera_keys": ["left", "right"],
+                                                "rotation_mean": "geodesic", "top_from_average": average.tolist()}))
+            stats = {key: {"mean": np.zeros(14), "std": np.ones(14)} for key in ("state", "actions")}
+            dataset = EpisodeDataset(root / "train_sim", stats, False, "sim_test", 0., config)
+            images = {cam: torch.rand(3, 32, 32) for cam in config.camera_keys}
+            with patch("abc_minimal.dataloader.decode_frame", return_value=images):
+                sample = dataset[0]
+            obs = {"state": rows[0, :14], "images": images, "camera_intrinsics": {cam: k for cam in poses},
+                   "camera_to_world": poses, "camera_reference_frame": "top"}
+            expected = observation_plucker(obs, config.cape_cameras, "cpu", "top_average",
+                                           np.linalg.inv(load_camera_average(average_path)))
+            for cam in config.cape_cameras:
+                torch.testing.assert_close(sample["plucker"][cam], expected[cam][0], atol=1e-6, rtol=1e-5)
+
     def test_cached_parameters_match_raw_state_without_training_fk(self):
         with tempfile.TemporaryDirectory() as folder:
             episode = Path(folder) / "episode_test"
             episode.mkdir()
-            config = tiny_config(True)
+            config = replace(tiny_config(True), cape_camera_keys=("left", "right"))
             rows = np.zeros((8, 28), dtype=np.float64)
             rows[:, :14] = np.arange(8)[:, None] * .1 + 1.
             rows.tofile(episode / "states_actions.bin")
@@ -714,7 +949,7 @@ class DatasetTests(unittest.TestCase):
             k, pose = calibration()
             fk_states = []
 
-            def parameters(ep_dir, state, metadata):
+            def parameters(ep_dir, state, metadata, *, frame_index=0):
                 fk_states.append(state.copy())
                 current_pose = pose.clone()
                 current_pose[0, 3] = float(state[0])
@@ -724,6 +959,7 @@ class DatasetTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "camera parameters missing"):
                 EpisodeDataset(folder, stats, True, "test", 1., config)
             geometry = Mock()
+            geometry.reference_frame = "left_arm"
             geometry.camera_parameters.side_effect = parameters
             prepare_camera_parameters(episode, geometry)
             np.testing.assert_array_equal(fk_states, rows[:, :14])
@@ -738,9 +974,11 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(geometry.camera_parameters.call_count, len(rows))
             self.assertTrue(all(sample["state_is_masked"] for sample in samples))
             self.assertEqual(float(samples[0]["state"].abs().sum()), 0.)
-            self.assertFalse(torch.equal(samples[0]["plucker"]["top"], samples[1]["plucker"]["top"]))
+            self.assertEqual(set(samples[0]["plucker"]), {"left", "right"})
+            self.assertEqual(set(samples[0]["images"]), {"top", "left", "right"})
+            self.assertFalse(torch.equal(samples[0]["plucker"]["left"], samples[1]["plucker"]["left"]))
             data = collate(samples, config.camera_keys)
-            self.assertEqual(data["plucker"]["top"].shape, (2, 6, 224, 224))
+            self.assertEqual(data["plucker"]["left"].shape, (2, 6, 224, 224))
             class Embedder:
                 def encode(self, prompts):
                     return torch.zeros(len(prompts), 8)
