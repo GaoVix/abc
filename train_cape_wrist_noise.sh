@@ -52,19 +52,23 @@ print(f"Filtered three-stage XML IK: {root}")
 print("RGB: top/left/right; CaPE: left/right; real joint-state noise: 40 dB")
 PY
 
-# Regenerate beside the converted states. The original RGB videos are untouched.
-"$REPO/.venv/bin/python" -m scripts.prepare_camera_parameters \
-  "$DATA_ROOT/train_real" "$DATA_ROOT/val_real" \
-  "$DATA_ROOT/train_sim" "$DATA_ROOT/val_sim" \
-  --calibration-path "$CALIBRATION_PATH" --model-dir "$MODEL_DIR" \
-  --reference-frame top --source-root "$SOURCE_ROOT" \
-  --workers "${PREPARE_WORKERS:-8}" --overwrite
+if [[ "${SKIP_CAMERA_PREPARE:-0}" != 1 ]]; then
+  # Regenerate beside the converted states. The original RGB videos are untouched.
+  "$REPO/.venv/bin/python" -m scripts.prepare_camera_parameters \
+    "$DATA_ROOT/train_real" "$DATA_ROOT/val_real" \
+    "$DATA_ROOT/train_sim" "$DATA_ROOT/val_sim" \
+    --calibration-path "$CALIBRATION_PATH" --model-dir "$MODEL_DIR" \
+    --reference-frame top --source-root "$SOURCE_ROOT" \
+    --workers "${PREPARE_WORKERS:-8}" --overwrite
 
-# One shared reference, calculated from training frames only and reused by every split.
-"$REPO/.venv/bin/python" -m scripts.average_camera_pose \
-  "$DATA_ROOT/train_real" "$DATA_ROOT/train_sim" \
-  --real-frames 100000 --sim-frames 25000 --seed 0 \
-  --output "$DATA_ROOT/camera_average.json"
+  # One shared reference, calculated from training frames only and reused by every split.
+  "$REPO/.venv/bin/python" -m scripts.average_camera_pose \
+    "$DATA_ROOT/train_real" "$DATA_ROOT/train_sim" \
+    --real-frames 100000 --sim-frames 25000 --seed 0 \
+    --output "$DATA_ROOT/camera_average.json"
+else
+  echo "Reusing prepared camera parameters and camera_average.json"
+fi
 
 if [[ "${PREPARE_ONLY:-0}" == 1 ]]; then
   exit 0

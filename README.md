@@ -198,6 +198,8 @@ following the supplied Log/Exp iteration; it does not use the chordal rotation m
 embeds the same average, and inference needs no external average file.
 Use `PREPARE_ONLY=1 bash train_cape_wrist_noise.sh` to preprocess and time the
 average calculation without launching the GPU probe or training.
+After successful preprocessing, `SKIP_CAMERA_PREPARE=1 bash train_cape_wrist_noise.sh`
+reuses the saved geometry and average, runs the short memory probe, then trains.
 
 At inference, use `--model.use-cape --model.cape-camera-keys left right
 --model.cape-reference-frame top_average`. Camera poses come from the current
