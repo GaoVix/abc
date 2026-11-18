@@ -38,9 +38,9 @@ def main():
     parser.add_argument("--calibration-path", type=Path,
                         help="Complete accepted three-camera calibrations.json.gz; omit for sim-only data")
     parser.add_argument("--model-dir", type=Path, help="Original robot XMLs for unretargeted real states; mesh assets are not needed")
-    parser.add_argument("--reference-frame", choices=("left_arm", "top"), default="left_arm")
+    parser.add_argument("--reference-frame", choices=("left_arm", "right_arm", "top"), default="left_arm")
     parser.add_argument("--source-root", type=Path,
-                        help="Original exported dataset, required for top-relative poses on converted real data")
+                        help="Original exported dataset, required for top/right-base poses on converted real data")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true", help="Regenerate after changing calibration, bases or states")
     args = parser.parse_args()

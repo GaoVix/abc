@@ -190,7 +190,7 @@ calibration or bases. The fixed direction table is about 1.72 MiB for three
 224x224 cameras, independent of episode length. Missing files raise an error. Old v1/v2/v3
 sidecars must be regenerated with `--overwrite` before training. The NPY field
 retains the snippet's name `camera_to_world`; its actual reference is recorded
-as `left_arm` or `top` in the manifest. The model checks this convention.
+as `left_arm`, `right_arm` or `top` in the manifest. The model checks this convention.
 New CaPE checkpoints record their selected `camera_reference_frame`; loading a
 different frame or a different set of conditioned cameras is rejected.
 
@@ -383,6 +383,47 @@ Both are off by default. Some episodes do not have eg. subtask annotations and
 for these training will drop back to task prompt only.
 
 (We intend to release the global manifest in future but this is TODO.)
+
+## Three-camera CaPE with right-anchored left-arm IK
+
+This is a separate dataset and experiment. The right arm retains its original
+state/action joints. Real left-arm targets are computed from original,
+unclipped joints in each sequence's calibrated right base. The target left
+base uses the sim XML's full relative base transform (currently translation
+`[0, 0.62, 0]` metres, identity rotation). The existing top-100 DP, Ceres and
+equality IK solvers run on the left arm only. Export keeps the existing
+0.1 mm / 0.1 degree, 30 degree jump and 30-frame chunk filters.
+
+Run `bash convert_right_anchor_local.sh` locally, where the original state/action
+NPZ sources and the FK grid are available. It writes a new work directory under
+`outputs/` and packs final results into its `results.tar.gz`. Set `WORK_DIR` to
+resume that exact run. `CALIBRATION_DIR` defaults to `outputs/cape_calibration`;
+it must contain the same three-camera calibration bundle used on the server.
+The large FK grid and its moved index stay on T7; no grid is transferred.
+
+On the server, extract that archive into the storage root, then run
+`bash prepare_cape_right_anchor.sh`. This uses the original official RGB/state
+export to check every right-arm value and export the filtered real sequences.
+Sim data is unchanged. Sim episode directories are independent, with files
+linked individually, so writing camera sidecars cannot overwrite
+another experiment's sidecars.
+
+All three cameras use physical poses from original RGB-aligned states and
+calibrated camera-to-link mounts, expressed in each episode's own top camera
+frame. The preparation script samples 100,000 real and 25,000 sim training
+frames with seed 0 and pools all three views, including the top identity pose
+at each sampled frame. It uses the same arithmetic translation and geodesic
+rotation means as the wrist-only run. The checkpoint stores the resulting fixed
+average for inference. The existing distortion, bicubic direction resizing,
+padding and shared RGB/ray augmentation are retained.
+
+`bash train_cape_right_anchor_noise.sh` starts a fresh fine-tune from the
+official pretrained parent: all three RGB/CaPE views, `top_average` reference,
+four GPUs, batch 88 per GPU, 100k steps, 40 dB real joint-input noise, validation
+every 1k and checkpoints every 30k plus the final step. For a sequence with
+unsolved left-arm frames, noise std uses the complete sequence's finite IK
+states; retained segments are still checked against their full result.
+The full state-result files must remain available while training.
 
 ## Visualizing episodes and policies
 

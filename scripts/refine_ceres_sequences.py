@@ -82,7 +82,14 @@ def run_sequence(record):
         segments, failures = [], []
         cache = directory / 'segments'
         cache.mkdir(exist_ok=True)
+        stream = str(source.get('input_stream', 'actions'))
         for arm, side in enumerate(SIDES):
+            if side not in source.get('retarget_sides', SIDES):
+                q[:, arm] = source[stream][:, COLUMNS[arm]]
+                initial[:, arm] = lower_bounds[:, arm] = upper_bounds[:, arm] = q[:, arm]
+                errors[:, arm] = trust.pose_errors(model, side, source['targets_world'][:, arm], q[:, arm])
+                usable[:, arm] = converged[:, arm] = np.all(errors[:, arm] <= .1, axis=-1)
+                continue
             radius = trust.joint_radii(model, side, CONFIG['first_joint_radius_rad']) if margin is None and not unlimited else None
             intervals = np.flatnonzero(np.diff(np.r_[False, valid[:, arm], False])).reshape(-1, 2)
             for begin, end in intervals:

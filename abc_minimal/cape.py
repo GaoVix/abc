@@ -5,7 +5,7 @@ Architecture adapted from CamPose (MIT, Copyright (c) 2025 RIPL);
 see assets/third_party/campose/LICENSE.
 Camera matrices use OpenCV axes (right, down, forward), pixel centers at
 (u + .5, v + .5), and metric camera poses in a shared reference frame
-(left_arm, top or top_average, as recorded in the checkpoint). Ray channels are [m, d],
+(left_arm, right_arm, top or top_average, as recorded in the checkpoint). Ray channels are [m, d],
 where d is a unit direction and m = camera_center cross d, matching the
 released ACT implementation. Geometric features are fused after DINO/CLIP;
 the image encoder, CLS token, pooling, and camera ID embeddings are retained.
@@ -129,10 +129,14 @@ def observation_plucker(obs, camera_keys, device, reference_frame=CAMERA_REFEREN
     target_frame = "top" if reference_frame == "top_average" else reference_frame
     reference_from_source = None
     if source_frame != target_frame:
-        if target_frame != "top" or "top" not in obs["camera_to_world"]:
+        if target_frame == "top" and "top" in obs["camera_to_world"]:
+            reference_pose = obs["camera_to_world"]["top"]
+        elif target_frame in obs.get("arm_base_to_world", {}):
+            reference_pose = obs["arm_base_to_world"][target_frame]
+        else:
             raise ValueError(f"Cannot convert CaPE observation frame {source_frame!r} to {reference_frame!r}")
         reference_from_source = torch.linalg.inv(torch.as_tensor(
-            obs["camera_to_world"]["top"], device=device, dtype=torch.float32))
+            reference_pose, device=device, dtype=torch.float32))
     if reference_frame == "top_average":
         if reference_from_top is None:
             raise ValueError("CaPE inference requires the fixed training average pose")
@@ -174,6 +178,16 @@ def mujoco_camera_geometry(model, data, camera_keys, height, width):
     intrinsics, poses = {}, {}
     base = data.body(CAMERA_REFERENCE_FRAME)
     base_rotation = base.xmat.reshape(3, 3)
+    arm_bases = {}
+    for side in ("left_arm", "right_arm"):
+        try:
+            body = data.body(side)
+        except KeyError:
+            continue
+        transform = np.eye(4, dtype=np.float32)
+        transform[:3, :3] = base_rotation.T @ body.xmat.reshape(3, 3)
+        transform[:3, 3] = base_rotation.T @ (body.xpos - base.xpos)
+        arm_bases[side] = transform
     for cam in camera_keys:
         index = model.camera(cam).id
         focal = height / (2 * np.tan(np.deg2rad(model.cam_fovy[index]) / 2))
@@ -183,7 +197,7 @@ def mujoco_camera_geometry(model, data, camera_keys, height, width):
         pose[:3, 3] = base_rotation.T @ (data.cam_xpos[index] - base.xpos)
         poses[cam] = pose
     return {"camera_intrinsics": intrinsics, "camera_to_world": poses,
-            "camera_reference_frame": CAMERA_REFERENCE_FRAME}
+            "camera_reference_frame": CAMERA_REFERENCE_FRAME, "arm_base_to_world": arm_bases}
 
 
 # Copied from CamPose's ACT models/backbone.py, including checkpoint loading.

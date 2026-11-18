@@ -126,7 +126,7 @@ class DiTConfig:
     use_cape: bool = False
     # None applies CaPE to every RGB view; a subset keeps the other views RGB-only.
     cape_camera_keys: tuple[str, ...] | None = None
-    cape_reference_frame: Literal["left_arm", "top", "top_average"] = "left_arm"
+    cape_reference_frame: Literal["left_arm", "right_arm", "top", "top_average"] = "left_arm"
 
     @property
     def cape_cameras(self):

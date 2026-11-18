@@ -25,6 +25,7 @@ from abc_minimal.camera_rays import (
 
 
 _DIRECTION_TABLES = OrderedDict()
+_AVERAGE_CAMERA_GROUPS = (("left", "right"), ("top", "left", "right"))
 
 
 def require_camera_parameters(episode):
@@ -41,7 +42,7 @@ def load_camera_parameters(episode):
     metadata = json.loads((episode / "camera_parameters.json").read_text())
     if metadata.get("version") != 4 or metadata.get("convention") != "opencv":
         raise ValueError(f"Unsupported CaPE camera parameter format: {episode}; regenerate with --overwrite")
-    if metadata.get("reference_frame") not in ("left_arm", "top"):
+    if metadata.get("reference_frame") not in ("left_arm", "right_arm", "top"):
         raise ValueError(f"Unsupported CaPE camera reference frame: {episode}; regenerate with --overwrite")
     frames = np.load(episode / "camera_parameters.npy", mmap_mode="r", allow_pickle=False)
     expected = np.dtype([("state", "<f8", (14,)),
@@ -106,12 +107,16 @@ def geodesic_rotation_mean(matrices, tol=1e-10, max_iter=100):
     raise ValueError(f"Geodesic rotation mean did not converge in {max_iter} iterations")
 
 
-def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0):
-    """Sample training frames uniformly, pairing both wrists in each top frame.
+def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0,
+                        camera_keys=("left", "right")):
+    """Sample training frames uniformly, pooling the selected views in each top frame.
 
     Positions use the arithmetic mean; rotations use the SO(3) geodesic mean.
     Only the sampled poses are loaded, independently of the full dataset size.
     """
+    camera_keys = tuple(camera_keys)
+    if camera_keys not in _AVERAGE_CAMERA_GROUPS:
+        raise ValueError("Average pose requires left/right or top/left/right cameras")
     roots = {Path(root).name: Path(root) for root in data_dirs}
     if len(roots) != 2 or set(roots) != {"train_real", "train_sim"}:
         raise ValueError("Average pose requires train_real and train_sim directories")
@@ -143,7 +148,7 @@ def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0):
             if not len(chosen):
                 continue
             metadata, frames = load_camera_parameters(str(episode))
-            indices = [metadata["camera_keys"].index(cam) for cam in ("left", "right")]
+            indices = [metadata["camera_keys"].index(cam) for cam in camera_keys]
             sampled_poses.append(frames["camera_to_world"][chosen][:, indices].reshape(-1, 4, 4))
             sampled_episodes += 1
         sampled_frames[split], available_frames[split] = count, total
@@ -152,18 +157,21 @@ def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0):
     average[:3, :3] = geodesic_rotation_mean(poses[:, :3, :3])
     average[:3, 3] = poses[:, :3, 3].mean(axis=0)
     validate_camera_matrices(np.eye(3), average)
-    return {"reference_frame": "top", "camera_keys": ["left", "right"],
+    return {"reference_frame": "top", "camera_keys": list(camera_keys),
             "top_from_average": average.tolist(), "num_poses": len(poses), "num_episodes": sampled_episodes,
             "weighting": "equal_per_sampled_camera_frame", "rotation_mean": "geodesic",
             "sample_seed": seed, "sampled_frames": sampled_frames, "available_frames": available_frames,
             "training_splits": [str(roots[split].resolve()) for split in ("train_real", "train_sim")]}
 
 
-def load_camera_average(path):
+def load_camera_average(path, *, camera_keys=None):
     """Load the one training-set reference reused by every split and inference."""
     metadata = json.loads(Path(path).read_text())
-    if metadata.get("reference_frame") != "top" or metadata.get("camera_keys") != ["left", "right"]:
-        raise ValueError(f"Expected a shared top-relative left/right wrist average: {path}")
+    saved_keys = tuple(metadata.get("camera_keys") or ())
+    if metadata.get("reference_frame") != "top" or saved_keys not in _AVERAGE_CAMERA_GROUPS:
+        raise ValueError(f"Expected a shared top-relative camera average: {path}")
+    if camera_keys is not None and saved_keys != tuple(camera_keys):
+        raise ValueError(f"Expected average of {tuple(camera_keys)}, found {saved_keys}: {path}")
     if metadata.get("rotation_mean") != "geodesic":
         raise ValueError(f"CaPE requires a geodesic rotation average: {path}")
     pose = np.asarray(metadata["top_from_average"], dtype=np.float64)
@@ -246,8 +254,8 @@ def prepare_camera_parameters(episode, geometry, camera_keys=("top", "left", "ri
         saved, frames = load_camera_parameters(str(episode))
         if saved["reference_frame"] != geometry.reference_frame:
             raise ValueError(f"CaPE camera reference frame changed: {episode}; regenerate with --overwrite")
-        if retargeted and geometry.reference_frame == "top" and saved.get("pose_source") != "original_rgb_state":
-            raise ValueError(f"Top-relative CaPE must use original RGB-aligned states: {episode}; regenerate with --overwrite")
+        if retargeted and geometry.reference_frame in ("top", "right_arm") and saved.get("pose_source") != "original_rgb_state":
+            raise ValueError(f"CaPE must use original RGB-aligned states: {episode}; regenerate with --overwrite")
         if saved["camera_keys"] != list(camera_keys) or not np.array_equal(frames["state"], states):
             raise ValueError(f"CaPE camera order or source state changed: {episode}; regenerate with --overwrite")
         load_camera_directions(str(episode))
@@ -268,7 +276,7 @@ def prepare_camera_parameters(episode, geometry, camera_keys=("top", "left", "ri
     directions = torch.stack([cached_camera_directions(fixed[cam], height, width) for cam in camera_keys])
     description = {"version": 4, "convention": "opencv", "camera_keys": list(camera_keys),
                    "reference_frame": geometry.reference_frame,
-                   "pose_source": "original_rgb_state" if retargeted and geometry.reference_frame == "top" else "state",
+                   "pose_source": "original_rgb_state" if retargeted and geometry.reference_frame in ("top", "right_arm") else "state",
                    "cameras": fixed, "ray_image_size": [height, width]}
     dtype = np.dtype([("state", "<f8", (14,)), ("camera_to_world", "<f4", (len(camera_keys), 4, 4))])
     temporary = output.with_suffix(".npy.tmp")

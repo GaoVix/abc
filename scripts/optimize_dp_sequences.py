@@ -85,7 +85,15 @@ def run_sequence(record):
         segments, failures = [], []
         cache = directory / 'segments'
         cache.mkdir(exist_ok=True)
+        stream = str(source.get('input_stream', 'actions'))
         for arm, side in enumerate(SIDES):
+            if side not in source.get('retarget_sides', SIDES):
+                # Anchored arms keep their original state/action values exactly.
+                q[:, arm] = source[stream][:, COLUMNS[arm]]
+                errors[:, arm] = ceres.pose_errors(model, side, source['targets_world'][:, arm], q[:, arm])
+                half_width[:, arm] = 0.
+                usable[:, arm] = converged[:, arm] = np.all(errors[:, arm] <= .1, axis=-1)
+                continue
             radius = ceres.joint_radii(model, side, .2)
             intervals = np.flatnonzero(np.diff(np.r_[False, valid[:, arm], False])).reshape(-1, 2)
             for begin, end in intervals:

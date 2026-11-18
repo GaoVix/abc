@@ -17,14 +17,14 @@ BUCKET_SHIFT = sum(CELL_BITS[1:])
 
 
 class GPUEEFPoseGrid:
-    def __init__(self, path):
+    def __init__(self, path, index_source=None):
         self.path = Path(path)
         metadata = json.loads((self.path / "metadata.json").read_text())
         if metadata["phase"] != "complete":
             raise ValueError("EEF pose grid is not complete")
         config = metadata["config"]
         self.has_pose_index = config.get("pose_index", True)
-        self.cells_path = Path(metadata.get("index_source", self.path)) / "cells"
+        self.cells_path = Path(index_source or metadata.get("index_source", self.path)) / "cells"
         self.total_rows = metadata["total_rows"]
         self.poses = np.memmap(self.path / "poses.bin", mode="r", dtype="<f4", shape=(self.total_rows, 6))
         self.poses._mmap.madvise(mmap.MADV_RANDOM)

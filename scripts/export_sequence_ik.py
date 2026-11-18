@@ -65,6 +65,9 @@ def load_solution(path, stream, base_mode='median'):
                             and float(data['source_clip_margin_deg']) == 10.)
         if str(data['base_mode']) != base_mode or not (solver == 'trust-constr' or identity_sim or hybrid_framewise):
             raise ValueError(f'Expected final {base_mode}-base equality IK: {path}')
+        if base_mode == 'right_anchor':
+            np.testing.assert_array_equal(data['retarget_sides'], ['left'])
+            np.testing.assert_array_equal(data[f'optimized_{stream}'][:, 7:14], data[stream][:, 7:14])
         values['solver'] = solver
     return values
 
@@ -173,6 +176,9 @@ def export_episode(job, args, settings):
             raise ValueError('Result frames do not match the original official episode')
         np.testing.assert_array_equal(state['optimized_states'][:, [6, 13]], original[:, [6, 13]])
         np.testing.assert_array_equal(action['optimized_actions'][:, [6, 13]], original[:, [20, 27]])
+        if args.base_mode == 'right_anchor':
+            np.testing.assert_array_equal(state['optimized_states'][:, 7:14], original[:, 7:14])
+            np.testing.assert_array_equal(action['optimized_actions'][:, 7:14], original[:, 21:28])
         rows, intervals, counts = select_frames(state, action, args)
         conversion = dict(signature=signature, source_episode=source.name, base_mode=args.base_mode,
                           action_solver=action['solver'], state_solver=state['solver'],
@@ -180,6 +186,8 @@ def export_episode(job, args, settings):
                           action_result=str(action_path), state_result=str(state_path),
                           timing='unchanged official frame indices; no interpolation or timeoffset',
                           normalized=False, **settings['filters'])
+        if args.base_mode == 'right_anchor':
+            conversion.update(anchor_frame='right_arm', retarget_sides=['left'])
         result = dict(episode=key, split=split, signature=signature, status='complete',
                       segments=len(intervals), intervals=intervals, **counts)
         if args.dry_run:
@@ -227,7 +235,7 @@ def main():
     parser.add_argument('--action-results', type=Path, required=True)
     parser.add_argument('--state-results', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--base-mode', choices=('median', 'xml'), default='median')
+    parser.add_argument('--base-mode', choices=('median', 'xml', 'right_anchor'), default='median')
     parser.add_argument('--position-tolerance-mm', type=float, default=.1)
     parser.add_argument('--rotation-tolerance-deg', type=float, default=.1)
     parser.add_argument('--jump-threshold-deg', type=float, default=30., help='Split at larger raw joint steps; 0 disables')

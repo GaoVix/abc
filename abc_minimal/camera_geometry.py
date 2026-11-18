@@ -1,7 +1,7 @@
 """Offline fixed camera calibration + FK of the processed dataset state.
 
-Calibration contains camera-to-link mounts. Output poses use either the left
-arm base or the sequence's top camera. State/image alignment belongs to the
+Calibration contains camera-to-link mounts. Output poses use either arm base
+or the sequence's top camera. State/image alignment belongs to the
 dataset; this module does not read timestamps or apply time offsets.
 """
 
@@ -47,6 +47,7 @@ def load_calibrations(path):
                              "T_reference_from_camera": camera["T_reference_from_camera"],
                              "recorded_intrinsics": intrinsics}
         result[record["episode"]] = {
+            "split": record.get("split"),
             "model_name": record["model_name"],
             "base_poses": record["base_pose"]["base_poses"],
             "cameras": cameras,
@@ -71,6 +72,7 @@ def arm_model_xml(model_path):
                     parent.remove(child)
         root.append(defaults)
     needed = {"joint": {f"{side}_joint{i}" for side in ("left", "right") for i in range(1, 7)},
+              "site": {f"{side}_tcp_site" for side in ("left", "right")},
               "camera": {"top", "left", "right"}}
 
     def is_needed(element):
@@ -146,7 +148,7 @@ class CameraGeometry:
     """Offline calibrated camera poses in the selected reference frame."""
 
     def __init__(self, calibration_path=None, model_dir=None, *, reference_frame="left_arm", source_root=None):
-        if reference_frame not in ("left_arm", "top"):
+        if reference_frame not in ("left_arm", "right_arm", "top"):
             raise ValueError(f"Unsupported camera reference frame: {reference_frame}")
         self.reference_frame = reference_frame
         self.source_root = Path(source_root).expanduser().resolve() if source_root else None
@@ -165,9 +167,9 @@ class CameraGeometry:
             raise ValueError(f"CaPE calibration missing for {original}; pass the complete three-camera --calibration-path")
         conversion = metadata.get("sequence_ik", {})
         retargeted = bool(conversion or metadata.get("joint_conversion"))
-        if retargeted and self.reference_frame == "top":
+        if retargeted and self.reference_frame in ("top", "right_arm"):
             if self.source_root is None:
-                raise ValueError("Top-relative CaPE on converted RGB requires --source-root with original states")
+                raise ValueError("CaPE on converted RGB in this frame requires --source-root with original states")
             source = self.source_root / episode.parent.name / original / "states_actions.bin"
             states = original_states(str(source))
             begin, end = metadata.get("source_frame_range", (0, len(states)))
@@ -187,7 +189,7 @@ class CameraGeometry:
             top_reference = pose(fk.data.body(record["cameras"]["top"]["reference_body"]))
             world_from_top = top_reference @ top_mount
         reference_from_world = np.linalg.inv(world_from_top if self.reference_frame == "top"
-                                            else pose(fk.data.body("left_arm")))
+                                            else pose(fk.data.body(self.reference_frame)))
         poses = {"top": reference_from_world @ world_from_top}
         for cam, view in (("left", "left-wrist"), ("right", "right-wrist")):
             camera = record["cameras"][view]
@@ -219,7 +221,7 @@ class CameraGeometry:
             reference = pose(fk.data.camera("top"))
             reference[:3, :3] @= np.diag([1., -1., -1.])
         else:
-            reference = pose(fk.data.body("left_arm"))
+            reference = pose(fk.data.body(self.reference_frame))
         reference_from_world = np.linalg.inv(reference)
         cameras, poses = {}, {}
         for cam in ("top", "left", "right"):

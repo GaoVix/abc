@@ -242,12 +242,17 @@ def full_sequence_state_stds(episodes, model_config):
             states = read_state_action_rows(path, 0, members[0][2], model_config)[
                 :, : model_config.state_dim
             ]
+        # A filtered right-anchor conversion can have unsolved left-arm frames.
+        # Use the complete sequence's finite IK states, never raw source joints.
+        noise_states = states
+        if kind == "ik" and base_mode == "right_anchor" and states.ndim == 2:
+            noise_states = states[np.isfinite(states).all(axis=1)]
         if (
             states.ndim != 2 or states.shape[1] != model_config.state_dim
-            or not len(states) or not np.isfinite(states).all()
+            or not len(noise_states) or not np.isfinite(noise_states).all()
         ):
             raise ValueError(f"full-sequence state must have finite (T, state_dim) values: {path}")
-        std = np.std(states, axis=0)
+        std = np.std(noise_states, axis=0)
         for index, ep_dir, length, metadata in members:
             if kind == "ik":
                 begin, end = metadata["source_frame_range"]
