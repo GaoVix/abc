@@ -21,9 +21,7 @@ import sys
 import numpy as np
 
 from abc_minimal.camera_geometry import load_calibrations, pose, state_fk
-from abc_minimal.eef_pose_grid_gpu import GPUEEFPoseGrid
-from scripts import batch_ceres_ik as dp
-from scripts.optimize_dp_sequences import WEIGHTS, save_arrays, write_json
+from scripts.export_sequence_ik import save_json as write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +42,9 @@ def target_bases():
 
 
 def initialize(calibration, model_dir, grid, grid_index, work):
+    from abc_minimal.eef_pose_grid_gpu import GPUEEFPoseGrid
+    from scripts import batch_ceres_ik as dp
+
     global CALIBRATIONS, MODEL_DIR, WORK, BASES
     CALIBRATIONS = load_calibrations(str(calibration))
     MODEL_DIR, WORK, BASES = Path(model_dir), Path(work), target_bases()
@@ -76,6 +77,9 @@ def source_rows(job):
 
 
 def prepare_episode(job):
+    from scripts import batch_ceres_ik as dp
+    from scripts.optimize_dp_sequences import save_arrays
+
     episode, split = job['episode'], job['split']
     rows = source_rows(job)
     if not len(rows) or not np.isfinite(rows).all():
@@ -121,6 +125,8 @@ def prepare_episode(job):
 
 
 def solver_config(work, stream, stage):
+    from scripts.optimize_dp_sequences import WEIGHTS
+
     output = work / stream / stage
     source = work / stream / ('dp' if stage == 'ceres' else 'ceres')
     modules = ['scripts/ceres_sequence_ik.py', 'scripts/scipy_ik.py']
@@ -225,6 +231,9 @@ def main():
     if args.export_only:
         export_dataset(args)
         return
+    # The server only exports finished results; the FK grid is for local IK.
+    from abc_minimal.eef_pose_grid_gpu import GPUEEFPoseGrid
+
     if any(getattr(args, name) is None for name in ('calibration_path', 'model_dir', 'grid')):
         parser.error('IK requires --calibration-path, --model-dir and --grid')
     grid = GPUEEFPoseGrid(args.grid, index_source=args.grid_index)
