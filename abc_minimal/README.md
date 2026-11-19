@@ -401,29 +401,33 @@ resume that exact run. `CALIBRATION_DIR` defaults to `outputs/cape_calibration`;
 it must contain the same three-camera calibration bundle used on the server.
 The large FK grid and its moved index stay on T7; no grid is transferred.
 
-On the server, extract that archive into the storage root, then run
-`bash prepare_cape_right_anchor.sh`. This uses the original official RGB/state
-export to check every right-arm value and export the filtered real sequences.
+On the server, reuse the extracted IK results in the storage root and run
+`bash prepare_cape_right_anchor.sh`. This checks every right-arm value against
+the official RGB/state export and writes the filtered sequences to
+`dishrack_right_anchor_left_ik_raw_sim_right_average`.
 Sim data is unchanged. Sim episode directories are independent, with files
 linked individually, so writing camera sidecars cannot overwrite
 another experiment's sidecars.
 
 All three cameras use physical poses from original RGB-aligned states and
-calibrated camera-to-link mounts, expressed in each episode's own top camera
+calibrated camera-to-link mounts, expressed in each episode's right arm base
 frame. The preparation script samples 100,000 real and 25,000 sim training
-frames with seed 0 and pools all three views, including the top identity pose
-at each sampled frame. It uses the same arithmetic translation and geodesic
-rotation means as the wrist-only run. The checkpoint stores the resulting fixed
-average for inference. The existing distortion, bicubic direction resizing,
-padding and shared RGB/ray augmentation are retained.
+frames with seed 0 and pools all three views. One shared reference uses the
+arithmetic translation and geodesic rotation means. The rays use
+`inverse(right_arm_from_average) @ right_arm_from_camera`, preserving the
+top camera's placement relative to the right base across episodes.
 
 `bash train_cape_right_anchor_noise.sh` starts a fresh fine-tune from the
-official pretrained parent: all three RGB/CaPE views, `top_average` reference,
+official pretrained parent: all three RGB/CaPE views, `right_average` reference,
 four GPUs, batch 88 per GPU, 100k steps, 40 dB real joint-input noise, validation
 every 1k and checkpoints every 30k plus the final step. For a sequence with
 unsolved left-arm frames, noise std uses the complete sequence's finite IK
 states; retained segments are still checked against their full result.
 The full state-result files must remain available while training.
+At eval, use the resulting checkpoint with
+`--model.use-cape --model.cape-camera-keys top left right --model.cape-reference-frame right_average`.
+Inference uses the current scene's right arm base and the fixed training mean
+stored in the checkpoint.
 
 ## Visualizing episodes and policies
 

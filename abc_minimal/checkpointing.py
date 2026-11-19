@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from abc_minimal.cape import CAMERA_REFERENCE_FRAME, validate_cape_checkpoint
+from abc_minimal.cape import AVERAGE_CAMERA_FRAMES, CAMERA_REFERENCE_FRAME, validate_cape_checkpoint
 
 
 def model_state_dict(ckpt) -> dict[str, torch.Tensor]:
@@ -138,11 +138,12 @@ def save_checkpoint(path, *, module, optimizer, scheduler, global_step, norm_sta
     if model_config is not None:
         payload["model_config"] = model_config
         if model_config.get("use_cape"):
-            payload["camera_reference_frame"] = model_config.get("cape_reference_frame", CAMERA_REFERENCE_FRAME)
-            if payload["camera_reference_frame"] == "top_average":
+            reference_frame = model_config.get("cape_reference_frame", CAMERA_REFERENCE_FRAME)
+            payload["camera_reference_frame"] = reference_frame
+            if reference_frame in AVERAGE_CAMERA_FRAMES:
                 if camera_average_pose is not None:
                     payload["camera_average_pose"] = torch.as_tensor(camera_average_pose).tolist()
-                validate_cape_checkpoint(payload, reference_frame="top_average")
+                validate_cape_checkpoint(payload, reference_frame=reference_frame)
     if train_config is not None:
         # Plain dict so eval-side readers (resolve_trained_max_prefix) need
         # no import of this repo's dataclasses to interpret it.

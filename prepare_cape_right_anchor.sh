@@ -5,7 +5,7 @@ cd "$REPO"
 STORAGE="${STORAGE:-/mnt/afs/L202500703/abc_storage}"
 SOURCE_ROOT="${SOURCE_ROOT:-$STORAGE/dishrack_original_1261}"
 RESULT_ROOT="${RESULT_ROOT:-$STORAGE/right_anchor_ik_results}"
-DATA_ROOT="${DATA_ROOT:-$STORAGE/dishrack_right_anchor_left_ik_raw_sim}"
+DATA_ROOT="${DATA_ROOT:-$STORAGE/dishrack_right_anchor_left_ik_raw_sim_right_average}"
 CALIBRATION_PATH="${CALIBRATION_PATH:-$STORAGE/cape_calibration/calibrations.json.gz}"
 MODEL_DIR="${MODEL_DIR:-$STORAGE/cape_calibration/models}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
@@ -28,10 +28,11 @@ PY
 "$REPO/.venv/bin/python" -m scripts.prepare_camera_parameters \
   "$DATA_ROOT/train_real" "$DATA_ROOT/val_real" "$DATA_ROOT/train_sim" "$DATA_ROOT/val_sim" \
   --calibration-path "$CALIBRATION_PATH" --model-dir "$MODEL_DIR" \
-  --reference-frame top --source-root "$SOURCE_ROOT" \
-  --workers "${PREPARE_WORKERS:-8}" --overwrite
+  --reference-frame right_arm --source-root "$SOURCE_ROOT" \
+  --workers "${PREPARE_WORKERS:-8}"
 "$REPO/.venv/bin/python" -m scripts.average_camera_pose \
   "$DATA_ROOT/train_real" "$DATA_ROOT/train_sim" \
-  --real-frames 100000 --sim-frames 25000 --seed 0 --camera-keys top left right \
+  --real-frames 100000 --sim-frames 25000 --seed 0 \
+  --reference-frame right_arm --camera-keys top left right \
   --output "$DATA_ROOT/camera_average.json"
-echo "Prepared right-anchored IK dataset with three-camera top-average CaPE: $DATA_ROOT"
+echo "Prepared right-anchored IK dataset with three-camera right-base-average CaPE: $DATA_ROOT"

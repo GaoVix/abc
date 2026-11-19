@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from abc_minimal.cape import AVERAGE_CAMERA_FRAMES
 from abc_minimal.config import DiTConfig, PromptConfig, VLAModelConfig
 from abc_minimal.camera_parameters import episode_plucker, load_camera_average, require_camera_parameters
 from abc_minimal.dit import task_name_to_prompt
@@ -397,11 +398,14 @@ class EpisodeDataset(Dataset):
         self.camera_keys = tuple(model_config.camera_keys)
         self.use_cape = getattr(model_config, "use_cape", False)
         self.cape_cameras = model_config.cape_cameras if self.use_cape else ()
-        self.cape_reference_from_top = None
-        if self.use_cape and model_config.cape_reference_frame == "top_average":
+        self.cape_average_from_reference = None
+        if self.use_cape and model_config.cape_reference_frame in AVERAGE_CAMERA_FRAMES:
             # Use the dataset root before resolving a split symlink (notably train_sim).
-            average = load_camera_average(Path(data_dir).parent / "camera_average.json")
-            self.cape_reference_from_top = np.linalg.inv(average)
+            average = load_camera_average(
+                Path(data_dir).parent / "camera_average.json",
+                reference_frame=AVERAGE_CAMERA_FRAMES[model_config.cape_reference_frame],
+            )
+            self.cape_average_from_reference = np.linalg.inv(average)
         if self.use_cape:
             for ep_dir, *_ in self.episodes:
                 require_camera_parameters(ep_dir)
@@ -499,7 +503,7 @@ class EpisodeDataset(Dataset):
             plucker = episode_plucker(ep_dir, k, geometry_state, length,
                                       {cam: raw_images[cam] for cam in self.cape_cameras},
                                       reference_frame=self.model_config.cape_reference_frame,
-                                      reference_from_top=self.cape_reference_from_top)
+                                      average_from_reference=self.cape_average_from_reference)
         images = augment_and_normalize(
             raw_images,
             self.train,

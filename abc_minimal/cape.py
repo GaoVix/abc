@@ -5,7 +5,7 @@ Architecture adapted from CamPose (MIT, Copyright (c) 2025 RIPL);
 see assets/third_party/campose/LICENSE.
 Camera matrices use OpenCV axes (right, down, forward), pixel centers at
 (u + .5, v + .5), and metric camera poses in a shared reference frame
-(left_arm, right_arm, top or top_average, as recorded in the checkpoint). Ray channels are [m, d],
+(left_arm, right_arm, top, top_average or right_average, as recorded in the checkpoint). Ray channels are [m, d],
 where d is a unit direction and m = camera_center cross d, matching the
 released ACT implementation. Geometric features are fused after DINO/CLIP;
 the image encoder, CLS token, pooling, and camera ID embeddings are retained.
@@ -19,6 +19,7 @@ from torch.nn import functional as F
 
 
 CAMERA_REFERENCE_FRAME = "left_arm"
+AVERAGE_CAMERA_FRAMES = {"top_average": "top", "right_average": "right_arm"}
 
 
 def validate_cape_checkpoint(ckpt, camera_keys=None, reference_frame=CAMERA_REFERENCE_FRAME):
@@ -34,10 +35,10 @@ def validate_cape_checkpoint(ckpt, camera_keys=None, reference_frame=CAMERA_REFE
         if tuple(saved_keys) != tuple(camera_keys):
             raise ValueError(f"CaPE cameras differ from checkpoint: saved={saved_keys}, "
                              f"requested={camera_keys}; set --model.cape-camera-keys accordingly")
-    if reference_frame == "top_average":
+    if reference_frame in AVERAGE_CAMERA_FRAMES:
         average = ckpt.get("camera_average_pose")
         if average is None or np.shape(average) != (4, 4):
-            raise ValueError("CaPE top_average checkpoint requires one saved 4x4 camera_average_pose")
+            raise ValueError(f"CaPE {reference_frame} checkpoint requires one saved 4x4 camera_average_pose")
         validate_camera_matrices(np.eye(3), average)
 
 
@@ -116,7 +117,7 @@ def resize_pad_plucker(rays, target_h=224, target_w=224):
 
 
 def observation_plucker(obs, camera_keys, device, reference_frame=CAMERA_REFERENCE_FRAME,
-                        reference_from_top=None):
+                        average_from_reference=None, *, reference_from_top=None):
     """Make rays; optional camera_distortion uses cached calibrated directions.
 
     camera_distortion[cam] supplies distortion_model/D (and optionally the
@@ -126,7 +127,7 @@ def observation_plucker(obs, camera_keys, device, reference_frame=CAMERA_REFEREN
     if "camera_intrinsics" not in obs or "camera_to_world" not in obs:
         raise ValueError("CaPE inference requires per-camera camera_intrinsics and camera_to_world in the observation")
     source_frame = obs.get("camera_reference_frame", CAMERA_REFERENCE_FRAME)
-    target_frame = "top" if reference_frame == "top_average" else reference_frame
+    target_frame = AVERAGE_CAMERA_FRAMES.get(reference_frame, reference_frame)
     reference_from_source = None
     if source_frame != target_frame:
         if target_frame == "top" and "top" in obs["camera_to_world"]:
@@ -137,12 +138,14 @@ def observation_plucker(obs, camera_keys, device, reference_frame=CAMERA_REFEREN
             raise ValueError(f"Cannot convert CaPE observation frame {source_frame!r} to {reference_frame!r}")
         reference_from_source = torch.linalg.inv(torch.as_tensor(
             reference_pose, device=device, dtype=torch.float32))
-    if reference_frame == "top_average":
-        if reference_from_top is None:
+    if reference_frame in AVERAGE_CAMERA_FRAMES:
+        if average_from_reference is None and reference_frame == "top_average":
+            average_from_reference = reference_from_top  # Legacy keyword for the top frame.
+        if average_from_reference is None:
             raise ValueError("CaPE inference requires the fixed training average pose")
-        average_from_top = torch.as_tensor(reference_from_top, device=device, dtype=torch.float32)
-        reference_from_source = (average_from_top if reference_from_source is None
-                                 else average_from_top @ reference_from_source)
+        average_from_reference = torch.as_tensor(average_from_reference, device=device, dtype=torch.float32)
+        reference_from_source = (average_from_reference if reference_from_source is None
+                                 else average_from_reference @ reference_from_source)
     batch_size = 1 if np.ndim(obs["state"]) == 1 else len(obs["state"])
     result = {}
     for cam in camera_keys:

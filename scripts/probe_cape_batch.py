@@ -55,7 +55,8 @@ def main():
     parser.add_argument("--max-batch", type=int, default=89)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--cape-camera-keys", nargs="+", choices=("top", "left", "right"))
-    parser.add_argument("--cape-reference-frame", choices=("left_arm", "right_arm", "top", "top_average"), default="left_arm")
+    parser.add_argument("--cape-reference-frame",
+                        choices=("left_arm", "right_arm", "top", "top_average", "right_average"), default="left_arm")
     parser.add_argument("--state-noise-snr", type=float)
     parser.add_argument("--single-trial", action="store_true", help="Test start-batch once, without searching smaller batches")
     args = parser.parse_args()

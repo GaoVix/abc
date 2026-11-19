@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from abc_minimal.cape import CAMERA_REFERENCE_FRAME, validate_camera_matrices
+from abc_minimal.cape import AVERAGE_CAMERA_FRAMES, CAMERA_REFERENCE_FRAME, validate_camera_matrices
 from abc_minimal.camera_rays import (
     cached_camera_directions,
     camera_calibration,
@@ -108,8 +108,8 @@ def geodesic_rotation_mean(matrices, tol=1e-10, max_iter=100):
 
 
 def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0,
-                        camera_keys=("left", "right")):
-    """Sample training frames uniformly, pooling the selected views in each top frame.
+                        camera_keys=("left", "right"), reference_frame="top"):
+    """Sample training frames uniformly, pooling the views in the selected reference frame.
 
     Positions use the arithmetic mean; rotations use the SO(3) geodesic mean.
     Only the sampled poses are loaded, independently of the full dataset size.
@@ -117,6 +117,8 @@ def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0,
     camera_keys = tuple(camera_keys)
     if camera_keys not in _AVERAGE_CAMERA_GROUPS:
         raise ValueError("Average pose requires left/right or top/left/right cameras")
+    if reference_frame not in AVERAGE_CAMERA_FRAMES.values():
+        raise ValueError(f"Unsupported camera average reference frame: {reference_frame}")
     roots = {Path(root).name: Path(root) for root in data_dirs}
     if len(roots) != 2 or set(roots) != {"train_real", "train_sim"}:
         raise ValueError("Average pose requires train_real and train_sim directories")
@@ -131,8 +133,8 @@ def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0,
         lengths = []
         for episode in episodes:
             metadata, frames = load_camera_parameters(str(episode))
-            if metadata["reference_frame"] != "top":
-                raise ValueError(f"Average pose requires top-relative camera parameters: {episode}")
+            if metadata["reference_frame"] != reference_frame:
+                raise ValueError(f"Average pose requires camera parameters in the {reference_frame} frame: {episode}")
             lengths.append(len(frames))
         ends = np.cumsum(lengths)
         total = int(ends[-1]) if len(ends) else 0
@@ -157,24 +159,26 @@ def average_camera_pose(data_dirs, *, real_frames, sim_frames, seed=0,
     average[:3, :3] = geodesic_rotation_mean(poses[:, :3, :3])
     average[:3, 3] = poses[:, :3, 3].mean(axis=0)
     validate_camera_matrices(np.eye(3), average)
-    return {"reference_frame": "top", "camera_keys": list(camera_keys),
-            "top_from_average": average.tolist(), "num_poses": len(poses), "num_episodes": sampled_episodes,
+    return {"reference_frame": reference_frame, "camera_keys": list(camera_keys),
+            f"{reference_frame}_from_average": average.tolist(), "num_poses": len(poses), "num_episodes": sampled_episodes,
             "weighting": "equal_per_sampled_camera_frame", "rotation_mean": "geodesic",
             "sample_seed": seed, "sampled_frames": sampled_frames, "available_frames": available_frames,
             "training_splits": [str(roots[split].resolve()) for split in ("train_real", "train_sim")]}
 
 
-def load_camera_average(path, *, camera_keys=None):
+def load_camera_average(path, *, camera_keys=None, reference_frame="top"):
     """Load the one training-set reference reused by every split and inference."""
     metadata = json.loads(Path(path).read_text())
     saved_keys = tuple(metadata.get("camera_keys") or ())
-    if metadata.get("reference_frame") != "top" or saved_keys not in _AVERAGE_CAMERA_GROUPS:
-        raise ValueError(f"Expected a shared top-relative camera average: {path}")
+    if (reference_frame not in AVERAGE_CAMERA_FRAMES.values()
+            or metadata.get("reference_frame") != reference_frame
+            or saved_keys not in _AVERAGE_CAMERA_GROUPS):
+        raise ValueError(f"Expected a shared camera average in the {reference_frame} frame: {path}")
     if camera_keys is not None and saved_keys != tuple(camera_keys):
         raise ValueError(f"Expected average of {tuple(camera_keys)}, found {saved_keys}: {path}")
     if metadata.get("rotation_mean") != "geodesic":
         raise ValueError(f"CaPE requires a geodesic rotation average: {path}")
-    pose = np.asarray(metadata["top_from_average"], dtype=np.float64)
+    pose = np.asarray(metadata[f"{reference_frame}_from_average"], dtype=np.float64)
     if pose.shape != (4, 4):
         raise ValueError(f"Expected one 4x4 average camera pose: {path}")
     validate_camera_matrices(np.eye(3), pose)
@@ -195,10 +199,10 @@ def exported_intrinsics(camera, height, width):
 
 
 def episode_plucker(episode, frame_index, state, num_frames, images, *,
-                    reference_frame=CAMERA_REFERENCE_FRAME, reference_from_top=None):
+                    reference_frame=CAMERA_REFERENCE_FRAME, average_from_reference=None, reference_from_top=None):
     """Read the same frame as RGB/state, check its source state, then make rays."""
     metadata, frames = load_camera_parameters(str(Path(episode).resolve()))
-    source_frame = "top" if reference_frame == "top_average" else reference_frame
+    source_frame = AVERAGE_CAMERA_FRAMES.get(reference_frame, reference_frame)
     if metadata["reference_frame"] != source_frame:
         raise ValueError(f"CaPE camera reference frame differs from model ({reference_frame}): {episode}; regenerate with --overwrite")
     if len(frames) != num_frames:
@@ -213,10 +217,12 @@ def episode_plucker(episode, frame_index, state, num_frames, images, *,
     indices = [metadata["camera_keys"].index(cam) for cam in images]
     # Compute only the views that actually receive CaPE.
     poses = frame["camera_to_world"][indices].copy()
-    if reference_frame == "top_average":
-        if reference_from_top is None:
+    if reference_frame in AVERAGE_CAMERA_FRAMES:
+        if average_from_reference is None and reference_frame == "top_average":
+            average_from_reference = reference_from_top  # Legacy keyword for the top frame.
+        if average_from_reference is None:
             raise ValueError("CaPE requires the fixed training average pose")
-        poses = reference_from_top @ poses
+        poses = average_from_reference @ poses
     rays = plucker_from_directions(directions[indices], poses)
     result = {}
     for index, (cam, image) in enumerate(images.items()):

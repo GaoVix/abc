@@ -29,7 +29,7 @@ from abc_minimal.checkpointing import (
     save_checkpoint,
     update_last,
 )
-from abc_minimal.cape import validate_cape_checkpoint
+from abc_minimal.cape import AVERAGE_CAMERA_FRAMES, validate_cape_checkpoint
 from abc_minimal.camera_parameters import load_camera_average
 from abc_minimal.config import (
     TrainConfig,
@@ -321,8 +321,11 @@ def main(config: TrainConfig):
         config, cache_root, cache_root / config.pretrained_ckpt_name
     )
     camera_average_pose = None
-    if not is_vla and config.model.use_cape and config.model.cape_reference_frame == "top_average":
-        camera_average_pose = load_camera_average(cache_root / "camera_average.json")
+    cape_reference = config.model.cape_reference_frame
+    if not is_vla and config.model.use_cape and cape_reference in AVERAGE_CAMERA_FRAMES:
+        camera_average_pose = load_camera_average(
+            cache_root / "camera_average.json", reference_frame=AVERAGE_CAMERA_FRAMES[cape_reference],
+        )
 
     distributed, rank, world, local_rank, local_world, device = _distributed_context()
     data_scope = data_parallel_scope(cache_root, rank, world, local_rank, local_world)
@@ -335,7 +338,7 @@ def main(config: TrainConfig):
         check_topology(resume_ckpt, batch_size=config.batch_size,
                        data_world=data_scope.world, rank=rank)
         if camera_average_pose is not None:
-            validate_cape_checkpoint(resume_ckpt, config.model.cape_cameras, "top_average")
+            validate_cape_checkpoint(resume_ckpt, config.model.cape_cameras, cape_reference)
             if not np.array_equal(resume_ckpt["camera_average_pose"], camera_average_pose):
                 raise ValueError("CaPE training average differs from resume checkpoint")
 

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from abc_minimal.checkpointing import model_state_dict
-from abc_minimal.cape import observation_plucker
+from abc_minimal.cape import AVERAGE_CAMERA_FRAMES, observation_plucker
 from abc_minimal.config import (
     FlowConfig,
     VLAModelConfig,
@@ -197,9 +197,9 @@ class DiTInferencePolicy(InferencePolicy):
         self.action_dim = self.model_config.action_dim
         self.model = DiTPolicy(self.model_config).to(self.device)
         ckpt = load_pretrained(self.model, checkpoint)
-        self.cape_reference_from_top = None
-        if self.model_config.use_cape and self.model_config.cape_reference_frame == "top_average":
-            self.cape_reference_from_top = torch.linalg.inv(torch.tensor(
+        self.cape_average_from_reference = None
+        if self.model_config.use_cape and self.model_config.cape_reference_frame in AVERAGE_CAMERA_FRAMES:
+            self.cape_average_from_reference = torch.linalg.inv(torch.tensor(
                 ckpt["camera_average_pose"], dtype=torch.float32, device=self.device))
         self.model.eval()
         self.norm_preset = preset_for_backbone(self.model_config.vision_backbone)
@@ -284,7 +284,7 @@ class DiTInferencePolicy(InferencePolicy):
         }
         if m.use_cape:
             batch["plucker"] = observation_plucker(obs, m.cape_cameras, self.device, m.cape_reference_frame,
-                                                   self.cape_reference_from_top)
+                                                   self.cape_average_from_reference)
         noise_t = None
         if noise is not None:
             noise_arr = np.asarray(noise, dtype=np.float32).reshape(
