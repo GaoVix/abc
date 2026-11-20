@@ -11,7 +11,7 @@ seeds=(
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_wrists_topavg_xml_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_rightavg_right_anchor_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -19,11 +19,11 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_three_stage_filtered_cape_wrists_topavg_noise40_bs88_20261117_185058/100000.pt \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_cape_right_anchor_rightavg_noise40_bs88_20261119_074657/100000.pt \
     --policy dit \
     --model.use-cape \
-    --model.cape-camera-keys left right \
-    --model.cape-reference-frame top_average \
+    --model.cape-camera-keys top left right \
+    --model.cape-reference-frame right_average \
     --task dishrack \
     --gpu-id "$GPU_ID" \
     --num-worlds 100 \
@@ -43,7 +43,7 @@ for seed in "${seeds[@]}"; do
     --rtc-inference-lead-steps 4 \
     --compensate-arm-bases \
     --base-compensation-ik slsqp \
-    --base-compensation-reference xml \
+    --base-compensation-reference right_anchor \
     --randomization '{"plate_count":3,"plate_variant":"plate_0","dish_rack_variant":"dish_rack_0","randomize_variants":false,"randomize_scales":false,"randomize_arm_bases":true,"arm_base_source":"training_6d","arm_collision_mode":"eef_only"}' \
     --log-every-chunk \
     --output-dir "$EVAL_OUTPUT_DIR" \
@@ -64,7 +64,7 @@ seeds=(
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_wrists_topavg_xml_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_rightavg_right_anchor_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -72,11 +72,11 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_three_stage_filtered_cape_wrists_topavg_noise40_bs88_20261117_185058/100000.pt \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_cape_right_anchor_rightavg_noise40_bs88_20261119_074657/100000.pt \
     --policy dit \
     --model.use-cape \
-    --model.cape-camera-keys left right \
-    --model.cape-reference-frame top_average \
+    --model.cape-camera-keys top left right \
+    --model.cape-reference-frame right_average \
     --task dishrack \
     --gpu-id "$GPU_ID" \
     --num-worlds 100 \
@@ -96,7 +96,7 @@ for seed in "${seeds[@]}"; do
     --rtc-inference-lead-steps 4 \
     --compensate-arm-bases \
     --base-compensation-ik slsqp \
-    --base-compensation-reference xml \
+    --base-compensation-reference right_anchor \
     --randomization '{"plate_count":3,"plate_variant":"plate_0","dish_rack_variant":"dish_rack_0","randomize_variants":false,"randomize_scales":false,"randomize_arm_bases":true,"arm_base_source":"training_6d","arm_collision_mode":"eef_only"}' \
     --log-every-chunk \
     --output-dir "$EVAL_OUTPUT_DIR" \
@@ -117,7 +117,7 @@ seeds=(
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_wrists_topavg_xml_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_rightavg_right_anchor_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -125,11 +125,11 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_three_stage_filtered_cape_wrists_topavg_noise40_bs88_20261117_185058/100000.pt \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_cape_right_anchor_rightavg_noise40_bs88_20261119_074657/100000.pt \
     --policy dit \
     --model.use-cape \
-    --model.cape-camera-keys left right \
-    --model.cape-reference-frame top_average \
+    --model.cape-camera-keys top left right \
+    --model.cape-reference-frame right_average \
     --task dishrack \
     --gpu-id "$GPU_ID" \
     --num-worlds 100 \
@@ -149,7 +149,7 @@ for seed in "${seeds[@]}"; do
     --rtc-inference-lead-steps 4 \
     --compensate-arm-bases \
     --base-compensation-ik slsqp \
-    --base-compensation-reference xml \
+    --base-compensation-reference right_anchor \
     --randomization '{"plate_count":3,"plate_variant":"plate_0","dish_rack_variant":"dish_rack_0","randomize_variants":false,"randomize_scales":false,"randomize_arm_bases":true,"arm_base_source":"training_6d","arm_collision_mode":"eef_only"}' \
     --log-every-chunk \
     --output-dir "$EVAL_OUTPUT_DIR" \
@@ -170,7 +170,7 @@ seeds=(
 
 for seed in "${seeds[@]}"; do
     POLICY_SEED="$seed"
-    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_wrists_topavg_xml_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
+    EVAL_OUTPUT_DIR="/mnt/afs/L202500703/abc_storage/output/eval_cape_rightavg_right_anchor_random6d_slsqp_pink_init_strict_100k_highres_pseed${POLICY_SEED}_$(date +%Y%m%d_%H%M%S)"
 
     mkdir -p "$EVAL_OUTPUT_DIR"
 
@@ -178,11 +178,11 @@ for seed in "${seeds[@]}"; do
     CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 \
     PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 \
     nohup .venv/bin/python eval_policy.py \
-    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_three_stage_filtered_cape_wrists_topavg_noise40_bs88_20261117_185058/100000.pt \
+    --checkpoint /mnt/afs/L202500703/abc_storage/output/dit_cape_right_anchor_rightavg_noise40_bs88_20261119_074657/100000.pt \
     --policy dit \
     --model.use-cape \
-    --model.cape-camera-keys left right \
-    --model.cape-reference-frame top_average \
+    --model.cape-camera-keys top left right \
+    --model.cape-reference-frame right_average \
     --task dishrack \
     --gpu-id "$GPU_ID" \
     --num-worlds 100 \
@@ -202,7 +202,7 @@ for seed in "${seeds[@]}"; do
     --rtc-inference-lead-steps 4 \
     --compensate-arm-bases \
     --base-compensation-ik slsqp \
-    --base-compensation-reference xml \
+    --base-compensation-reference right_anchor \
     --randomization '{"plate_count":3,"plate_variant":"plate_0","dish_rack_variant":"dish_rack_0","randomize_variants":false,"randomize_scales":false,"randomize_arm_bases":true,"arm_base_source":"training_6d","arm_collision_mode":"eef_only"}' \
     --log-every-chunk \
     --output-dir "$EVAL_OUTPUT_DIR" \

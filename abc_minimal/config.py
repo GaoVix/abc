@@ -305,7 +305,7 @@ class SimEvalConfig:
     compensate_arm_bases: bool = False
     # Testing-time compensation IK only; independent of training/data conversion.
     base_compensation_ik: Literal["pink", "pink-debug", "mink", "slsqp"] = "pink"
-    base_compensation_reference: Literal["xml", "median"] = "xml"
+    base_compensation_reference: Literal["xml", "median", "right_anchor"] = "xml"
     deterministic_inference: bool = False  # Requires CPU MuJoCo physics and fast_inference=False.
     fast_inference: bool = True
     fast_compile_mode: str = "max-autotune"

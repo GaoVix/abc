@@ -24,7 +24,7 @@ class BaseCompensation:
     def __init__(self, ik_backend="pink", reference="xml"):
         if ik_backend not in ("pink", "pink-debug", "mink", "slsqp"):
             raise ValueError(f"Unknown base compensation IK backend: {ik_backend}")
-        if reference not in ("xml", "median"):
+        if reference not in ("xml", "median", "right_anchor"):
             raise ValueError(f"Unknown base compensation reference: {reference}")
         self.ik_backend = ik_backend
         self._uses_pink = ik_backend in ("pink", "pink-debug")
@@ -41,6 +41,7 @@ class BaseCompensation:
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
         self.sides = ("left", "right")
+        self.retarget_arms = (0,) if reference == "right_anchor" else (0, 1)
         self.qpos = np.array([
             [self.model.joint(f"{side}_joint{i}").qposadr[0] for i in range(1, 7)]
             for side in self.sides
@@ -49,6 +50,7 @@ class BaseCompensation:
         self.world_from_camera[:3, :3] @= np.diag([1., -1., -1.])
         self.camera_from_world = np.linalg.inv(self.world_from_camera)
         self.nominal_bases = [_pose(self.data.body(f"{side}_arm")) for side in self.sides]
+        self.nominal_right_from_left = np.linalg.inv(self.nominal_bases[1]) @ self.nominal_bases[0]
         if reference == "median":
             poses = json.loads(Path(__file__).with_name(
                 "dishrack_median_base_poses.json"
@@ -67,7 +69,8 @@ class BaseCompensation:
             for side in self.sides
         ]
         self.controllers = []
-        for arm, side in enumerate(self.sides):
+        for arm in self.retarget_arms:
+            side = self.sides[arm]
             spec = mujoco.MjSpec.from_file(str(path))
             for field in ("sensors", "equalities", "actuators", "tendons", "keys"):
                 for element in list(getattr(spec, field)):
@@ -111,7 +114,7 @@ class BaseCompensation:
         for record in randomizations:
             metadata = record.metadata if record is not None else {}
             poses = metadata.get("arm_base_poses", {})
-            arms = []
+            actual_bases = []
             for arm, side in enumerate(self.sides):
                 actual = self.nominal_bases[arm].copy()
                 if f"{side}_arm" in poses:
@@ -120,13 +123,21 @@ class BaseCompensation:
                     rotation = np.empty(9)
                     mujoco.mju_quat2Mat(rotation, np.asarray(pose["quat"]))
                     actual[:3, :3] = rotation.reshape(3, 3)
-                camera_from_actual = self.camera_from_world @ actual
+                actual_bases.append(actual)
+            camera_from_reference = self.camera_from_reference
+            if self.reference == "right_anchor":
+                # Place the virtual left base at the XML offset from this world's right base.
+                camera_from_right = self.camera_from_world @ actual_bases[1]
+                camera_from_reference = (camera_from_right @ self.nominal_right_from_left,)
+            arms = np.repeat(np.eye(4)[None], len(self.sides), axis=0)
+            for arm in self.retarget_arms:
+                camera_from_actual = self.camera_from_world @ actual_bases[arm]
                 camera_from_nominal = self.camera_from_world @ self.nominal_bases[arm]
                 # The FK/IK model stays at XML base N. Represent the reference
                 # base M in its coordinates: N M^-1 A FK_base(q_physical).
                 # Inverting this transform gives N A^-1 M FK_base(q_policy).
-                arms.append(
-                    camera_from_nominal @ np.linalg.inv(self.camera_from_reference[arm])
+                arms[arm] = (
+                    camera_from_nominal @ np.linalg.inv(camera_from_reference[arm])
                     @ camera_from_actual @ np.linalg.inv(camera_from_nominal)
                 )
             transforms.append(arms)
@@ -184,7 +195,7 @@ class BaseCompensation:
             return result.reshape(values.shape).astype(np.float32)
         for world, row in enumerate(result):
             targets = self._fk(row)
-            for arm in range(2):
+            for arm in self.retarget_arms:
                 segment = slice(7 * arm, 7 * arm + 6)
                 target = transforms[world, arm] @ targets[arm]
                 solution, position, rotation, calls = self._solve(arm, target, seeds[world, segment])
