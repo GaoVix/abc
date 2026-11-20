@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CHECKPOINT="${1:?Usage: bash evalb.sh /path/to/noise-baseline/100000.pt}"
+CHECKPOINT="/mnt/afs/L202500703/abc_storage/output/dit_baseline_real_joint_noise_snr40_bs90_20261116_185242/100000.pt"
 
 cd /mnt/afs/L202500703/abc
 unset MUJOCO_GL
